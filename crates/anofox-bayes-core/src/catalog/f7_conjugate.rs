@@ -52,6 +52,7 @@ const SLOTS: &[&str] = &[
     "exposure",
     "prior",
     "draws",
+    "chains",
     "seed",
     "engine",
     "min_obs",

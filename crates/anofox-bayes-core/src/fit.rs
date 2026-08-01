@@ -48,6 +48,13 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
     // parsed here rather than repeated in each one. Families still declare the slots
     // in `config_slots` so that `reject_unknown` accepts them.
     let n_draws = cfg.usize_in("draws", SampleOptions::default().n_draws, 4, 1_000_000)?;
+    // Defaults to one chain, and that is not an oversight. R-hat compares chains to
+    // detect a Markov chain that has not mixed; both engines in 0.1 draw
+    // *independently*, so there is nothing to fail to mix and a second chain would
+    // buy an R-hat of 1.0 that means nothing. The slot exists because a caller may
+    // want the cross-check anyway, and because NUTS in 0.2 will default it to 4.
+    // Until then, the gate is ESS -- see docs/API_REFERENCE.md.
+    let n_chains = cfg.usize_in("chains", 1, 1, 64)?;
     let seed = cfg.seed()?;
     let engine_kind = match cfg.opt_str("engine")? {
         Some(name) => EngineKind::parse(name)?,
@@ -68,9 +75,7 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
     }
 
     let opts = SampleOptions {
-        // Every engine in 0.1 draws independently, so a second chain would add cost
-        // without adding information. NUTS will set this from config in 0.2.
-        n_chains: 1,
+        n_chains,
         n_draws,
         seed,
     };
@@ -338,6 +343,44 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a.posterior.meta.model_id, b.posterior.meta.model_id);
+    }
+
+    /// R-hat is structurally absent under one chain, which is the default. Asking
+    /// for more chains makes it available and it must come out near 1 -- these
+    /// engines draw independently, so the chains genuinely are exchangeable. A value
+    /// far from 1 here would mean the per-chain streams were not independent, which
+    /// is exactly the seed-derivation bug `chains_are_independent_streams` guards
+    /// against from the other side.
+    #[test]
+    fn asking_for_more_chains_makes_rhat_available_and_it_comes_out_near_one() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let single = fit(
+            "conjugate_anomaly",
+            &Config::parse(r#"{"value": "cost", "group": "lane", "draws": 2000}"#).unwrap(),
+            &view,
+        )
+        .unwrap();
+        assert!(
+            single.diagnostics.iter().all(|d| d.rhat.is_none()),
+            "one chain cannot support an R-hat"
+        );
+
+        let multi = fit(
+            "conjugate_anomaly",
+            &Config::parse(r#"{"value": "cost", "group": "lane", "draws": 2000, "chains": 4}"#)
+                .unwrap(),
+            &view,
+        )
+        .unwrap();
+        assert_eq!(multi.posterior.n_chains, 4);
+        for d in &multi.diagnostics {
+            let r = d.rhat.expect("four chains support an R-hat");
+            assert!(r < 1.01, "{}/{}: rhat {r}", d.group_id, d.param);
+        }
+        assert_eq!(multi.posterior.meta.status, FitStatus::Converged);
     }
 
     #[test]

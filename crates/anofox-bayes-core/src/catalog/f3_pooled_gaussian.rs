@@ -59,6 +59,7 @@ const SLOTS: &[&str] = &[
     "pool_scale",
     "prior",
     "draws",
+    "chains",
     "seed",
     "engine",
 ];

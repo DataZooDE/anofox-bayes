@@ -59,16 +59,31 @@ flowchart TB
 
 ### 3.1 SQL Surface
 
-| Function | Kind | Purpose |
-|---|---|---|
-| `anofox_bayes_fit(family, TABLE data, config JSON)` | table function | Fit; returns fit summary row(s); materializes draws + metadata tables |
-| `anofox_bayes_draws(model_id)` | table function / view | Access draws `(model_id, group_id, chain, draw, param, value)` |
-| `anofox_bayes_predict(model_id, TABLE newdata, kind)` | table function | Posterior- (or prior-) predictive samples for new rows |
-| `rhat(value)`, `ess_bulk(value)`, `ess_tail(value)` | aggregates | Convergence diagnostics over draws, `GROUP BY param` |
-| `anofox_bayes_status(model_id)` | scalar/table | Structured status: `converged \| degenerate \| insufficient_data \| failed` + reasons |
-| Convenience macros | SQL macros | `credible_interval(...)`, `service_level_quantile(...)`, family-specific decision helpers |
+| Function | Kind | Status | Purpose |
+|---|---|---|---|
+| `anofox_bayes_fit(relation, family, config)` | table in-out | **0.1** | Fit; returns the draws contract `(model_id, group_id, chain, draw, param, value)` |
+| `anofox_bayes_rhat(value, chain, draw)` | aggregate | **0.1** | Split R̂ over draws, `GROUP BY param` |
+| `anofox_bayes_ess_bulk(...)`, `anofox_bayes_ess_tail(...)` | aggregates | **0.1** | Effective sample size, bulk and tail |
+| `anofox_bayes_credible_interval`, `anofox_bayes_prob_greater`, `anofox_bayes_service_level_quantile`, `anofox_bayes_status_text`, `anofox_bayes_is_actionable` | SQL macros | **0.1** | Decision helpers over a draws table |
+| `anofox_bayes_version()`, `anofox_bayes_draws_schema_version()` | scalars | **0.1** | Build and contract versions |
+| `anofox_bayes_predict(draws, newdata, kind)` | table function | 0.3 | Posterior- (or prior-) predictive samples for new rows |
+| `anofox_bayes_draws(model_id)`, `anofox_bayes_status(model_id)` | table functions | — | **Dropped.** Superseded by the pure-function design below: draws *are* the return value, and status rides inside them |
 
-Positional parameters, `anofox_bayes_*` prefix with short aliases — consistent with existing anofox extensions.
+Three notes on how the shipped surface differs from the sketch this document started
+from, each for a reason worth recording:
+
+* **The relation is the first argument and arrives as a subquery**, not as
+  `TABLE tbl` — DuckDB's parser rejects the latter, and a function with a `TABLE`
+  parameter may not have overloads, so `config` is required rather than optional.
+* **Aggregates take `(value, chain, draw)`, not `value` alone.** DuckDB gives an
+  aggregate no row-order guarantee, and R̂ and ESS are both functions of the
+  *sequence*; fed shuffled rows they would report excellent numbers for a badly mixed
+  fit.
+* **Names are not aliased short.** `rhat` and `ess_bulk` are plausible column names in
+  a user's own schema, and shadowing one would be a poor trade for six saved
+  characters.
+
+Positional parameters and an `anofox_bayes_*` prefix throughout — consistent with the sibling anofox extensions.
 
 > **Implementation note (v0.1).** `anofox_bayes_fit` is realised as a *pure* table-in/table-out
 > function: it returns the draw rows and materialises nothing itself. Persistence is the

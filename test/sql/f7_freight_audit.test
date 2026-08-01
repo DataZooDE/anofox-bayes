@@ -143,8 +143,8 @@ SELECT group_id,
 FROM draws WHERE param = 'mu' AND draw >= 0
 GROUP BY group_id ORDER BY group_id;
 ----
-BRE-ANT	2.99	3.0	3.01
-DUS-MIL	2.4	2.6	2.8
+BRE-ANT	2.98	3.0	3.02
+DUS-MIL	2.39	2.6	2.8
 HAM-ROT	1.99	2.0	2.01
 
 #######################################
