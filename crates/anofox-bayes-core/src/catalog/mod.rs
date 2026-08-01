@@ -177,6 +177,19 @@ pub trait CompiledModel: std::fmt::Debug {
 pub trait ExactPosterior {
     /// Draw one sample into `out`, which has one slot per parameter name.
     fn sample_into(&self, rng: &mut BayesRng, out: &mut [f64]) -> BayesResult<()>;
+
+    /// Draw one sample from the **prior**, for a prior-predictive check (BR-11).
+    ///
+    /// Defaults to a refusal rather than to the posterior. A family that has not
+    /// implemented this must say so: silently returning posterior draws under a
+    /// `sample_from: 'prior'` request would make the pre-fit gate agree with the data
+    /// it is supposed to be checked against, which is the one thing it must never do.
+    fn sample_prior_into(&self, _rng: &mut BayesRng, _out: &mut [f64]) -> BayesResult<()> {
+        Err(BayesError::config(
+            "sample_from",
+            "this family cannot draw from its prior",
+        ))
+    }
 }
 
 /// A model whose log posterior and its gradient are available on an unconstrained

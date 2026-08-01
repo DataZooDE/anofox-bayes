@@ -72,6 +72,7 @@ const SLOTS: &[&str] = &[
     "max_draw_megabytes",
     "seed",
     "engine",
+    "sample_from",
 ];
 
 impl ModelFamily for PooledGaussian {
@@ -126,13 +127,22 @@ impl ModelFamily for PooledGaussian {
         }
 
         let prior = cfg.nested("prior")?;
-        prior.reject_unknown(&["beta_scale", "a0", "s0"])?;
+        prior.reject_unknown(&["beta_scale", "intercept_scale", "a0", "s0"])?;
         // Infinite by default: a flat prior on the coefficients, which makes the
         // posterior mean the least-squares estimate. Any finite default would be a
         // scale assumption about someone else's data.
         let beta_scale = prior.f64_or("beta_scale", f64::INFINITY)?;
         if beta_scale <= 0.0 {
             return Err(BayesError::config("prior.beta_scale", "must be > 0"));
+        }
+        // Flat by default, which is the shipped behaviour and stays the shipped
+        // behaviour: an intercept prior centred at zero says something nobody means.
+        // The slot exists so a prior-predictive check (BR-11) is *possible* -- a
+        // joint prior with one flat coordinate is improper and has nothing to draw
+        // from, so without this F3 could never run the pre-fit gate at all.
+        let intercept_scale = prior.f64_or("intercept_scale", f64::INFINITY)?;
+        if intercept_scale <= 0.0 {
+            return Err(BayesError::config("prior.intercept_scale", "must be > 0"));
         }
         let a0 = prior.f64_or("a0", 0.0)?;
         let s0 = prior.non_negative_f64_or("s0", 0.0)?;
@@ -285,13 +295,18 @@ impl ModelFamily for PooledGaussian {
         let precision: Vec<f64> = (0..p)
             .map(|j| {
                 if j < first_slope {
-                    // The intercept is never penalised. `beta_scale` is a statement
-                    // about how large an *effect* is plausibly, and an effect prior
-                    // centred at zero is a sensible default; the intercept lives on
-                    // the scale of the response, where a prior centred at zero says
-                    // something nobody means -- and shrinking it silently pushes
-                    // every slope the other way to compensate.
-                    0.0
+                    // The intercept is not penalised unless the caller explicitly
+                    // asks. `beta_scale` is a statement about how large an *effect*
+                    // is plausibly, and an effect prior centred at zero is a sensible
+                    // default; the intercept lives on the scale of the response,
+                    // where a prior centred at zero says something nobody means --
+                    // and shrinking it silently pushes every slope the other way to
+                    // compensate.
+                    if intercept_scale.is_finite() {
+                        1.0 / (intercept_scale * intercept_scale)
+                    } else {
+                        0.0
+                    }
                 } else if j < n_fixed {
                     slope_precision
                 } else {
@@ -356,6 +371,30 @@ impl ModelFamily for PooledGaussian {
             Readiness::ready()
         };
 
+        // The prior is proper only if every coordinate carries positive precision and
+        // the variance prior is a distribution. Its precision matrix is diagonal, so
+        // its Cholesky factor is the elementwise square root -- no factorisation.
+        let prior_chol = if precision.iter().all(|v| *v > 0.0) && a0 > 0.0 && s0 > 0.0 {
+            let mut l: Mat<f64> = Mat::zeros(p, p);
+            for (j, v) in precision.iter().enumerate() {
+                l[(j, j)] = v.sqrt();
+            }
+            Some(l)
+        } else {
+            None
+        };
+
+        if cfg.opt_str("sample_from")? == Some("prior") && prior_chol.is_none() {
+            return Err(BayesError::config(
+                "sample_from",
+                "a prior predictive check needs a proper prior, and this fit's prior is \
+                 improper. By default the intercept and the slopes are flat and the \
+                 variance prior carries no mass, which is right for fitting and leaves \
+                 nothing to draw from. Set prior.intercept_scale, prior.beta_scale, \
+                 prior.a0 and prior.s0 to positive values",
+            ));
+        }
+
         Ok(Box::new(CompiledPooledGaussian {
             params,
             chol,
@@ -366,6 +405,9 @@ impl ModelFamily for PooledGaussian {
             n_groups: group_keys.len().max(1),
             fingerprint,
             readiness,
+            prior_chol,
+            a0,
+            s0,
         }))
     }
 }
@@ -383,6 +425,11 @@ struct CompiledPooledGaussian {
     n_groups: usize,
     fingerprint: String,
     readiness: Readiness,
+    /// Cholesky factor of the *prior* precision, for a prior-predictive check.
+    /// `None` when the prior is improper and so not a distribution to draw from.
+    prior_chol: Option<Mat<f64>>,
+    a0: f64,
+    s0: f64,
 }
 
 impl CompiledModel for CompiledPooledGaussian {
@@ -534,6 +581,34 @@ impl ExactPosterior for CompiledPooledGaussian {
             rng,
             &mut out[..p - 1],
         )?;
+        out[p - 1] = sigma_sq.sqrt();
+        Ok(())
+    }
+
+    /// Draw from the prior, for a prior-predictive check (BR-11).
+    ///
+    /// Structurally identical to the posterior draw with the prior's hyperparameters
+    /// substituted -- conjugacy is exactly the statement that they are the same
+    /// distribution -- so the coefficient prior stays correctly scaled by `sigma`,
+    /// which is what makes `beta_scale` and `pool_scale` measured in residual
+    /// standard deviations here as well as in the posterior.
+    fn sample_prior_into(&self, rng: &mut BayesRng, out: &mut [f64]) -> BayesResult<()> {
+        let p = self.params.len();
+        if out.len() != p {
+            return Err(BayesError::DimensionMismatch(format!(
+                "expected {p} slots, got {}",
+                out.len()
+            )));
+        }
+        let Some(chol) = self.prior_chol.as_ref() else {
+            return Err(BayesError::config(
+                "sample_from",
+                "this fit's prior is improper, so there is nothing to draw from",
+            ));
+        };
+        let sigma_sq = 1.0 / rng.gamma(self.a0, self.s0)?;
+        let zero = vec![0.0; p - 1];
+        sample_mvn(chol, &zero, sigma_sq.sqrt(), rng, &mut out[..p - 1])?;
         out[p - 1] = sigma_sq.sqrt();
         Ok(())
     }
@@ -974,5 +1049,116 @@ mod tests {
         assert_eq!(names, vec!["intercept", "beta[x]", "sigma"]);
         let cols = draw(&*model, 2000, 10);
         assert!(cols[2].iter().all(|v| *v > 0.0));
+    }
+    //=== Prior predictive (BR-11) ==========================================//
+
+    /// The default prior is flat on the intercept and the slopes and carries no mass
+    /// on the variance. That is right for fitting and leaves nothing to draw from, so
+    /// the pre-fit gate must refuse rather than invent a stand-in.
+    #[test]
+    fn a_prior_predictive_check_is_refused_under_the_flat_default_prior() {
+        let frame = Frame::new(6)
+            .numeric("y", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .numeric("x", vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let err = compile(r#"{"y": "y", "x": ["x"], "sample_from": "prior"}"#, &view).unwrap_err();
+        assert!(
+            err.to_string().contains("improper"),
+            "the refusal must say why: {err}"
+        );
+    }
+
+    /// With every coordinate given a proper prior the check runs, and the draws must
+    /// reflect the prior rather than the data.
+    ///
+    /// The coefficient prior is `N(0, sigma^2 * beta_scale^2)`, so marginalising over
+    /// `sigma^2 ~ InvGamma(a0, s0)` gives `Var(beta) = beta_scale^2 * s0 / (a0 - 1)`.
+    /// With `beta_scale = 2, a0 = 3, s0 = 4` that is `4 * 4 / 2 = 8`.
+    #[test]
+    fn a_proper_prior_yields_prior_draws_with_the_specified_spread() {
+        let cfg = r#"{"y": "y", "x": ["x"], "sample_from": "prior",
+                      "prior": {"intercept_scale": 5.0, "beta_scale": 2.0,
+                                "a0": 3.0, "s0": 4.0}}"#;
+
+        let small = Frame::new(6)
+            .numeric("y", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .numeric("x", vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let refs = small.key_refs();
+        let view = small.view(&refs);
+        let model = compile(cfg, &view).unwrap();
+        let exact = model.as_exact().unwrap();
+
+        let n = 200_000;
+        let width = model.param_names().len();
+        let mut rng = BayesRng::for_chain(3, 0);
+        let mut slot = vec![0.0; width];
+        let mut betas = Vec::with_capacity(n);
+        for _ in 0..n {
+            exact.sample_prior_into(&mut rng, &mut slot).unwrap();
+            betas.push(slot[1]); // the slope on x
+        }
+
+        let m = betas.iter().sum::<f64>() / n as f64;
+        let v = betas.iter().map(|b| (b - m).powi(2)).sum::<f64>() / n as f64;
+        assert!(m.abs() < 0.05, "prior mean of beta should be 0, got {m}");
+        assert!(
+            (v - 8.0).abs() < 0.4,
+            "prior variance of beta should be 8, got {v}"
+        );
+
+        // ...and it must not have looked at the data at all.
+        let large = Frame::new(6)
+            .numeric("y", vec![900.0, 910.0, 920.0, 930.0, 940.0, 950.0])
+            .numeric("x", vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let refs = large.key_refs();
+        let view = large.view(&refs);
+        let other = compile(cfg, &view).unwrap();
+        let other_exact = other.as_exact().unwrap();
+        let mut rng = BayesRng::for_chain(3, 0);
+        let mut slot_b = vec![0.0; width];
+        other_exact
+            .sample_prior_into(&mut rng, &mut slot_b)
+            .unwrap();
+
+        let mut rng = BayesRng::for_chain(3, 0);
+        let mut slot_a = vec![0.0; width];
+        exact.sample_prior_into(&mut rng, &mut slot_a).unwrap();
+        assert_eq!(slot_a, slot_b, "prior draws moved with the data");
+    }
+
+    /// The new slot must not change what a default fit does. `intercept_scale`
+    /// defaults to infinite precision-free flatness, which is what shipped.
+    #[test]
+    fn the_intercept_prior_slot_leaves_the_default_fit_untouched() {
+        let frame = Frame::new(6)
+            .numeric("y", vec![1.0, 2.1, 2.9, 4.2, 5.1, 5.8])
+            .numeric("x", vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let bare = compile(r#"{"y": "y", "x": ["x"]}"#, &view).unwrap();
+        let explicit = compile(
+            r#"{"y": "y", "x": ["x"], "prior": {"beta_scale": 1e300}}"#,
+            &view,
+        )
+        .unwrap();
+
+        let mut a = vec![0.0; bare.param_names().len()];
+        let mut b = vec![0.0; explicit.param_names().len()];
+        let mut ra = BayesRng::for_chain(1, 0);
+        let mut rb = BayesRng::for_chain(1, 0);
+        bare.as_exact()
+            .unwrap()
+            .sample_into(&mut ra, &mut a)
+            .unwrap();
+        explicit
+            .as_exact()
+            .unwrap()
+            .sample_into(&mut rb, &mut b)
+            .unwrap();
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-6, "{a:?} vs {b:?}");
+        }
     }
 }

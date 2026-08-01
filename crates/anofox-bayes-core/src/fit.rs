@@ -29,7 +29,7 @@ use crate::diagnostics::{self, ParamDiagnostics, Thresholds};
 use crate::draws::{derive_model_id, ModelMeta, Posterior};
 use crate::engines::{self, SampleOptions};
 use crate::errors::{BayesError, BayesResult};
-use crate::types::{EngineKind, FitStatus};
+use crate::types::{EngineKind, FitStatus, SampleFrom};
 
 /// Default ceiling on the in-memory draw buffer, in megabytes.
 ///
@@ -98,6 +98,13 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
     // Until then, the gate is ESS -- see docs/API_REFERENCE.md.
     let n_chains = cfg.usize_in("chains", 1, 1, 64)?;
     let seed = cfg.seed()?;
+    // Posterior unless asked otherwise. Parsed here rather than per family because
+    // the slot means the same thing everywhere; families still declare it so that
+    // `reject_unknown` accepts it.
+    let sample_from = match cfg.opt_str("sample_from")? {
+        Some(name) => SampleFrom::parse(name)?,
+        None => SampleFrom::Posterior,
+    };
     let engine_kind = match cfg.opt_str("engine")? {
         Some(name) => EngineKind::parse(name)?,
         None => family.default_engine(),
@@ -131,6 +138,7 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         n_chains,
         n_draws,
         seed,
+        sample_from,
     };
     let sample = engine.sample(&*model, &opts)?;
 
@@ -156,6 +164,7 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         // implicating any particular group, so folding them in would produce a count
         // that does not correspond to anything an agent can go and look at.
         n_groups_unready: model.n_groups_unready(),
+        sample_from,
     };
 
     let posterior = Posterior::new(

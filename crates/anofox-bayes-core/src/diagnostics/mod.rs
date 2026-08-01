@@ -385,6 +385,7 @@ mod tests {
                 n_obs: 10,
                 n_groups: 1,
                 n_groups_unready: 0,
+                sample_from: crate::types::SampleFrom::Posterior,
             },
             params,
             1,

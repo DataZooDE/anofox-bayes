@@ -54,7 +54,11 @@ impl Engine for ExactEngine {
             let mut rng = BayesRng::for_chain(opts.seed, chain as u32);
             for draw in 0..opts.n_draws {
                 let offset = (chain * opts.n_draws + draw) * n_params;
-                exact.sample_into(&mut rng, &mut values[offset..offset + n_params])?;
+                let slots = &mut values[offset..offset + n_params];
+                match opts.sample_from {
+                    crate::types::SampleFrom::Posterior => exact.sample_into(&mut rng, slots)?,
+                    crate::types::SampleFrom::Prior => exact.sample_prior_into(&mut rng, slots)?,
+                }
             }
         }
 
@@ -152,6 +156,7 @@ mod tests {
             n_chains: 3,
             n_draws: 7,
             seed: 1,
+            sample_from: crate::types::SampleFrom::Posterior,
         };
         let sample = ExactEngine.sample(&m, &opts).unwrap();
         assert_eq!(sample.values.len(), 3 * 7 * 2);
@@ -165,6 +170,7 @@ mod tests {
             n_chains: 2,
             n_draws: 50,
             seed: 99,
+            sample_from: crate::types::SampleFrom::Posterior,
         };
         let a = ExactEngine.sample(&m, &opts).unwrap();
         let b = ExactEngine.sample(&m, &opts).unwrap();
@@ -186,6 +192,7 @@ mod tests {
             n_chains: 2,
             n_draws: 100,
             seed: 5,
+            sample_from: crate::types::SampleFrom::Posterior,
         };
         let sample = ExactEngine.sample(&m, &opts).unwrap();
         let chain0 = &sample.values[..100 * 2];
@@ -238,6 +245,7 @@ mod tests {
                     n_chains: 1,
                     n_draws: 100_000,
                     seed: 3,
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )
             .unwrap();

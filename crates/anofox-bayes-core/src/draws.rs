@@ -22,7 +22,8 @@
 
 use crate::errors::BayesResult;
 use crate::types::{
-    validate_param_name, EngineKind, FamilyCode, FitStatus, DRAWS_SCHEMA_VERSION, GLOBAL_GROUP,
+    validate_param_name, EngineKind, FamilyCode, FitStatus, SampleFrom, DRAWS_SCHEMA_VERSION,
+    GLOBAL_GROUP,
 };
 
 // Reserved parameter names. Sample statistics are per `(chain, draw)`; metadata rows
@@ -42,6 +43,7 @@ pub const META_N_GROUPS_UNREADY: &str = "__n_groups_unready__";
 pub const META_N_CHAINS: &str = "__n_chains__";
 pub const META_N_DRAWS: &str = "__n_draws__";
 pub const META_SCHEMA_VERSION: &str = "__schema_version__";
+pub const META_SAMPLE_FROM: &str = "__sample_from__";
 
 /// Sentinel chain/draw index for model-level metadata rows.
 ///
@@ -127,6 +129,12 @@ pub struct ModelMeta {
     /// `status` is still the collapsed worst-case verdict, and this says how much of
     /// the fit that verdict is about.
     pub n_groups_unready: usize,
+    /// Whether these draws are the posterior or a prior-predictive check.
+    ///
+    /// Emitted because a persisted prior-predictive table is otherwise
+    /// indistinguishable from a posterior one, and acting on the prior in the belief
+    /// it is the posterior is acting on no evidence at all.
+    pub sample_from: SampleFrom,
 }
 
 /// A fitted posterior, before it becomes rows.
@@ -310,6 +318,7 @@ impl Posterior {
             META_STATUS => m.status as i32 as f64,
             META_ENGINE => m.engine as i32 as f64,
             META_FAMILY => m.family as i32 as f64,
+            META_SAMPLE_FROM => m.sample_from as i32 as f64,
             META_SEED => m.seed as f64,
             META_N_OBS => m.n_obs as f64,
             META_N_GROUPS => m.n_groups as f64,
@@ -362,6 +371,7 @@ impl Posterior {
 pub const META_ROWS: &[&str] = &[
     META_SCHEMA_VERSION,
     META_FAMILY,
+    META_SAMPLE_FROM,
     META_STATUS,
     META_ENGINE,
     META_SEED,
@@ -443,6 +453,7 @@ mod tests {
             n_obs: 120,
             n_groups: 3,
             n_groups_unready: 1,
+            sample_from: crate::types::SampleFrom::Posterior,
         }
     }
 
@@ -550,7 +561,7 @@ mod tests {
         // offset `row_at` subtracts to reach the draws, so a name added to the list
         // without a value behind it would shift every draw row by one.
         assert_eq!(meta_rows.len(), META_ROWS.len());
-        assert_eq!(meta_rows.len(), 10);
+        assert_eq!(meta_rows.len(), 11);
         for row in &meta_rows {
             assert_eq!(row.chain, META_INDEX);
         }
@@ -571,6 +582,7 @@ mod tests {
         m.n_obs = 102;
         m.n_groups = 103;
         m.n_groups_unready = 104;
+        m.sample_from = SampleFrom::Prior; // 1, distinct from every count below
         let params = vec![ParamName::global("mu").unwrap()];
         // 5 chains x 7 draws, so neither is confusable with the other or with a count.
         let p = Posterior::new(m, params, 5, 7, vec![0.0; 35], Vec::new()).unwrap();
@@ -578,6 +590,7 @@ mod tests {
         let expected: Vec<(&str, f64)> = vec![
             (META_SCHEMA_VERSION, DRAWS_SCHEMA_VERSION as f64),
             (META_FAMILY, 7.0),
+            (META_SAMPLE_FROM, 1.0),
             (META_STATUS, 3.0),
             (META_ENGINE, 2.0),
             (META_SEED, 101.0),

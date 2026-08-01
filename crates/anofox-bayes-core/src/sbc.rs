@@ -402,6 +402,7 @@ mod families {
                     // A stream distinct from the simulation's, so the posterior draws
                     // cannot correlate with the noise that produced the data.
                     seed: rng.uniform().to_bits(),
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )?;
             let p = model.param_names().len();
@@ -473,6 +474,7 @@ mod families {
                 n_chains: 1,
                 n_draws,
                 seed: rng.uniform().to_bits(),
+                sample_from: crate::types::SampleFrom::Posterior,
             };
             let sample = match self.engine {
                 EngineKind::Laplace => LaplaceEngine.sample(&*model, &opts)?,

@@ -1,0 +1,157 @@
+# name: test/sql/prior_predictive.test
+# description: The prior-predictive check, BR-11's pre-fit gate
+# group: [anofox_bayes]
+#
+# The question a prior predictive answers is asked *before* any data is conditioned
+# on: does the model, as configured, consider the observed world possible at all? A
+# prior implying delivery times of minus three days is a modelling error worth finding
+# in the first second rather than defending in the last.
+#
+# It is the same table function and the same output contract, with one config slot
+# changed -- so an agent gates on it with the SQL it already has.
+
+require anofox_bayes
+
+statement ok
+CREATE TABLE deliveries(depot VARCHAR, days DOUBLE);
+
+statement ok
+INSERT INTO deliveries
+SELECT 'BER', 3 + (i % 5) FROM range(30) t(i)
+UNION ALL SELECT 'HAM', 6 + (i % 4) FROM range(30) t(i);
+
+#######################################
+# The default prior cannot be checked
+#######################################
+
+# The shipped defaults are *reference* priors: scale-free, and improper for exactly
+# that reason -- they carry no finite mass. They make a good posterior once data
+# arrives and there is nothing to draw from beforehand. Refusing is the honest answer;
+# substituting some arbitrary proper stand-in would answer a different question while
+# looking like it answered this one.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT depot, days FROM deliveries),
+    'conjugate_anomaly',
+    {'value': 'days', 'group': 'depot', 'sample_from': 'prior'});
+----
+improper
+
+#######################################
+# A proper prior can
+#######################################
+
+statement ok
+CREATE TABLE prior_draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT depot, days FROM deliveries),
+    'conjugate_anomaly',
+    {'value': 'days', 'group': 'depot', 'draws': 4000, 'seed': 11,
+     'prior': {'mu0': 6.0, 'kappa0': 1.0, 'alpha0': 4.0, 'beta0': 24.0},
+     'sample_from': 'prior'});
+
+# The table says what it is. Without this row a persisted prior-predictive table is
+# indistinguishable from a posterior one, and acting on the prior while believing it
+# is the posterior is acting on no evidence at all.
+query I
+SELECT value FROM prior_draws WHERE param = '__sample_from__';
+----
+1.000000
+
+query I
+SELECT anofox_bayes_family_text(param, value) FROM prior_draws WHERE param = '__family__';
+----
+conjugate_anomaly
+
+# The check itself: the prior must not already rule out the data we hold. The observed
+# range is 3..9 days, and the prior's central 95% must cover it -- otherwise the model
+# would be fighting the data before it ever saw it.
+#
+# This assertion earned its place. The prior first written here -- mu0 = 5 with
+# kappa0 = 2, alpha0 = 3, beta0 = 8 -- looks reasonable and is not: marginalising over
+# sigma gives mu a t(6) with scale sqrt(8/6) = 1.15, so its central 95% is [2.2, 7.8]
+# and it assigns implausibly little mass to a nine-day delivery that the data shows
+# happening routinely. That is precisely the misconfiguration a prior predictive is
+# for, found by the check rather than by the fit going quietly wrong.
+query II
+SELECT anofox_bayes_credible_lower(value, 0.95) < 3.0,
+       anofox_bayes_credible_upper(value, 0.95) > 9.0
+FROM prior_draws WHERE param = 'mu' AND draw >= 0;
+----
+true	true
+
+# ...and the gate an agent would actually run: a prior that puts real mass on
+# physically impossible values is a misconfiguration, not a finding.
+query I
+SELECT avg(CASE WHEN value < 0 THEN 1.0 ELSE 0.0 END) < 0.05
+FROM prior_draws WHERE param = 'mu' AND draw >= 0;
+----
+true
+
+#######################################
+# It is the PRIOR, not the posterior
+#######################################
+
+# The defining property. Ten-fold the data and the prior draws must not move; if they
+# moved at all, the pre-fit gate would be agreeing with the very observations it
+# exists to be checked against.
+statement ok
+CREATE TABLE elsewhere(depot VARCHAR, days DOUBLE);
+
+statement ok
+INSERT INTO elsewhere
+SELECT 'BER', 300 + (i % 5) FROM range(30) t(i)
+UNION ALL SELECT 'HAM', 600 + (i % 4) FROM range(30) t(i);
+
+statement ok
+CREATE TABLE prior_elsewhere AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT depot, days FROM elsewhere),
+    'conjugate_anomaly',
+    {'value': 'days', 'group': 'depot', 'draws': 4000, 'seed': 11,
+     'prior': {'mu0': 6.0, 'kappa0': 1.0, 'alpha0': 4.0, 'beta0': 24.0},
+     'sample_from': 'prior'});
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT group_id, draw, param, value FROM prior_draws       WHERE draw >= 0
+    EXCEPT ALL
+    SELECT group_id, draw, param, value FROM prior_elsewhere   WHERE draw >= 0
+);
+----
+true
+
+# The posterior over the same data, by contrast, tracks it closely -- which is the
+# contrast that makes the test above meaningful rather than a statement that the
+# function ignores its input.
+statement ok
+CREATE TABLE posterior_draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT depot, days FROM deliveries),
+    'conjugate_anomaly',
+    {'value': 'days', 'group': 'depot', 'draws': 4000, 'seed': 11,
+     'prior': {'mu0': 6.0, 'kappa0': 1.0, 'alpha0': 4.0, 'beta0': 24.0}});
+
+query I
+SELECT value FROM posterior_draws WHERE param = '__sample_from__';
+----
+0.000000
+
+# The posterior is much tighter than the prior, and centred where the data is.
+query II
+SELECT p.sd < r.sd / 2, abs(p.mid - 5.0) < 0.5
+FROM (SELECT stddev_samp(value) AS sd, median(value) AS mid FROM posterior_draws
+      WHERE param = 'mu' AND group_id = 'BER' AND draw >= 0) p,
+     (SELECT stddev_samp(value) AS sd FROM prior_draws
+      WHERE param = 'mu' AND group_id = 'BER' AND draw >= 0) r;
+----
+true	true
+
+# The two tables are different fits and must carry different ids, so a cache cannot
+# serve one for the other. `sample_from` is part of the canonical config, so this
+# holds without any special-casing.
+query I
+SELECT (SELECT DISTINCT model_id FROM prior_draws)
+    <> (SELECT DISTINCT model_id FROM posterior_draws);
+----
+true

@@ -320,6 +320,7 @@ mod tests {
                 n_chains: 1,
                 n_draws: 200_000,
                 seed: 17,
+                sample_from: crate::types::SampleFrom::Posterior,
             };
             let exact = ExactEngine.sample(&*model, &opts).unwrap();
             let laplace = LaplaceEngine.sample(&*model, &opts).unwrap();
@@ -386,6 +387,7 @@ mod tests {
                 n_chains: 1,
                 n_draws: 200_000,
                 seed: 31,
+                sample_from: crate::types::SampleFrom::Posterior,
             };
             let p = model.param_names().len();
             let mean_of = |values: &[f64]| {
@@ -429,6 +431,7 @@ mod tests {
                 n_chains: 1,
                 n_draws: 200_000,
                 seed: 19,
+                sample_from: crate::types::SampleFrom::Posterior,
             };
             let exact = ExactEngine.sample(&*model, &opts).unwrap();
             let laplace = LaplaceEngine.sample(&*model, &opts).unwrap();
@@ -462,6 +465,7 @@ mod tests {
                 n_chains: 2,
                 n_draws: 100,
                 seed: 23,
+                sample_from: crate::types::SampleFrom::Posterior,
             };
             let a = LaplaceEngine.sample(&*model, &opts).unwrap();
             let b = LaplaceEngine.sample(&*model, &opts).unwrap();
@@ -483,6 +487,7 @@ mod tests {
                         n_chains: 1,
                         n_draws: 20_000,
                         seed: 29,
+                        sample_from: crate::types::SampleFrom::Posterior,
                     },
                 )
                 .unwrap();
@@ -519,6 +524,7 @@ mod tests {
             n_chains: 1,
             n_draws: 200_000,
             seed,
+            sample_from: crate::types::SampleFrom::Posterior,
         };
         let exact = ExactEngine.sample(&*model, &opts).unwrap();
         let laplace = LaplaceEngine.sample(&*model, &opts).unwrap();
@@ -702,6 +708,7 @@ mod tests {
                     n_chains: 1,
                     n_draws: 1000,
                     seed: 47,
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )
             .unwrap();

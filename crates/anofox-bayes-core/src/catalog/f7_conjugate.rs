@@ -56,6 +56,7 @@ const SLOTS: &[&str] = &[
     "max_draw_megabytes",
     "seed",
     "engine",
+    "sample_from",
     "min_obs",
 ];
 
@@ -105,6 +106,24 @@ impl ModelFamily for ConjugateAnomaly {
         }
 
         let prior = Prior::parse(&cfg.nested("prior")?, likelihood)?;
+
+        // Fail before any arithmetic, per the module contract: a request that cannot
+        // be served should say so precisely and immediately, not once per draw.
+        if cfg.opt_str("sample_from")? == Some("prior") && !prior.is_proper(likelihood) {
+            let needed = match likelihood {
+                Likelihood::Normal => "prior.kappa0, prior.alpha0 and prior.beta0 must all be > 0",
+                Likelihood::Poisson => "prior.a0 and prior.b0 must both be > 0",
+            };
+            return Err(BayesError::config(
+                "sample_from",
+                format!(
+                    "a prior predictive check needs a proper prior, and this fit's prior \
+                     is improper. The defaults are reference priors, which are scale-free \
+                     precisely because they carry no finite mass -- there is nothing to \
+                     draw from. Set an explicit prior: {needed}"
+                ),
+            ));
+        }
 
         // Column resolution and null filtering happen before any arithmetic, so a
         // typo'd column name never reaches the mathematics.
@@ -156,6 +175,9 @@ impl ModelFamily for ConjugateAnomaly {
             params,
             rows.len(),
             fingerprint,
+            prior
+                .is_proper(likelihood)
+                .then(|| prior.as_kind(likelihood)),
         )))
     }
 }
@@ -216,6 +238,41 @@ struct Prior {
 }
 
 impl Prior {
+    /// The prior written in the same form as the posterior.
+    ///
+    /// Conjugacy is exactly the statement that these are the same distribution family
+    /// with different hyperparameters, so a prior-predictive draw reuses the posterior
+    /// sampler unchanged rather than duplicating it — which also means the two cannot
+    /// drift apart.
+    fn as_kind(&self, likelihood: Likelihood) -> PosteriorKind {
+        match likelihood {
+            Likelihood::Normal => PosteriorKind::Nig {
+                mu_n: self.mu0,
+                kappa_n: self.kappa0,
+                alpha_n: self.alpha0,
+                beta_n: self.beta0,
+            },
+            Likelihood::Poisson => PosteriorKind::Gamma {
+                a_n: self.a0,
+                b_n: self.b0,
+            },
+        }
+    }
+
+    /// Whether the prior is a distribution at all.
+    ///
+    /// The defaults are *reference* priors — `kappa0 = 0`, `alpha0 = -1/2`,
+    /// `beta0 = 0` for the Normal, `b0 = 0` for the Poisson — chosen because they are
+    /// scale-free. Scale-free is bought by being improper: they have no normalising
+    /// constant and no finite mass, so there is nothing to draw from. They make a
+    /// perfectly good posterior once data arrives, and no prior predictive at all.
+    fn is_proper(&self, likelihood: Likelihood) -> bool {
+        match likelihood {
+            Likelihood::Normal => self.kappa0 > 0.0 && self.alpha0 > 0.0 && self.beta0 > 0.0,
+            Likelihood::Poisson => self.a0 > 0.0 && self.b0 > 0.0,
+        }
+    }
+
     fn parse(cfg: &Config, likelihood: Likelihood) -> BayesResult<Self> {
         match likelihood {
             Likelihood::Normal => {
@@ -489,7 +546,15 @@ impl GroupPosterior {
             out.fill(f64::NAN);
             return Ok(());
         }
-        match self.kind {
+        sample_kind(self.kind, rng, out)
+    }
+}
+
+/// Draw one sample from a conjugate kind, whether it holds prior or posterior
+/// hyperparameters. Shared so the prior predictive cannot drift from the posterior.
+fn sample_kind(kind: PosteriorKind, rng: &mut BayesRng, out: &mut [f64]) -> BayesResult<()> {
+    {
+        match kind {
             PosteriorKind::Nig {
                 mu_n,
                 kappa_n,
@@ -528,6 +593,9 @@ struct CompiledConjugate {
     /// exact engine gives: NULL for that group, real numbers for the rest.
     theta_offsets: Vec<Option<usize>>,
     dim: usize,
+    /// The prior, in posterior form, for a prior-predictive check. `None` when the
+    /// prior is improper and therefore not a distribution to draw from.
+    prior_kind: Option<PosteriorKind>,
 }
 
 impl CompiledConjugate {
@@ -537,6 +605,7 @@ impl CompiledConjugate {
         params: Vec<ParamName>,
         n_obs: usize,
         fingerprint: String,
+        prior_kind: Option<PosteriorKind>,
     ) -> Self {
         let width = likelihood.param_names().len();
         let mut dim = 0usize;
@@ -560,6 +629,7 @@ impl CompiledConjugate {
             fingerprint,
             theta_offsets,
             dim,
+            prior_kind,
         }
     }
 
@@ -770,6 +840,34 @@ impl ExactPosterior for CompiledConjugate {
         }
         for (i, posterior) in self.posteriors.iter().enumerate() {
             posterior.sample_into(rng, &mut out[i * width..(i + 1) * width])?;
+        }
+        Ok(())
+    }
+
+    /// Draw from the prior, independently per group.
+    ///
+    /// Independently, because the prior *is* independent across groups in this family
+    /// — nothing is shared until data arrives. Every group therefore gets its own
+    /// draw rather than one draw broadcast, which is what makes the prior predictive
+    /// show the spread the model actually assumes across groups rather than a single
+    /// group's uncertainty repeated.
+    fn sample_prior_into(&self, rng: &mut BayesRng, out: &mut [f64]) -> BayesResult<()> {
+        let Some(kind) = self.prior_kind else {
+            return Err(BayesError::config(
+                "sample_from",
+                "this fit's prior is improper, so there is nothing to draw from",
+            ));
+        };
+        let width = self.likelihood.param_names().len();
+        if out.len() != self.posteriors.len() * width {
+            return Err(BayesError::DimensionMismatch(format!(
+                "expected {} slots, got {}",
+                self.posteriors.len() * width,
+                out.len()
+            )));
+        }
+        for i in 0..self.posteriors.len() {
+            sample_kind(kind, rng, &mut out[i * width..(i + 1) * width])?;
         }
         Ok(())
     }
@@ -1546,5 +1644,110 @@ mod tests {
             1,
             "exactly the EMPTY lane is unready"
         );
+    }
+    //=== Prior predictive (BR-11) ==========================================//
+
+    fn draw_prior(model: &dyn CompiledModel, n: usize, seed: u64) -> Vec<Vec<f64>> {
+        let exact = model.as_exact().expect("family is conjugate");
+        let width = model.param_names().len();
+        let mut rng = BayesRng::for_chain(seed, 0);
+        let mut cols = vec![Vec::with_capacity(n); width];
+        let mut slot = vec![0.0; width];
+        for _ in 0..n {
+            exact.sample_prior_into(&mut rng, &mut slot).unwrap();
+            for (c, v) in cols.iter_mut().zip(&slot) {
+                c.push(*v);
+            }
+        }
+        cols
+    }
+
+    /// The point of a prior-predictive check: the draws must reflect the *prior*, so
+    /// they must be insensitive to the data. If they tracked the data at all, the
+    /// pre-fit gate would agree with the observations it is meant to be checked
+    /// against, which is the one thing it must never do.
+    #[test]
+    fn prior_draws_do_not_depend_on_the_data() {
+        let cfg = r#"{"value": "cost",
+                      "prior": {"mu0": 10.0, "kappa0": 4.0, "alpha0": 3.0, "beta0": 2.0}}"#;
+
+        let cheap = Frame::new(5).numeric("cost", vec![1.0, 1.1, 0.9, 1.05, 1.0]);
+        let refs = cheap.key_refs();
+        let view = cheap.view(&refs);
+        let a = draw_prior(&*compile(cfg, &view).unwrap(), 4_000, 11);
+
+        let dear = Frame::new(5).numeric("cost", vec![900.0, 910.0, 890.0, 905.0, 895.0]);
+        let refs = dear.key_refs();
+        let view = dear.view(&refs);
+        let b = draw_prior(&*compile(cfg, &view).unwrap(), 4_000, 11);
+
+        assert_eq!(a[0], b[0], "prior draws for mu moved with the data");
+        assert_eq!(a[1], b[1], "prior draws for sigma moved with the data");
+    }
+
+    /// ...and they must match the prior that was actually specified. Under
+    /// NIG(mu0, kappa0, alpha0, beta0) the marginal prior mean of `mu` is `mu0` and
+    /// the prior mean of `sigma^2` is `beta0 / (alpha0 - 1)`.
+    #[test]
+    fn prior_draws_match_the_specified_prior_moments() {
+        let frame = Frame::new(5).numeric("cost", vec![1.0, 1.1, 0.9, 1.05, 1.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(
+            r#"{"value": "cost",
+                "prior": {"mu0": 10.0, "kappa0": 4.0, "alpha0": 3.0, "beta0": 2.0}}"#,
+            &view,
+        )
+        .unwrap();
+
+        let cols = draw_prior(&*model, 200_000, 5);
+        let mu_mean = mean(&cols[0]);
+        assert!((mu_mean - 10.0).abs() < 0.05, "prior mean of mu: {mu_mean}");
+
+        // E[sigma^2] = beta0 / (alpha0 - 1) = 2 / 2 = 1.
+        let var_mean = cols[1].iter().map(|s| s * s).sum::<f64>() / cols[1].len() as f64;
+        assert!(
+            (var_mean - 1.0).abs() < 0.05,
+            "prior mean of sigma^2: {var_mean}"
+        );
+    }
+
+    /// The default priors are the *reference* priors, and a reference prior is
+    /// improper -- it has no normalising constant and there is nothing to draw from.
+    /// The request must be refused rather than served from some arbitrary proper
+    /// stand-in, which would silently answer a different question.
+    #[test]
+    fn a_prior_predictive_check_is_refused_under_an_improper_default_prior() {
+        let frame = Frame::new(5).numeric("cost", vec![1.0, 1.1, 0.9, 1.05, 1.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let err = compile(r#"{"value": "cost", "sample_from": "prior"}"#, &view).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("improper") && msg.contains("prior"),
+            "the refusal must say why: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_poisson_prior_predictive_matches_its_gamma_prior() {
+        let frame = Frame::new(4)
+            .numeric("claims", vec![2.0, 3.0, 1.0, 4.0])
+            .numeric("ships", vec![100.0, 120.0, 90.0, 110.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(
+            r#"{"value": "claims", "likelihood": "poisson", "exposure": "ships",
+                "prior": {"a0": 6.0, "b0": 3.0}, "sample_from": "prior"}"#,
+            &view,
+        )
+        .unwrap();
+
+        // Gamma(a0 = 6, rate b0 = 3): mean 2, variance a0/b0^2 = 2/3.
+        let cols = draw_prior(&*model, 200_000, 7);
+        let m = mean(&cols[0]);
+        let v = cols[0].iter().map(|x| (x - m).powi(2)).sum::<f64>() / cols[0].len() as f64;
+        assert!((m - 2.0).abs() < 0.02, "prior mean: {m}");
+        assert!((v - 2.0 / 3.0).abs() < 0.02, "prior variance: {v}");
     }
 }

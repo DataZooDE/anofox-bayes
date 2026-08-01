@@ -60,6 +60,7 @@ Emitted exactly once per fit, with `group_id = '__global__'`.
 | `param` | Meaning |
 |---|---|
 | `__schema_version__` | version of this contract |
+| `__sample_from__` | `0` posterior, `1` prior — see below |
 | `__family__` | which catalog family produced the table — see below |
 | `__status__` | `0` converged, `1` degenerate, `2` insufficient_data, `3` failed |
 | `__engine__` | `0` exact, `1` laplace, `2` nuts |
@@ -68,6 +69,14 @@ Emitted exactly once per fit, with `group_id = '__global__'`.
 | `__n_groups__` | distinct groups fitted |
 | `__n_groups_unready__` | how many of those groups the family refused — see below |
 | `__n_chains__`, `__n_draws__` | sampling shape |
+
+**`__sample_from__` distinguishes a fit from a pre-fit check.** A prior-predictive
+table (`sample_from: 'prior'`) has the identical schema to a posterior one and means
+something entirely different — it is what the model assumed *before* seeing any data.
+Acting on it in the belief that it is the posterior is acting on no evidence at all,
+so the distinction travels with the table rather than living in whoever wrote it.
+`sample_from` is part of the canonical config, so the two also carry different
+`model_id`s and a cache cannot serve one for the other.
 
 Carrying status *inside* the draws table is deliberate. An agent that persists one
 table has persisted the fit, its provenance and its refusal status together; there is

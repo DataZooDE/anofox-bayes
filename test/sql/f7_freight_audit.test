@@ -54,11 +54,11 @@ draw	INTEGER
 param	VARCHAR
 value	DOUBLE
 
-# 3 lanes x (mu, sigma) x 4000 draws, plus the 10 model-metadata rows.
+# 3 lanes x (mu, sigma) x 4000 draws, plus the 11 model-metadata rows.
 query I
 SELECT count(*) FROM draws;
 ----
-24010
+24011
 
 # One model, one id.
 query I

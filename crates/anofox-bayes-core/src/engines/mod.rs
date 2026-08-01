@@ -32,6 +32,8 @@ pub struct SampleOptions {
     pub n_chains: usize,
     pub n_draws: usize,
     pub seed: u64,
+    /// Posterior unless the caller asked for a prior-predictive check.
+    pub sample_from: crate::types::SampleFrom,
 }
 
 impl Default for SampleOptions {
@@ -42,6 +44,7 @@ impl Default for SampleOptions {
             // independent sampler, without making a per-group fit expensive.
             n_draws: 1000,
             seed: crate::config::DEFAULT_SEED,
+            sample_from: crate::types::SampleFrom::Posterior,
         }
     }
 }

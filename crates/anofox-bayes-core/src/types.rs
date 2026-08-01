@@ -126,6 +126,46 @@ impl FamilyCode {
 ///
 /// Recorded in the draws table so that a downstream consumer can tell an exact
 /// conjugate posterior from a Gaussian approximation to one — the numbers look
+/// Which distribution a fit draws from.
+///
+/// A **prior predictive** check (BR-11) is the pre-fit gate: draw parameters from the
+/// prior alone, simulate data, and look at whether the implied data is physically
+/// plausible before spending anything on the posterior. A prior that puts most of its
+/// mass on negative delivery times is a modelling error worth finding in the first
+/// second rather than the last.
+///
+/// It is a config slot rather than a separate function because the output is the same
+/// draws contract, and because being part of the canonical config means `model_id`
+/// covers it for free -- a prior-predictive table and a posterior table over the same
+/// data cannot collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum SampleFrom {
+    #[default]
+    Posterior = 0,
+    Prior = 1,
+}
+
+impl SampleFrom {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SampleFrom::Posterior => "posterior",
+            SampleFrom::Prior => "prior",
+        }
+    }
+
+    pub fn parse(name: &str) -> BayesResult<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "posterior" => Ok(SampleFrom::Posterior),
+            "prior" => Ok(SampleFrom::Prior),
+            other => Err(BayesError::config(
+                "sample_from",
+                format!("unknown: '{other}'; expected 'posterior' or 'prior'"),
+            )),
+        }
+    }
+}
+
 /// identical in SQL but do not carry the same warranty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]

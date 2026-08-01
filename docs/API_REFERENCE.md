@@ -119,7 +119,51 @@ exists to detect a Markov chain that has not mixed, and both v0.1 engines draw
 if you want the cross-check for its own sake; the gate in v0.1 is ESS. It becomes
 load-bearing when the NUTS engine lands. Memory scales linearly with it.
 
-### 1.3 Engines
+### 1.3 `sample_from` — the prior-predictive check
+
+| Value | Meaning |
+|---|---|
+| `'posterior'` (default) | Condition on the data. The ordinary fit. |
+| `'prior'` | Draw from the prior alone, ignoring the data. |
+
+A **prior predictive** is the pre-fit gate (BR-11): before spending anything on a
+posterior, check that the model as configured considers the observed world possible.
+A prior implying negative delivery times is a modelling error worth finding in the
+first second rather than defending in the last.
+
+```sql
+-- Does the prior already rule out what we routinely observe?
+SELECT anofox_bayes_credible_lower(value, 0.95) AS lo,
+       anofox_bayes_credible_upper(value, 0.95) AS hi
+FROM anofox_bayes_fit((SELECT depot, days FROM deliveries), 'conjugate_anomaly',
+       {'value': 'days', 'group': 'depot', 'sample_from': 'prior',
+        'prior': {'mu0': 6.0, 'kappa0': 1.0, 'alpha0': 4.0, 'beta0': 24.0}})
+WHERE param = 'mu' AND draw >= 0;
+```
+
+Same function, same output contract, one slot changed — so an agent gates on it with
+the SQL it already has. The result carries `__sample_from__ = 1` and a distinct
+`model_id`.
+
+**It requires a proper prior, and refuses without one.** The shipped defaults are
+*reference* priors: scale-free, and improper for exactly that reason — they carry no
+finite mass, so there is nothing to draw from. They make a perfectly good posterior
+once data arrives. Set an explicit prior to run the check:
+
+| Family | Slots that must be positive |
+|---|---|
+| `conjugate_anomaly`, Normal | `prior.kappa0`, `prior.alpha0`, `prior.beta0` |
+| `conjugate_anomaly`, Poisson | `prior.a0`, `prior.b0` |
+| `pooled_gaussian` | `prior.intercept_scale`, `prior.beta_scale`, `prior.a0`, `prior.s0` |
+
+`pooled_gaussian`'s `prior.intercept_scale` exists for this and defaults to flat, which
+is what shipped and what an ordinary fit still gets: an intercept prior centred at zero
+says something nobody means. A joint prior with one flat coordinate is improper, so
+without the slot the check would be permanently unavailable for that family.
+
+Worked example: `test/sql/prior_predictive.test`.
+
+### 1.4 Engines
 
 | Value | Status |
 |---|---|
@@ -150,7 +194,7 @@ ran is on the table too, as `__family__`: `3` for `pooled_gaussian`, `7` for
 `anofox_bayes_family_text(param, value)`. See
 [the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
-### 1.4 Null handling and grouping
+### 1.5 Null handling and grouping
 
 Rows with a `NULL` in any column the model reads (the value/response, any
 predictor, any exposure, the group key) are dropped before fitting. `__n_obs__`
