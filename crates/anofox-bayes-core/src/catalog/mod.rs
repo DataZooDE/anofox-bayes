@@ -16,6 +16,7 @@
 //!
 //! Adding an engine touches no family. Adding a family touches no engine.
 
+pub mod f2_censored_aft;
 pub mod f3_pooled_gaussian;
 pub mod f7_conjugate;
 
@@ -60,6 +61,21 @@ impl Readiness {
     pub fn degenerate(reason: impl Into<String>) -> Self {
         Self {
             status: FitStatus::Degenerate,
+            reasons: vec![reason.into()],
+        }
+    }
+
+    /// The fit could not be completed at all: there is no mode, so there is no
+    /// posterior to approximate. Distinct from [`Readiness::degenerate`], where a
+    /// point was found and the curvature there turned out not to be a covariance.
+    ///
+    /// Draws for the affected parameters are NULL-shaped rather than absent, so that
+    /// the shape of a draws table does not depend on whether the fit succeeded — a
+    /// consumer joins on the same columns either way and reads `__status__` to find
+    /// out.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            status: FitStatus::Failed,
             reasons: vec![reason.into()],
         }
     }
@@ -171,6 +187,75 @@ pub trait CompiledModel: std::fmt::Debug {
     fn as_differentiable(&self) -> Option<&dyn LogPosterior> {
         None
     }
+
+    /// A Gaussian approximation the family already holds, for a fit performed
+    /// elsewhere.
+    ///
+    /// Returning `Some` says: the mode and the curvature at it were computed by
+    /// something that is not this crate's Newton search — today, `anofox-stats-core`
+    /// through [`crate::bridge`] — so there is nothing left for the Laplace engine to
+    /// find, only draws to generate. See [`GaussianApproximation`].
+    fn as_gaussian(&self) -> Option<&dyn GaussianApproximation> {
+        None
+    }
+}
+
+/// One independent Gaussian block of a posterior.
+///
+/// A block is a set of parameters fitted jointly and independently of every other
+/// block — one per group for a per-group model, exactly one for a pooled one. Blocks
+/// exist rather than one big matrix because a per-group fit is genuinely block
+/// diagonal, and because a group that could not be fitted is simply absent from the
+/// list instead of contributing a row of zeros that would have to be special-cased in
+/// the factorisation.
+#[derive(Debug, Clone)]
+pub struct GaussianBlock {
+    /// The mode, on the unconstrained scale.
+    pub mode: Vec<f64>,
+    /// The observed information at the mode — the **full** symmetric positive-definite
+    /// matrix, never its diagonal.
+    ///
+    /// The precision rather than the covariance because that is what a Cholesky
+    /// factor of it is directly useful for: `theta = mode + L^-T z` needs a factor of
+    /// the precision, so forming the covariance and factoring *that* would cost an
+    /// inversion and lose conditioning for nothing.
+    ///
+    /// **Why this is a matrix and not a vector.** Its off-diagonal is the correlation
+    /// between coefficients, and in a regression with a covariate measured away from
+    /// zero that correlation dominates the width of any predictive interval. A
+    /// diagonal here would produce draws that are individually plausible, pass every
+    /// diagnostic in this crate, and imply intervals wrong by an order of magnitude.
+    pub precision: faer::Mat<f64>,
+    /// Which entries of [`CompiledModel::param_names`] this block writes, in the order
+    /// [`GaussianApproximation::constrain`] fills them.
+    pub params: Vec<usize>,
+}
+
+/// A model that arrives already fitted: a mode and the full curvature at it.
+///
+/// This is the seam onto a fit performed outside this crate. A MAP estimate plus its
+/// observed information *is* a Laplace posterior, so a family that can produce those
+/// two objects needs nothing else from an engine except the last step — sample the
+/// multivariate normal and back-transform.
+///
+/// It is deliberately separate from [`LogPosterior`]. A family exposing a log density
+/// and a gradient is asking the engine to *find* the mode; a family implementing this
+/// trait already knows it, and the engine must not go looking for a different one.
+/// Keeping the two apart is also what keeps the warranty honest: a bridged posterior
+/// is `EngineKind::Laplace` — a Gaussian approximation — regardless of who computed
+/// the curvature, and it carries the same obligation to an SBC suite.
+pub trait GaussianApproximation {
+    /// The independent blocks of the posterior. Parameters covered by no block are
+    /// reported as NULL, which is how a refused group travels.
+    fn blocks(&self) -> &[GaussianBlock];
+
+    /// Map one block's unconstrained draw onto the parameters it reports.
+    ///
+    /// `theta` has `blocks()[block].mode.len()` entries; `out` has
+    /// `blocks()[block].params.len()`. The two need not be the same length — a family
+    /// may report a parameter it does not sample over, or sample a coordinate it does
+    /// not report.
+    fn constrain(&self, block: usize, theta: &[f64], out: &mut [f64]);
 }
 
 /// A model whose posterior is available in closed form.
@@ -248,6 +333,7 @@ pub fn lookup(id: &str) -> BayesResult<&'static dyn ModelFamily> {
 /// Every family in the catalog.
 pub fn all() -> &'static [&'static dyn ModelFamily] {
     const FAMILIES: &[&dyn ModelFamily] = &[
+        &f2_censored_aft::CensoredAft,
         &f3_pooled_gaussian::PooledGaussian,
         &f7_conjugate::ConjugateAnomaly,
     ];

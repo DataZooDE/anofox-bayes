@@ -115,7 +115,7 @@ the single most useful thing a prior does.
 > which is fine for a posterior but means they cannot be *sampled from*; that has a
 > consequence for validation, see [§8](#8-how-we-know-it-is-right).
 
-## 4. The two shipped families
+## 4. The shipped families
 
 Model families are **code, not user input**. You choose among them and tune documented
 slots; you cannot write your own likelihood. That is a deliberate restriction: it is
@@ -189,8 +189,8 @@ on the `__engine__` row so a reviewer can see which one ran.
 
 | Engine | What it does | Status |
 |---|---|---|
-| `exact` | Samples the closed-form posterior directly. No approximation. | default for both families |
-| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on both families |
+| `exact` | Samples the closed-form posterior directly. No approximation. | default for the two conjugate families |
+| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available everywhere; **the** engine for `censored_aft` |
 | `nuts` | General-purpose sampler for models with no closed form. | planned (0.2) |
 
 Where a closed form exists, `exact` is both faster and more accurate, so it is the
@@ -216,6 +216,48 @@ the group's own observation count, not the size of the table. That is a strong r
 to leave `exact` in place here: an anomaly model earns its keep on exactly the thin
 lanes where the approximation is worst, and too narrow is the direction that
 manufactures both false alarms and unearned all-clears.
+
+### `censored_aft` — a bridged Laplace posterior
+
+`censored_aft` is the first family here with **no closed form at all**, so `laplace` is
+not a cross-check on it — it is the fit. That matters for how much you should trust it,
+and the honest accounting is:
+
+The mode and the curvature are not computed here. They come from `anofox-statistics`,
+which already owns a tested censored AFT likelihood, its analytic gradient and Hessian,
+and a Newton search with damping. anofox-bayes calls that fit in-process, reassembles
+the observed information at the mode it returns, and turns the pair into draws. A MAP
+estimate together with its observed information *is* a Laplace posterior; the only step
+that was missing was sampling the multivariate normal.
+
+**The full covariance is used, and that is the whole ballgame.** The upstream fit
+publishes only standard errors — the diagonal. Sampling from a diagonal treats every
+coefficient as independent, and in a duration model with a covariate measured away from
+zero the intercept and the slope are almost perfectly anti-correlated: measured on the
+test fixture, `corr = −0.998`. Their errors then cancel in the linear predictor, so the
+predictive standard deviation computed from the full matrix is about **25 times
+smaller** than the one computed from the diagonal. Both answers are finite, both pass
+every diagnostic, and only one is the posterior.
+
+**What has been certified, and what has not.** SBC requires drawing the truth from the
+prior the fit actually uses, and the upstream fit accepts priors on the coefficients
+and on nothing else — the scale is estimated by maximum likelihood under a flat prior.
+So:
+
+| Suite | Result (χ², 15 df; threshold 37.7) |
+|---|---|
+| `exponential`, n = 200 — every free parameter properly priored | **13.0 / 12.8 — passes.** A complete certificate for the bridge |
+| `weibull`, n = 200 — coefficients only | 14.0 / 14.2 — passes, but *conditional*: `sigma` is uncertified |
+| `exponential`, n = 25, heavily censored | 7.2 / 9.7 — calibrated even on a thin cohort |
+
+`sigma` **is not SBC-certified for the distributions that estimate it**, and cannot be
+until `anofox-statistics` grows a prior slot on the scale. That is a one-field change
+upstream, and until it lands the gap is stated here rather than left to be discovered.
+
+Worth contrasting with `conjugate_anomaly`: the thin-cohort result is *good*, where
+F7's is bad (29 % too narrow at n = 6). The difference is what is being approximated.
+A regression coefficient's posterior is close to Gaussian at modest sample sizes; a
+variance parameter's is not.
 
 > **In detail.** Laplace works on an unconstrained scale — `sigma` is sampled as
 > `log sigma`, so every draw is positive by construction; a Gaussian fitted directly to
@@ -322,6 +364,20 @@ priors — and the defaults here are reference priors, which are improper. The P
 covers exactly that gap: it found a real degrees-of-freedom error in `pooled_gaussian`
 that SBC structurally could not see, and that the per-parameter tolerances were too
 loose to catch. Neither harness is redundant.
+
+**And a fourth, learned from the bridge: a per-parameter check cannot certify a
+covariance.** SBC ranks each parameter on its own, so it tests *marginal* posteriors —
+and the marginals are exactly what a covariance matrix's diagonal preserves. Replacing
+`censored_aft`'s posterior precision with its own diagonal, which would throw away
+every correlation between coefficients, leaves **219 of 220 unit tests and all six SBC
+suites green**. The one test that fails is the one written on a *function of several
+parameters at once* — the standard deviation of the linear predictor, checked against
+the full-covariance answer and against the diagonal-only one, which differ by a factor
+of 25.
+
+So every family gets at least one assertion on a linear combination of its parameters,
+not only on each parameter separately. Marginal checks cannot see a joint error, and a
+joint error is what produces a confidently wrong interval.
 
 ## 9. Further reading
 

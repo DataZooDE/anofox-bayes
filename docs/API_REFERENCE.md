@@ -18,6 +18,7 @@ names, and `NULL` semantics. This document does not duplicate it.
 2. [Model families](#2-model-families)
    - [`conjugate_anomaly` (F7)](#21-conjugate_anomaly-f7)
    - [`pooled_gaussian` (F3)](#22-pooled_gaussian-f3)
+   - [`censored_aft` (F2)](#23-censored_aft-f2)
 3. [Diagnostics aggregates](#3-diagnostics-aggregates)
 4. [Scalar functions](#4-scalar-functions)
 5. [Settings](#5-settings)
@@ -167,8 +168,8 @@ Worked example: `test/sql/prior_predictive.test`.
 
 | Value | Status |
 |---|---|
-| `exact` | **Available**, and the default for both families. Samples the closed-form conjugate posterior directly — no approximation, so where it applies it is both faster and more accurate. |
-| `laplace` | **Available on both families.** Fits a Gaussian at the posterior mode on an unconstrained scale. Neither family needs it — both are conjugate — so on both it serves as an independent check on the exact posterior rather than as the way to fit. |
+| `exact` | **Available**, and the default for the two conjugate families. Samples the closed-form posterior directly — no approximation, so where it applies it is both faster and more accurate. Not available for `censored_aft`, whose posterior has no closed form; asking for it there is an error rather than a silent substitution. |
+| `laplace` | **Available on every family, and the default for `censored_aft`.** Fits a Gaussian at the posterior mode on an unconstrained scale. On the conjugate families it serves as an independent check on the exact posterior rather than as the way to fit; on `censored_aft` it is the fit. |
 | `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2. Until then use 'exact' … or 'laplace' …"*. |
 
 Switching engines changes no caller SQL: same function, same output columns, same
@@ -188,9 +189,11 @@ Prefer `exact` here — it is the default, it is faster, and a thin lane is prec
 what an anomaly model is looking at. Both engines have their own calibration suite. See
 [Theory §5](THEORY.md#5-engines).
 
-`__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. The family that
-ran is on the table too, as `__family__`: `3` for `pooled_gaussian`, `7` for
-`conjugate_anomaly` — the catalog F-numbers, decoded by
+`__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. **Read it.** An
+`exact` posterior and a `laplace` one look identical in SQL and do not carry the same
+warranty: the first is the posterior, the second is a Gaussian approximation to it.
+The family that ran is on the table too, as `__family__`: `2` for `censored_aft`,
+`3` for `pooled_gaussian`, `7` for `conjugate_anomaly` — the catalog F-numbers, decoded by
 `anofox_bayes_family_text(param, value)`. See
 [the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
@@ -447,6 +450,99 @@ FROM dd WHERE param = 'beta[treated_post]' AND draw >= 0;
 * A perfectly explained response leaves no residual variance to estimate, so the
   fit is `__status__ = 1` (`degenerate`) with `NULL` draws rather than infinitely
   confident.
+
+---
+
+### 2.3 `censored_aft` (F2)
+
+> Accelerated failure time regression with right censoring (Weibull, lognormal,
+> log-logistic, exponential); the inference layer for delivery-promise and
+> time-to-event questions.
+
+The model behind "how long until this happens, when some of them have not happened
+yet":
+
+```text
+log T = x'beta + sigma * W
+```
+
+A shipment that has been delivered contributes its density; one still in transit
+contributes its **survival** — the probability that it takes at least as long as we
+have watched it for. Dropping the ones still in transit is the obvious thing to do and
+it is wrong in a known direction: the ones still moving are the slow ones, so
+discarding them makes every lane look faster than it is.
+
+**This family is bridged, and carries a weaker warranty.** The likelihood, its
+gradient and the mode search come from
+[`anofox-statistics`](https://github.com/DataZooDE/anofox-statistics), called
+in-process; anofox-bayes contributes the posterior, the draws contract, the refusal
+path and the calibration. The posterior is a **Gaussian approximation at the mode**,
+not a closed form — `__engine__` reads `laplace` and there is no `exact` alternative.
+See [Theory §5](THEORY.md#5-engines) for what that costs and
+[§8](THEORY.md#8-how-we-know-it-is-right) for what has been certified.
+
+**Config slots**
+
+| Slot | Type | Default | Meaning |
+|---|---|---|---|
+| `time` | string | *required* | Duration column. Strictly positive: the elapsed time to the event, or to the moment observation stopped. A non-positive value is a request error naming the column, not weak evidence. |
+| `event` | string | *required* | `1` where the event was observed, `0` where the row is still open. Any other value is rejected. |
+| `x` | string or list | `[]` | Predictors. Their coefficients are on the **log-time** scale, so `exp(beta)` is a multiplicative effect on duration. |
+| `intercept` | 0/1 | `1` | Fit a duration level. |
+| `group` | string | — | Fit one **independent** model per group. There is no pooling across groups; a thin group borrows no strength from a thick one. |
+| `dist` | string | `weibull` | `weibull`, `lognormal`, `loglogistic`, `exponential`. `exponential` holds `sigma` at 1 rather than estimating it. |
+| `prior.beta_scale` | number | `∞` | `N(0, beta_scale)` on each predictor's coefficient. The intercept is never penalised — shrinking a duration *level* toward zero would claim everything happens instantly. |
+
+**Parameters reported** — per group: `intercept`, one `beta[<column>]` per predictor,
+and `sigma`. `sigma` is reported for every distribution, including `exponential` where
+it was not estimated, so a downstream query need not branch on `dist`.
+
+**Turning the posterior into a promise.** For a Weibull AFT the `p`-quantile of the
+duration is closed form, so a posterior *over the promise itself* is arithmetic over
+the draws table — no re-fit and no extension code:
+
+```sql
+-- The 95th-percentile transit time for an 800 km haul, one draw per posterior draw.
+WITH wide AS (
+    SELECT group_id AS lane, draw,
+           max(value) FILTER (WHERE param = 'intercept')            AS a,
+           max(value) FILTER (WHERE param = 'beta[distance_100km]') AS b,
+           max(value) FILTER (WHERE param = 'sigma')                AS s
+    FROM draws WHERE draw >= 0
+    GROUP BY group_id, draw
+)
+SELECT lane,
+       quantile_cont(exp(a + b * 8.0 + s * ln(-ln(1 - 0.95))), 0.9) AS promise_days
+FROM wide GROUP BY lane;
+```
+
+The inner `ln(-ln(1 - p))` is the quantile of the standard extreme-value error and is
+specific to `weibull`; `loglogistic` uses `ln(p / (1 - p))` and `lognormal` needs a
+probit. The outer `quantile_cont(..., 0.9)` is the part that matters commercially:
+publish a conservative quantile of the posterior, not its median, so the promise
+survives the model having been optimistic.
+
+Because every draw carries the level, the distance effect and the spread **jointly**,
+that promise inherits the correlation between them. It has to: in a duration model
+with a covariate measured away from zero, the intercept and the slope are strongly
+anti-correlated, and an interval built from their variances alone can be an order of
+magnitude too wide.
+
+**Refusal.** Statuses are mapped from the upstream fit, not inherited from it:
+
+| Situation | `__status__` |
+|---|---|
+| Every row in a group still open | `degenerate` — plenty of rows, no information about *when* |
+| Fewer usable rows than parameters | `insufficient_data` |
+| Rank-deficient design at the mode | `degenerate` — the curvature there is not a posterior |
+| Mode search did not converge | `failed` — there is no mode, so there is no posterior |
+| Non-positive duration, non-binary event | **not a status** — a request error naming the column |
+
+Refusal is per group and worst-wins for the model, with `__n_groups_unready__` saying
+how many groups the verdict is about. A refused group's draws are `NULL`, so it still
+appears in the table under its own name.
+
+**Worked example:** `test/sql/f2_delivery_promise.test`.
 
 ---
 
