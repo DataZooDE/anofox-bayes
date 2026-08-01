@@ -24,7 +24,7 @@ use crate::data::DataView;
 use crate::draws::ParamName;
 use crate::errors::{BayesError, BayesResult};
 use crate::rng::BayesRng;
-use crate::types::{EngineKind, FitStatus};
+use crate::types::{EngineKind, FamilyCode, FitStatus};
 
 /// A family's structural verdict on its data, reached before any sampling.
 ///
@@ -91,6 +91,13 @@ pub trait ModelFamily: Send + Sync + std::fmt::Debug {
     /// Stable identifier used in SQL and recorded in `model_id`.
     fn id(&self) -> &'static str;
 
+    /// Numeric identity written into the draws table as `__family__`.
+    ///
+    /// Separate from [`ModelFamily::id`] only because the `value` column is `DOUBLE`;
+    /// the two must name the same family, which
+    /// `a_family_code_and_a_family_id_name_the_same_family` enforces.
+    fn code(&self) -> FamilyCode;
+
     /// One-line description for the catalog listing.
     fn description(&self) -> &'static str;
 
@@ -127,6 +134,29 @@ pub trait CompiledModel: std::fmt::Debug {
 
     /// The structural verdict described on [`Readiness`].
     fn readiness(&self) -> Readiness;
+
+    /// How many of [`CompiledModel::n_groups`] groups did **not** reach
+    /// `FitStatus::Converged` on their own.
+    ///
+    /// [`Readiness::worst`] collapses per-group verdicts into one and continues to do
+    /// so: a fit covering 500 lanes of which three are unidentifiable is not 99.4 %
+    /// trustworthy, it is a fit an agent must look at. What the collapse throws away
+    /// is the *scale* of that inspection — three lanes and four hundred lanes reach
+    /// SQL as the same `insufficient_data`. This is the missing number, reported
+    /// beside the verdict rather than in place of it.
+    ///
+    /// The default is the honest answer for a family whose verdict is reached over
+    /// the whole design rather than per group: such a family cannot single out a
+    /// subset of its groups, so a downgrade implicates all of them. Over-counting is
+    /// also the safe direction — it sends an agent to look at more than it must,
+    /// never at less.
+    fn n_groups_unready(&self) -> usize {
+        if self.readiness().status.is_actionable() {
+            0
+        } else {
+            self.n_groups()
+        }
+    }
 
     /// Closed-form sampling, when the family is conjugate.
     ///
@@ -246,6 +276,41 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "duplicate family id in {ids:?}");
+    }
+
+    /// A family has one identity wearing two hats — a name for SQL and a number for
+    /// the `DOUBLE` value column of the draws table. If the two ever disagreed, a
+    /// persisted table would name a different model than the one that wrote it.
+    #[test]
+    fn a_family_code_and_a_family_id_name_the_same_family() {
+        for family in all() {
+            assert_eq!(
+                family.code().as_str(),
+                family.id(),
+                "family '{}' carries code {:?}, which names '{}'",
+                family.id(),
+                family.code(),
+                family.code().as_str()
+            );
+            assert_eq!(
+                FamilyCode::from_code(family.code() as i32),
+                Some(family.code()),
+                "the code of '{}' does not decode",
+                family.id()
+            );
+        }
+    }
+
+    /// Two families sharing a code would make a persisted draws table ambiguous about
+    /// which model produced it, which is the one question `__family__` exists to
+    /// answer.
+    #[test]
+    fn every_catalog_entry_has_a_distinct_family_code() {
+        let mut codes: Vec<i32> = all().iter().map(|f| f.code() as i32).collect();
+        let n = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), n, "duplicate family code in the catalog");
     }
 
     /// Worst-wins, not majority: a fit covering 500 lanes of which three are

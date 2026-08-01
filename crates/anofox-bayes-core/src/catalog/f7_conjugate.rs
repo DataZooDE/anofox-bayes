@@ -37,7 +37,7 @@ use crate::data::DataView;
 use crate::draws::ParamName;
 use crate::errors::{BayesError, BayesResult};
 use crate::rng::BayesRng;
-use crate::types::EngineKind;
+use crate::types::{EngineKind, FamilyCode};
 
 use super::{CompiledModel, ExactPosterior, ModelFamily, Readiness};
 
@@ -62,6 +62,10 @@ const SLOTS: &[&str] = &[
 impl ModelFamily for ConjugateAnomaly {
     fn id(&self) -> &'static str {
         "conjugate_anomaly"
+    }
+
+    fn code(&self) -> FamilyCode {
+        FamilyCode::ConjugateAnomaly
     }
 
     fn description(&self) -> &'static str {
@@ -488,6 +492,20 @@ impl CompiledModel for CompiledConjugate {
         Readiness::worst(self.posteriors.iter().map(|p| p.readiness.clone()))
     }
 
+    /// This family fits each group independently, so unlike the pooled families it
+    /// knows exactly which groups are the problem and can count them.
+    ///
+    /// An empty catalog of groups reports zero rather than one: `readiness` calls
+    /// that case insufficient, but there is no group it can be blamed on, and
+    /// `__n_groups__` is zero too. A count larger than the population it counts would
+    /// be worse than no count.
+    fn n_groups_unready(&self) -> usize {
+        self.posteriors
+            .iter()
+            .filter(|p| !p.readiness.status.is_actionable())
+            .count()
+    }
+
     fn as_exact(&self) -> Option<&dyn ExactPosterior> {
         Some(self)
     }
@@ -813,6 +831,57 @@ mod tests {
         assert_eq!(model.readiness().status, FitStatus::InsufficientData);
         let cols = draw(&*model, 50, 29);
         assert!(cols[0].iter().all(|v| v.is_finite()));
+    }
+
+    /// The count this family reports beside the collapsed verdict. Because it fits
+    /// each group independently it knows exactly which groups are thin, so the number
+    /// is exact rather than the conservative whole-model default.
+    #[test]
+    fn the_unready_groups_are_counted_exactly_while_the_verdict_stays_collapsed() {
+        // Four lanes: two with four invoices, two with two.
+        let frame = Frame::new(12)
+            .numeric(
+                "cost",
+                vec![
+                    1.0, 1.1, 0.9, 1.05, // A
+                    2.0, 2.1, 1.9, 2.05, // B
+                    5.0, 5.2, // THIN-1
+                    7.0, 7.3, // THIN-2
+                ],
+            )
+            .key(
+                "lane",
+                vec![
+                    "A", "A", "A", "A", "B", "B", "B", "B", "THIN-1", "THIN-1", "THIN-2", "THIN-2",
+                ],
+            );
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let model = compile(r#"{"value": "cost", "group": "lane", "min_obs": 3}"#, &view).unwrap();
+        assert_eq!(model.n_groups(), 4);
+        assert_eq!(model.n_groups_unready(), 2);
+        // The doctrine is unchanged: two good lanes do not make the fit safe.
+        assert_eq!(model.readiness().status, FitStatus::InsufficientData);
+
+        // Lowering the bar makes every lane ready, and the count follows.
+        let model = compile(r#"{"value": "cost", "group": "lane", "min_obs": 2}"#, &view).unwrap();
+        assert_eq!(model.n_groups_unready(), 0);
+        assert_eq!(model.readiness().status, FitStatus::Converged);
+    }
+
+    /// A group whose posterior does not exist at all is unready too — the count is
+    /// over readiness verdicts, not over one particular reason for failing them.
+    #[test]
+    fn a_group_with_no_estimable_posterior_counts_as_unready() {
+        let frame = Frame::new(5)
+            .numeric("cost", vec![1.0, 1.1, 0.9, 1.05, 42.0])
+            .key("lane", vec!["A", "A", "A", "A", "SOLO"]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(r#"{"value": "cost", "group": "lane"}"#, &view).unwrap();
+        assert_eq!(model.n_groups(), 2);
+        assert_eq!(model.n_groups_unready(), 1);
     }
 
     #[test]

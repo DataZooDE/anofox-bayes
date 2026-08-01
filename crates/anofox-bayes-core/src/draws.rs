@@ -22,7 +22,7 @@
 
 use crate::errors::BayesResult;
 use crate::types::{
-    validate_param_name, EngineKind, FitStatus, DRAWS_SCHEMA_VERSION, GLOBAL_GROUP,
+    validate_param_name, EngineKind, FamilyCode, FitStatus, DRAWS_SCHEMA_VERSION, GLOBAL_GROUP,
 };
 
 // Reserved parameter names. Sample statistics are per `(chain, draw)`; metadata rows
@@ -34,9 +34,11 @@ pub const PARAM_STEP_SIZE: &str = "__step_size__";
 
 pub const META_STATUS: &str = "__status__";
 pub const META_ENGINE: &str = "__engine__";
+pub const META_FAMILY: &str = "__family__";
 pub const META_SEED: &str = "__seed__";
 pub const META_N_OBS: &str = "__n_obs__";
 pub const META_N_GROUPS: &str = "__n_groups__";
+pub const META_N_GROUPS_UNREADY: &str = "__n_groups_unready__";
 pub const META_N_CHAINS: &str = "__n_chains__";
 pub const META_N_DRAWS: &str = "__n_draws__";
 pub const META_SCHEMA_VERSION: &str = "__schema_version__";
@@ -111,12 +113,20 @@ impl SampleStats {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelMeta {
     pub model_id: String,
-    pub family: String,
+    /// Which catalog family produced this posterior. Held as the code rather than as
+    /// the name so that the value written to `__family__` and the name used in
+    /// `model_id` cannot drift apart: `FamilyCode::as_str` is the only mapping.
+    pub family: FamilyCode,
     pub engine: EngineKind,
     pub status: FitStatus,
     pub seed: u64,
     pub n_obs: usize,
     pub n_groups: usize,
+    /// How many of `n_groups` failed their own readiness check. See
+    /// [`crate::catalog::CompiledModel::n_groups_unready`] — the model-level
+    /// `status` is still the collapsed worst-case verdict, and this says how much of
+    /// the fit that verdict is about.
+    pub n_groups_unready: usize,
 }
 
 /// A fitted posterior, before it becomes rows.
@@ -295,16 +305,27 @@ impl Posterior {
 
     fn meta_row(&self, i: usize) -> (&'static str, f64) {
         let m = &self.meta;
-        match META_ROWS[i] {
-            META_SCHEMA_VERSION => (META_SCHEMA_VERSION, DRAWS_SCHEMA_VERSION as f64),
-            META_STATUS => (META_STATUS, m.status as i32 as f64),
-            META_ENGINE => (META_ENGINE, m.engine as i32 as f64),
-            META_SEED => (META_SEED, m.seed as f64),
-            META_N_OBS => (META_N_OBS, m.n_obs as f64),
-            META_N_GROUPS => (META_N_GROUPS, m.n_groups as f64),
-            META_N_CHAINS => (META_N_CHAINS, self.n_chains as f64),
-            other => (other, self.n_draws as f64),
-        }
+        let value = match META_ROWS[i] {
+            META_SCHEMA_VERSION => DRAWS_SCHEMA_VERSION as f64,
+            META_STATUS => m.status as i32 as f64,
+            META_ENGINE => m.engine as i32 as f64,
+            META_FAMILY => m.family as i32 as f64,
+            META_SEED => m.seed as f64,
+            META_N_OBS => m.n_obs as f64,
+            META_N_GROUPS => m.n_groups as f64,
+            META_N_GROUPS_UNREADY => m.n_groups_unready as f64,
+            META_N_CHAINS => self.n_chains as f64,
+            META_N_DRAWS => self.n_draws as f64,
+            // Unreachable as long as `META_ROWS` and this match are edited together,
+            // which `every_metadata_row_reports_its_own_quantity` enforces. NaN
+            // rather than a panic — this runs inside a customer's DuckDB process —
+            // and NaN reaches SQL as NULL, which reads as "no value" rather than as
+            // some neighbouring row's number. The previous catch-all arm returned
+            // `n_draws`, so a name added to `META_ROWS` alone would have been
+            // published with a plausible and entirely wrong value.
+            _ => f64::NAN,
+        };
+        (META_ROWS[i], value)
     }
 
     /// The `nth` present statistic of a draw, in a fixed probe order.
@@ -328,13 +349,25 @@ impl Posterior {
 }
 
 /// Model-level metadata rows, in emission order. Part of the draws contract.
+///
+/// Its **length** is load-bearing: [`Posterior::row_at`] treats every index below it
+/// as a metadata row and subtracts it to reach the draws, and [`Posterior::n_rows`]
+/// adds it. Adding a name here therefore shifts every draw row by one and is only
+/// correct when [`Posterior::meta_row`] learns to produce that name's value — adding
+/// the name alone would emit it with no meaning attached.
+///
+/// Adding a row is nevertheless **not** a breaking change under the contract's
+/// compatibility rules: consumers are required to filter on the reserved names they
+/// know rather than assume a fixed set, so `__schema_version__` does not move.
 pub const META_ROWS: &[&str] = &[
     META_SCHEMA_VERSION,
+    META_FAMILY,
     META_STATUS,
     META_ENGINE,
     META_SEED,
     META_N_OBS,
     META_N_GROUPS,
+    META_N_GROUPS_UNREADY,
     META_N_CHAINS,
     META_N_DRAWS,
 ];
@@ -403,12 +436,13 @@ mod tests {
     fn meta() -> ModelMeta {
         ModelMeta {
             model_id: "abc123".to_string(),
-            family: "conjugate_anomaly".to_string(),
+            family: FamilyCode::ConjugateAnomaly,
             engine: EngineKind::Exact,
             status: FitStatus::Converged,
             seed: 42,
             n_obs: 120,
             n_groups: 3,
+            n_groups_unready: 1,
         }
     }
 
@@ -498,19 +532,77 @@ mod tests {
                 .value
         };
         assert_eq!(find(META_SCHEMA_VERSION), DRAWS_SCHEMA_VERSION as f64);
+        assert_eq!(
+            find(META_FAMILY),
+            FamilyCode::ConjugateAnomaly as i32 as f64
+        );
         assert_eq!(find(META_STATUS), FitStatus::Converged as i32 as f64);
         assert_eq!(find(META_ENGINE), EngineKind::Exact as i32 as f64);
         assert_eq!(find(META_SEED), 42.0);
         assert_eq!(find(META_N_OBS), 120.0);
         assert_eq!(find(META_N_GROUPS), 3.0);
+        assert_eq!(find(META_N_GROUPS_UNREADY), 1.0);
         assert_eq!(find(META_N_CHAINS), 2.0);
         assert_eq!(find(META_N_DRAWS), 3.0);
 
-        // Metadata is emitted exactly once, not once per chain.
-        assert_eq!(meta_rows.len(), 8);
+        // Metadata is emitted exactly once, not once per chain. The count is checked
+        // rather than merely the presence of each name: `META_ROWS.len()` is the
+        // offset `row_at` subtracts to reach the draws, so a name added to the list
+        // without a value behind it would shift every draw row by one.
+        assert_eq!(meta_rows.len(), META_ROWS.len());
+        assert_eq!(meta_rows.len(), 10);
         for row in &meta_rows {
             assert_eq!(row.chain, META_INDEX);
         }
+    }
+
+    /// Every name in `META_ROWS` must have a value behind it in `meta_row`.
+    ///
+    /// The two are edited together by hand, and the old catch-all arm made a
+    /// half-finished edit invisible: a new name fell through to `n_draws` and was
+    /// published as a plausible, entirely wrong number. Distinct sentinel values here
+    /// make any such crossing detectable, and an unmapped name now shows up as NaN.
+    #[test]
+    fn every_metadata_row_reports_its_own_quantity() {
+        let mut m = meta();
+        m.status = FitStatus::Failed; // 3
+        m.engine = EngineKind::Nuts; // 2
+        m.seed = 101;
+        m.n_obs = 102;
+        m.n_groups = 103;
+        m.n_groups_unready = 104;
+        let params = vec![ParamName::global("mu").unwrap()];
+        // 5 chains x 7 draws, so neither is confusable with the other or with a count.
+        let p = Posterior::new(m, params, 5, 7, vec![0.0; 35], Vec::new()).unwrap();
+
+        let expected: Vec<(&str, f64)> = vec![
+            (META_SCHEMA_VERSION, DRAWS_SCHEMA_VERSION as f64),
+            (META_FAMILY, 7.0),
+            (META_STATUS, 3.0),
+            (META_ENGINE, 2.0),
+            (META_SEED, 101.0),
+            (META_N_OBS, 102.0),
+            (META_N_GROUPS, 103.0),
+            (META_N_GROUPS_UNREADY, 104.0),
+            (META_N_CHAINS, 5.0),
+            (META_N_DRAWS, 7.0),
+        ];
+        // Every name in the contract is covered by this table, so a name added to
+        // `META_ROWS` without being added here fails the assertion below rather than
+        // slipping through untested.
+        assert_eq!(
+            expected.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            META_ROWS.to_vec()
+        );
+        for (i, (name, value)) in expected.iter().enumerate() {
+            let row = p.row_at(i).expect("metadata row");
+            assert_eq!(row.param, *name);
+            assert_eq!(row.value, *value, "{name}");
+        }
+        // ...and the first draw row starts immediately after them, which is the
+        // invariant `META_ROWS.len()` buys `row_at`.
+        let first_draw = p.row_at(META_ROWS.len()).expect("first draw row");
+        assert_eq!((first_draw.chain, first_draw.draw), (0, 0));
     }
 
     /// `sum(__divergent__) = 0` must mean "the sampler saw no divergences", never

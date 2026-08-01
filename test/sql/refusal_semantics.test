@@ -42,6 +42,17 @@ FROM anofox_bayes_fit((SELECT grp, v FROM solo), 'conjugate_anomaly',
 ----
 insufficient_data	false
 
+# The verdict above covers both lanes, deliberately: a fit an agent must inspect is
+# not half trustworthy. `__n_groups_unready__` says how much of it there is to
+# inspect -- one lane out of two -- without softening the verdict.
+query II
+SELECT max(value) FILTER (WHERE param = '__n_groups_unready__'),
+       max(value) FILTER (WHERE param = '__n_groups__')
+FROM anofox_bayes_fit((SELECT grp, v FROM solo), 'conjugate_anomaly',
+                      {'value': 'v', 'group': 'grp', 'draws': 1000});
+----
+1.0	2.0
+
 #######################################
 # Degenerate input 2: zero variance
 #######################################

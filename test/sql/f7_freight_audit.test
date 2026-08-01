@@ -54,11 +54,11 @@ draw	INTEGER
 param	VARCHAR
 value	DOUBLE
 
-# 3 lanes x (mu, sigma) x 4000 draws, plus the 8 model-metadata rows.
+# 3 lanes x (mu, sigma) x 4000 draws, plus the 10 model-metadata rows.
 query I
 SELECT count(*) FROM draws;
 ----
-24008
+24010
 
 # One model, one id.
 query I
@@ -79,12 +79,22 @@ true
 
 query II
 SELECT param, value FROM draws
-WHERE param IN ('__n_obs__', '__n_groups__', '__schema_version__')
+WHERE param IN ('__n_obs__', '__n_groups__', '__n_groups_unready__', '__family__',
+                '__schema_version__')
 ORDER BY param;
 ----
+__family__	7.0
 __n_groups__	3.0
+__n_groups_unready__	0.0
 __n_obs__	108.0
 __schema_version__	1.0
+
+# The table says what model wrote it, without a join and without the reader having to
+# know that 7 means conjugate_anomaly.
+query I
+SELECT anofox_bayes_family_text(param, value) FROM draws;
+----
+conjugate_anomaly
 
 # Diagnostics as a single pass/fail query per parameter -- the shape a deterministic
 # workflow node enforces before letting a recommendation through.

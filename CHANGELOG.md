@@ -18,8 +18,26 @@ tables persisted by a customer stay readable across extension upgrades.
   diagnostics as aggregates over `(value, chain, draw)`, for `GROUP BY param`.
 - Decision macros: `anofox_bayes_credible_interval` / `_lower` / `_upper`,
   `anofox_bayes_prob_greater` / `_less`, `anofox_bayes_service_level_quantile`,
-  `anofox_bayes_status_text`, `anofox_bayes_is_actionable`.
+  `anofox_bayes_status_text`, `anofox_bayes_is_actionable`,
+  `anofox_bayes_family_text`.
 - `anofox_bayes_version()`, `anofox_bayes_draws_schema_version()`.
+
+**Draws contract**
+
+- `__family__` — which catalog family produced the table, as its BRD F-number
+  (`3` = `pooled_gaussian`, `7` = `conjugate_anomaly`). The `value` column is `DOUBLE`,
+  so the name cannot travel; reusing the existing F-numbering rather than minting a
+  second one keeps one identity per family. Append-only, like `FitStatus` and
+  `EngineKind`.
+- `__n_groups_unready__` — how many of `__n_groups__` failed their own readiness check.
+  `__status__` remains the collapsed worst-case verdict; this says how much of the fit
+  that verdict is about.
+- Both are new `__`-prefixed metadata rows and therefore **not** breaking:
+  `__schema_version__` stays at 1. A consumer that assumed the metadata block was
+  exactly eight rows long was relying on something the contract already said not to.
+- `__data_fingerprint__` was considered and **not** shipped: a hex digest has no
+  lossless home in a `DOUBLE`, and a fingerprint that silently collides is worse than
+  an absent one. See `docs/DRAWS_CONTRACT.md`.
 
 **Model catalog**
 

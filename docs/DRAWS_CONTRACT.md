@@ -60,11 +60,13 @@ Emitted exactly once per fit, with `group_id = '__global__'`.
 | `param` | Meaning |
 |---|---|
 | `__schema_version__` | version of this contract |
+| `__family__` | which catalog family produced the table — see below |
 | `__status__` | `0` converged, `1` degenerate, `2` insufficient_data, `3` failed |
 | `__engine__` | `0` exact, `1` laplace, `2` nuts |
 | `__seed__` | the seed the fit used |
 | `__n_obs__` | observations that survived null filtering |
 | `__n_groups__` | distinct groups fitted |
+| `__n_groups_unready__` | how many of those groups the family refused — see below |
 | `__n_chains__`, `__n_draws__` | sampling shape |
 
 Carrying status *inside* the draws table is deliberate. An agent that persists one
@@ -75,6 +77,61 @@ no second table to lose, and no session-scoped extension state to depend on.
 -- The gate, in full.
 SELECT value = 0 AS safe_to_act_on FROM draws WHERE param = '__status__';
 ```
+
+### `__family__` — which model was fitted
+
+| code | family | BRD |
+|---:|---|---|
+| 3 | `pooled_gaussian` | F3 |
+| 7 | `conjugate_anomaly` | F7 |
+
+`value` is `DOUBLE`, so the family cannot travel under its name; it travels as its
+**catalog F-number**, the numbering already fixed in [BRD §6](BRD.md) and used
+throughout [the API reference](API_REFERENCE.md) and [the HLD](HLD.md). Reusing that
+numbering rather than inventing a registration-ordered one means a family has a single
+identity: the gaps are the families this catalog does not ship yet, not accidents. A
+family outside the BRD's F1–F7 grid takes the next unused code.
+
+Like `FitStatus` and `EngineKind`, the numbering is **append-only** — these values sit
+in tables customers have already persisted, so renumbering one would change what a
+table written last quarter says it contains.
+
+Decode it in SQL with the shipped macro, which needs no join and no knowledge of the
+table:
+
+```sql
+SELECT anofox_bayes_family_text(param, value) AS family FROM draws;
+-- conjugate_anomaly
+```
+
+### `__n_groups_unready__` — how much of the fit to inspect
+
+The number of groups whose own readiness verdict was not `ready`, out of
+`__n_groups__`. `__status__` is the *worst* verdict across every group and stays that
+way: a fit covering 500 lanes of which three are unidentifiable is not 99.4 %
+trustworthy, it is a fit an agent must look at before acting on any of it. What the
+collapse loses is the **scale** of that inspection — three lanes and four hundred
+lanes both arrive as `insufficient_data` — and that is what this row restores.
+
+```sql
+SELECT
+    max(value) FILTER (WHERE param = '__n_groups_unready__') AS unready,
+    max(value) FILTER (WHERE param = '__n_groups__')         AS groups
+FROM draws;
+```
+
+Two things it is not:
+
+* **It is not a diagnostics count.** It counts the groups the *family* refused from
+  their sufficient statistics alone — a lane with one invoice, a group whose
+  observations are all identical. R-hat and ESS are computed per parameter, not per
+  group, so a fit downgraded to `degenerate` by diagnostics can report zero unready
+  groups. `__status__` remains the only gate.
+* **It is not always exact.** A family that reaches one verdict over one design
+  containing every group — `pooled_gaussian` — cannot single out a subset of its
+  groups, and reports all of them when it refuses. `conjugate_anomaly`, which fits
+  each group independently, reports the exact count. Over-counting is the safe
+  direction: it sends an agent to look at more than it must, never at less.
 
 ## Reserved names
 
@@ -134,6 +191,32 @@ Consequences worth relying on:
 * **Cache detection is a comparison,** not a registry lookup.
 * **Refit detection is free.** A changed id means the question changed.
 
+### The data fingerprint is not in the table, and cannot be
+
+`model_id` is a digest *over* the data fingerprint, so the fingerprint cannot be
+recovered from it. A `__data_fingerprint__` row would let a consumer check a draws
+table against a source relation without re-deriving the id — and it is **not
+shipped**, because there is nowhere honest to put it.
+
+The fingerprint is a hex digest. The `value` column is `DOUBLE`, and a `DOUBLE` has 53
+bits of mantissa: any encoding of a 64-bit digest into it silently drops bits, and a
+fingerprint that collides silently is strictly worse than one that is absent. A
+consumer would use it for exactly one thing — deciding that a table does or does not
+describe a given relation — which is the decision a lossy encoding gets wrong while
+looking right.
+
+The two lossless routes are both breaking changes: a new `VARCHAR` column (`model_id`
+is one, but adding a column changes the schema every consumer binds to), or
+overloading `group_id` on the metadata row, which is contractually `__global__`.
+Either moves `__schema_version__`, and neither is worth doing on its own.
+
+So this stays open until the contract breaks for another reason, and the fingerprint
+travels with the next schema version rather than in a form that would have to be
+un-promised later. In the meantime, `__family__`, `__engine__` and `__seed__` are on
+the table, and a caller who also has the config can re-derive `model_id` from a
+candidate relation and compare — which answers the same question without a new
+encoding.
+
 ## Ordering
 
 Rows are emitted metadata-first, then draws in `(chain, draw, param)` order, with each
@@ -160,7 +243,13 @@ assuming a fixed set.
 | Row **order** within a draw | no — treat it as unspecified |
 | The meaning of an existing reserved row | **yes** |
 | A column's type or meaning | **yes** |
-| `FitStatus` / `EngineKind` numbering | **yes**, and it is append-only for that reason |
+| `FitStatus` / `EngineKind` / `FamilyCode` numbering | **yes**, and it is append-only for that reason |
+
+`__family__` and `__n_groups_unready__` arrived after schema version 1 was published
+and did **not** move it: they are new `__`-prefixed metadata rows, the first line of
+this table. A consumer that filters on the names it knows is unaffected; one that
+assumed the metadata block was eight rows long was relying on something this document
+already said not to rely on.
 
 Sampler statistics are uniform across draws within a fit — a fit reports the same
 *set* of statistics for every draw, even where the values differ — so the number of

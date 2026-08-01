@@ -70,6 +70,58 @@ impl FitStatus {
     }
 }
 
+/// Which catalog family produced a posterior.
+///
+/// Recorded in the draws table as the `__family__` row so that an auditor holding
+/// only the persisted table can say *what model was fitted*. Without it the table
+/// reports how it was fitted (`__engine__`), with what budget and to what data, but
+/// not which likelihood produced the numbers.
+///
+/// **Why a number and not the family's name.** The `value` column of the draws
+/// contract is `DOUBLE`, and the only `VARCHAR` columns — `model_id` and `group_id` —
+/// already carry meanings that a metadata row may not overload. Adding a column would
+/// be a breaking change to the contract; a numeric code is not.
+///
+/// **Why *these* numbers.** They are the catalog's F-numbers, already fixed in
+/// `docs/BRD.md` §6 and used throughout `docs/API_REFERENCE.md` and `docs/HLD.md`:
+/// `pooled_gaussian` is F3 and `conjugate_anomaly` is F7. Inventing a second,
+/// registration-ordered numbering would have created two identities for one family
+/// and a table mapping between them to keep in step. The gaps are the families this
+/// catalog does not ship yet, which is information rather than an accident.
+///
+/// Numbering is **append-only**, exactly as for [`FitStatus`] and [`EngineKind`]:
+/// these values travel into persisted customer tables, so a renumbering would change
+/// the meaning of a table already written. A family outside the BRD's F1–F7 planning
+/// grid takes the next unused code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum FamilyCode {
+    /// F3 — pooled Gaussian linear model.
+    PooledGaussian = 3,
+    /// F7 — conjugate anomaly (Normal / Poisson closed forms).
+    ConjugateAnomaly = 7,
+}
+
+impl FamilyCode {
+    /// The family's SQL identifier. Equal to `ModelFamily::id()` by construction, and
+    /// a catalog test enforces it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FamilyCode::PooledGaussian => "pooled_gaussian",
+            FamilyCode::ConjugateAnomaly => "conjugate_anomaly",
+        }
+    }
+
+    /// Decode a `__family__` value read back off a draws table.
+    pub fn from_code(code: i32) -> Option<Self> {
+        match code {
+            3 => Some(FamilyCode::PooledGaussian),
+            7 => Some(FamilyCode::ConjugateAnomaly),
+            _ => None,
+        }
+    }
+}
+
 /// Which inference engine produced a posterior.
 ///
 /// Recorded in the draws table so that a downstream consumer can tell an exact
@@ -174,6 +226,21 @@ mod tests {
             assert_eq!(FitStatus::from_code(code).map(|s| s as i32), Some(code));
         }
         assert_eq!(FitStatus::from_code(4), None);
+    }
+
+    /// Family codes travel into persisted customer tables. Renumbering one would
+    /// change what a table written last quarter says it contains.
+    #[test]
+    fn family_codes_are_stable_and_round_trip() {
+        assert_eq!(FamilyCode::PooledGaussian as i32, 3);
+        assert_eq!(FamilyCode::ConjugateAnomaly as i32, 7);
+        for code in [FamilyCode::PooledGaussian, FamilyCode::ConjugateAnomaly] {
+            assert_eq!(FamilyCode::from_code(code as i32), Some(code));
+        }
+        // The gaps are families the catalog does not ship, not aliases for one it
+        // does -- decoding one must fail rather than pick a neighbour.
+        assert_eq!(FamilyCode::from_code(1), None);
+        assert_eq!(FamilyCode::from_code(4), None);
     }
 
     #[test]

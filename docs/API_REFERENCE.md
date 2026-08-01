@@ -139,7 +139,11 @@ and in the scale parameter, whose discrepancy falls from ~5 % at n = 20 to ~0.1 
 n = 2000. Both engines have their own calibration suite. See
 [Theory §5](THEORY.md#5-engines).
 
-`__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts.
+`__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. The family that
+ran is on the table too, as `__family__`: `3` for `pooled_gaussian`, `7` for
+`conjugate_anomaly` — the catalog F-numbers, decoded by
+`anofox_bayes_family_text(param, value)`. See
+[the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
 ### 1.4 Null handling and grouping
 
@@ -529,6 +533,7 @@ exactly as the underlying quantile functions do. Filter to real draws first
 | `anofox_bayes_rhat_gate(value, chain, draw, max_rhat)` | BOOLEAN | Whether R̂ clears its gate. Coalesces to **true**, not false: an absent R̂ is legitimate under an independent sampler, where there is no chain that could have failed to mix |
 | `anofox_bayes_status_text(param, value)` | VARCHAR | `converged` / `degenerate` / `insufficient_data` / `failed` |
 | `anofox_bayes_is_actionable(param, value)` | BOOLEAN | True only for `converged` |
+| `anofox_bayes_family_text(param, value)` | VARCHAR | `pooled_gaussian` / `conjugate_anomaly`, decoded from the `__family__` row; `unknown` for a code this build does not know |
 
 `anofox_bayes_prob_greater` is the one that earns its place: *"is the effect bigger
 than the rollout cost?"* is a mean of an indicator over the draws, with no

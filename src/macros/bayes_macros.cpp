@@ -129,6 +129,23 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
      {{nullptr, nullptr}},
      "coalesce(max(CASE WHEN param = '__status__' THEN value END) = 0, false)"},
 
+    // Decodes the reserved __family__ row: which model produced this table.
+    //
+    // The value column is DOUBLE, so the family travels as its catalog F-number
+    // (docs/DRAWS_CONTRACT.md). Without this macro an auditor holding a persisted
+    // table would have to know that 7 means `conjugate_anomaly`, which is precisely
+    // the knowledge a persisted table is supposed to carry for them. An unknown code
+    // reads as 'unknown' rather than NULL: a table written by a newer extension is a
+    // fact worth seeing, not a missing value to coalesce away.
+    {DEFAULT_SCHEMA,
+     "anofox_bayes_family_text",
+     {"param", "value", nullptr},
+     {{nullptr, nullptr}},
+     "CASE max(CASE WHEN param = '__family__' THEN value END)"
+     "  WHEN 3 THEN 'pooled_gaussian'"
+     "  WHEN 7 THEN 'conjugate_anomaly'"
+     "  ELSE 'unknown' END"},
+
     {nullptr, nullptr, {nullptr}, {{nullptr, nullptr}}, nullptr}};
 
 } // anonymous namespace

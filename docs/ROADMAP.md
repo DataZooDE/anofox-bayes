@@ -244,22 +244,33 @@ on session-global state, which is the same reason this extension keeps no state 
 own: a recipe whose correctness depends on a `SET` the caller might not have issued is
 a recipe that will silently be wrong somewhere.
 
-**Record the family in the draws table** — ~0.5 d. A persisted table reports
-`__engine__`, `__seed__`, `__status__`, `__n_obs__`, `__n_groups__` and the sampling
-shape, but not which family produced it. An auditor holding the table alone cannot say
-what model was fitted. Non-breaking under the contract's compatibility rules.
+**Record the family in the draws table** — **done.** `__family__` carries the catalog
+F-number (`3` = `pooled_gaussian`, `7` = `conjugate_anomaly`), decoded in SQL by
+`anofox_bayes_family_text`. The `value` column is `DOUBLE`, so the name could not
+travel; reusing the BRD's existing F-numbering rather than inventing a second one keeps
+a family to one identity. Append-only, like `FitStatus` and `EngineKind`, and
+non-breaking — `__schema_version__` did not move.
 
-**Record the data fingerprint** — ~0.5 d. `model_id` is a digest *over* the fingerprint,
-so the fingerprint cannot be recovered from the table. `__data_fingerprint__` lets a
-consumer check a draws table against a source relation without re-deriving the id. Also
-non-breaking.
+**Record the data fingerprint** — **not shipped, and not on a half-day budget.**
+`model_id` is a digest *over* the fingerprint, so recovering it from the table would
+need the fingerprint itself, and the fingerprint is a hex digest with no honest home in
+a `DOUBLE`: 53 bits of mantissa against a 64-bit digest means silent collisions, and a
+fingerprint that silently collides is worse than an absent one, because its only use is
+deciding whether a table describes a given relation. The lossless routes — a new
+`VARCHAR` column, or overloading `group_id` on the metadata row — are both breaking, so
+this now waits for the next schema version rather than shipping in a form that would
+have to be un-promised. Recorded in `DRAWS_CONTRACT.md` alongside the workaround: with
+`__family__`, `__engine__` and `__seed__` on the table, a caller holding the config can
+re-derive `model_id` from a candidate relation and compare.
 
-**Count the unready groups** — ~0.5 d. `Readiness::worst` collapses per-group verdicts
-into one, so a 5 000-lane fit with three unfittable lanes reports `insufficient_data`
-for all 5 000 with no indication of scale. `__n_groups_unready__` is a cheap partial
-answer while gap 11 waits. It does not change what `worst` returns and should not — the
-doctrine that a fit an agent must inspect is not 99.4 % trustworthy is right. What is
-missing is the number telling the agent how much inspecting there is.
+**Count the unready groups** — **done.** `__n_groups_unready__` reports how many groups
+failed their own readiness check, beside the unchanged collapsed `__status__`.
+`Readiness::worst` still returns the worst verdict and should — the doctrine that a fit
+an agent must inspect is not 99.4 % trustworthy is right. What was missing was the
+number telling the agent how much inspecting there is, and that is now on the table. It
+remains a partial answer while gap 11 waits: `conjugate_anomaly` fits each group
+independently and so counts exactly, while `pooled_gaussian` reaches one verdict over
+one design and reports all of its groups when it refuses.
 
 ## 5. Non-goals
 

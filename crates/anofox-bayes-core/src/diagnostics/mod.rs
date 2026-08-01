@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn diagnose_reports_one_row_per_parameter_carrying_its_group() {
         use crate::draws::{ModelMeta, ParamName, Posterior};
-        use crate::types::{EngineKind, FitStatus};
+        use crate::types::{EngineKind, FamilyCode, FitStatus};
 
         let params = vec![
             ParamName::global("mu").unwrap(),
@@ -378,12 +378,13 @@ mod tests {
         let post = Posterior::new(
             ModelMeta {
                 model_id: "m".into(),
-                family: "f".into(),
+                family: FamilyCode::ConjugateAnomaly,
                 engine: EngineKind::Exact,
                 status: FitStatus::Converged,
                 seed: 1,
                 n_obs: 10,
                 n_groups: 1,
+                n_groups_unready: 0,
             },
             params,
             1,
