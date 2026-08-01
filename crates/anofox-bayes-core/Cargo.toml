@@ -18,4 +18,5 @@ rand.workspace = true
 rand_chacha.workspace = true
 rand_distr.workspace = true
 blake3.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

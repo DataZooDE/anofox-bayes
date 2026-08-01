@@ -23,6 +23,10 @@ rand_chacha = "0.3"
 rand_distr = "0.4"
 # Deterministic model ids / data fingerprints.
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
+# Config arrives as JSON across the SQL boundary. Default features only: the
+# key-sorted BTreeMap representation is what makes a canonical config string --
+# and therefore a stable model_id -- possible.
+serde_json = "1.0"
 thiserror = "2.0"
 libc = "0.2"
 

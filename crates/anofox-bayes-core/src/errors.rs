@@ -20,8 +20,8 @@ pub type BayesResult<T> = Result<T, BayesError>;
 pub enum BayesError {
     /// The requested family is not in the catalog. The catalog is closed by design
     /// (BRD §4), so this is a permanent, not a transient, failure.
-    #[error("unknown model family '{0}'")]
-    UnknownFamily(String),
+    #[error("unknown model family '{name}' (catalog: {catalog})")]
+    UnknownFamily { name: String, catalog: String },
 
     /// A configuration slot failed validation. `slot` is a dotted path into the
     /// config object so the caller can repair exactly one field.
@@ -29,8 +29,12 @@ pub enum BayesError {
     Config { slot: String, reason: String },
 
     /// A column named in the config is absent from the input relation.
-    #[error("column '{column}' not found in input data")]
-    MissingColumn { column: String },
+    ///
+    /// `available` lists what the relation does offer, so a caller who wrote
+    /// `cost_per_kilo` for a `cost_per_kg` column can repair the request from the
+    /// message alone.
+    #[error("column '{column}' not found in input data (available: {available})")]
+    MissingColumn { column: String, available: String },
 
     /// Column lengths disagree — a bug in the caller, not in the data.
     #[error("dimension mismatch: {0}")]
@@ -89,7 +93,7 @@ pub enum ErrorCode {
 impl BayesError {
     pub fn code(&self) -> ErrorCode {
         match self {
-            BayesError::UnknownFamily(_) => ErrorCode::UnknownFamily,
+            BayesError::UnknownFamily { .. } => ErrorCode::UnknownFamily,
             BayesError::Config { .. } => ErrorCode::Config,
             BayesError::MissingColumn { .. } => ErrorCode::MissingColumn,
             BayesError::DimensionMismatch(_) => ErrorCode::DimensionMismatch,
