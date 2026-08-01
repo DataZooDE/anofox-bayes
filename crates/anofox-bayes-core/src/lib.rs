@@ -36,6 +36,7 @@ pub mod errors;
 pub mod fit;
 pub mod linalg;
 pub mod rng;
+pub mod sbc;
 pub mod types;
 
 pub use errors::{BayesError, BayesResult};
