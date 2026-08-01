@@ -80,7 +80,31 @@ for.
 5. Add a `test/sql/` file exercising a realistic scenario end to end, not a synthetic
    one. The existing files model a freight audit and a difference-in-differences
    panel; write the query a customer would actually run.
-6. Add a PyMC parity test in `validation/`.
+6. Add a PyMC parity test in `validation/`. **What that means depends on the
+   engine**, and getting it wrong makes the suite vacuous rather than red:
+
+   | engine | reference | why |
+   |---|---|---|
+   | `exact` | NUTS on the same prior | the extension side is i.i.d., so only the reference carries autocorrelation |
+   | `nuts` | NUTS, **with ESS measured on both sides** | the floor is `sd/sqrt(ESS)`, never `sd/sqrt(draws)`; assert the measured ESS so the derivation cannot rot |
+   | `laplace` | **two** references: an independently computed mode + observed information, *and* NUTS | one comparison cannot separate "the likelihood is wrong" from "a Gaussian at the mode is not the posterior" |
+
+   Every tolerance is derived in `validation/TOLERANCES.md`, in units of the
+   reference posterior's own sd. A tolerance without a derivation is one that
+   gets loosened until it is green.
+
+   Where the two implementations genuinely cannot agree — a prior PyMC cannot
+   express, an approximation that is the shipped answer — **document the
+   discrepancy and pin it with a direct measurement**, the way F3's residual
+   scale and F2's are. A documented, understood discrepancy is a result; a
+   silently loosened tolerance is not.
+
+**SBC and parity are not redundant, and neither subsumes the other.** SBC
+certifies calibration *under the model's own prior*, so it only ever runs where
+that prior is proper — which is exactly where F3's degrees-of-freedom bug was
+not present. Parity checks the posterior against an independent implementation,
+so it sees improper defaults, log-Jacobian terms and likelihood constants that
+SBC structurally cannot. Both have now caught things the other could not.
 
 ## Adding an engine
 
