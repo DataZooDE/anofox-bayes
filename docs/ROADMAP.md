@@ -24,8 +24,8 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 3 | F5 payer-alive (BG/NBD) | 05 | Blocker | 8–12 | — |
 | 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 blocker; 01, 04, 06 degradation | Unblocks 02 outright; gives 01/04/06 an honest interim path | 6–9 | statistics exposing the vcov matrix |
 | 3 | F5 payer-alive (BG/NBD) | 05 | **Shipped.** Agent 05 unblocked | 8–12 | — |
-| 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | Blocker for 06 — the interaction-column workaround left 10 of 12 intervals not covering | 12–18 | gap 6 for the learned scale |
-| 5 | Per-group variance | 04 | Blocker for the tail question, which is why agent 04 exists | 5–8 with gap 4 | gap 4 |
+| 4 | Random slopes + ~~learned pooling scale~~ **learned scale shipped** | 06 blocker; 03 degradation | The learned `pool_scale` ships in `varying_variance_gaussian`; *fixed*-scale random slopes in `pooled_gaussian` remain, on a separate track | 12–18 | gap 6 for the learned scale |
+| 5 | ~~Per-group variance~~ **shipped** | 04 | `varying_variance_gaussian` answers the tail question; agent 04 unblocked | 5–8 with gap 4 | gap 4 |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | Dependency of gaps 4, 5, 7 | **done** | — |
 | 7 | F1 hierarchical negative binomial | 01 | Blocker natively; degraded path via gap 2 | 12–20 | gap 6 — **met** |
 | 8 | F4 payment delay, native | 04 | Degradation — `pooled_gaussian` on log-delay is already a lognormal model | 8–12 | gaps 4, 5 |
@@ -125,6 +125,15 @@ The hierarchical Gaussian family comes after NUTS because what agent 06 needs is
 precisely what Laplace approximates badly — a variance parameter near zero, where a
 Gaussian approximation on the unconstrained scale is least honest and where SBC will
 say so.
+
+> **It said so, and more emphatically than expected.** `varying_variance_gaussian`
+> ships (gaps 4-learned-scale and 5). Its SBC suite was run per engine: under `nuts` all
+> fourteen ranked parameters are calibrated (χ² 6.3–24.6 against 37.7); under `laplace`
+> **not one of them is**, `pool_scale` and `sigma_spread` come in at 3 942 and 4 403,
+> and the mode search fails to converge at all on 3.1 % of replications. The prediction
+> was that Laplace would be poor for the variance components; the measurement is that it
+> is inadmissible for the whole family. `nuts` is the default and `docs/THEORY.md` §5
+> carries the table.
 
 ### Later
 
@@ -381,9 +390,49 @@ The `beta_scale` complaint resolves inside the same decision: it shrinks every s
 toward zero, which is a claim about the world ("effects are small") nobody asked to
 make. Shrinking group deviations toward a common mean is the random-slope structure.
 
-**Naming is open.** `hierarchical_gaussian` is the obvious candidate and not obviously
-right, since `pooled_gaussian` is also hierarchical. Decide before the config surface is
-public — a family id feeds `model_id`, so renaming one invalidates every persisted fit.
+**Naming is settled: `varying_variance_gaussian`, `FamilyCode` 8.**
+
+`hierarchical_gaussian` was rejected on exactly the objection raised above.
+`pooled_gaussian` *is* hierarchical — group effects drawn toward a common level — so
+the pair leaves a caller nothing to choose on, and the technically precise reading
+("hierarchical means the hyperparameters are estimated") is a distinction the catalog
+listing cannot carry. `heteroscedastic_gaussian` names the discriminating capability
+correctly and was rejected for a duller reason: the word has two accepted spellings in
+the literature (`-sc-` / `-sk-`), and a family id is a string a caller types and that
+feeds `model_id`, so a name with a coin-flip spelling is a name with a support burden.
+
+What is left is the plain description of what a caller chooses on: the variance
+**varies** — within a group it is that group's own, and between groups it is estimated
+rather than set. The pair reads `pooled_gaussian` (one pooled variance, pooling you
+set) against `varying_variance_gaussian` (a variance per group, pooling the data sets),
+which is the actual decision.
+
+The code is **8**, not an F-number, and that is deliberate. The BRD's grid runs F1–F7
+and this family is none of them: it is the hierarchical substrate F4 (payment delay per
+segment) and F6 (elasticity pooled by segment) will be written on top of. Borrowing F4's
+number would make a persisted table claim to contain a payment-delay model.
+
+**Two findings from building it**, both recorded because a future family will meet them.
+
+*Non-centring fixes the funnel and not the ridge.* Parameterising `eta_g = tau * z_g`
+did what it was chosen for — `pool_scale`, `sigma_pop` and `sigma_spread` all mix
+cleanly. What survives is the *other* geometry the NUTS track reported for
+`pooled_gaussian`: the unpenalised intercept and the group effects trade off along a
+direction a diagonal mass matrix cannot precondition. It costs effective sample size,
+not correctness, and the fix is draws rather than algebra — 4 × 1000 leaves R̂ just above
+1.01 on an eight-group panel and 4 × 2000 clears it. **A dense or low-rank mass matrix
+is the only thing that would fix it properly, and that is engine work nobody has costed.**
+
+*A flat prior on a hierarchical scale is a divergence generator.* Under `p(tau) ∝ 1` —
+proper, and the textbook recommendation — the upper tail is long enough that the sampler
+diverges in it: 34 divergences in 8 000 draws, concentrated at `pool_scale` averaging
+5.7 against a bulk of 2.3. Since any divergence is a refusal, the family would have
+reported `degenerate` on clean simulated data. The default is now a half-Normal at the
+**response's own standard deviation**, which is scale-free in the sense THEORY §3
+demands — it rescales with the data, so it asserts nothing about units — and it takes
+divergences to zero on the same fixtures. Raising the sampler's acceptance target from
+0.8 to 0.95, declared by the family through a new defaulted `LogPosterior::target_accept`,
+did the rest. Both are worth trying first for any future hierarchical family.
 
 ### Known gap: the counterfactual suite does not run in CI
 

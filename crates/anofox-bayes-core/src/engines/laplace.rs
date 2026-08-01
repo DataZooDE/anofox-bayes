@@ -954,7 +954,11 @@ mod tests {
             .numeric("delivered", delivered)
             .numeric("freq", (0..n).map(|i| (i % 5) as f64).collect())
             .numeric("rec", (0..n).map(|i| ((i % 5) as f64) * 6.0).collect())
-            .numeric("age", (0..n).map(|_| 40.0).collect());
+            .numeric("age", (0..n).map(|_| 40.0).collect())
+            .key(
+                "segment",
+                (0..n).map(|i| ["A", "B", "C", "D"][i % 4]).collect(),
+            );
         let refs = f.key_refs();
         let view = f.view(&refs);
 
@@ -967,6 +971,13 @@ mod tests {
             // suite is what certifies the Gaussian approximation here -- see
             // `sbc::families::f5_is_calibrated_under_the_laplace_engine`.
             "payer_alive",
+            // Group variances under a shared hyperprior, and a learned pooling scale.
+            // Either one alone destroys conjugacy, which is why this is a separate
+            // family from `pooled_gaussian` (ROADMAP.md 3.3). Being *servable* by
+            // Laplace is not the same as being *served* by it: the SBC suite measures
+            // that approximation as inadmissible here, and the family's default engine
+            // is `nuts`. See `sbc::families::f8_under_laplace_is_measured_and_is_not_certified`.
+            "varying_variance_gaussian",
         ];
 
         let configs = [
@@ -979,6 +990,10 @@ mod tests {
             (
                 "payer_alive",
                 r#"{"frequency": "freq", "recency": "rec", "age": "age", "min_customers": 1}"#,
+            ),
+            (
+                "varying_variance_gaussian",
+                r#"{"y": "y", "x": "x1", "group": "segment"}"#,
             ),
         ];
         assert_eq!(

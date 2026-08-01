@@ -102,9 +102,11 @@ SELECT value = 0 AS safe_to_act_on FROM draws WHERE param = '__status__';
 
 | code | family | BRD |
 |---:|---|---|
+| 2 | `censored_aft` | F2 |
 | 3 | `pooled_gaussian` | F3 |
 | 5 | `payer_alive` | F5 |
 | 7 | `conjugate_anomaly` | F7 |
+| 8 | `varying_variance_gaussian` | — (outside the F1–F7 grid) |
 
 `value` is `DOUBLE`, so the family cannot travel under its name; it travels as its
 **catalog F-number**, the numbering already fixed in [BRD §6](BRD.md) and used

@@ -236,6 +236,98 @@ Two consequences worth knowing:
 > them reports `degenerate` with `NULL` draws rather than a confident number derived
 > from curvature that is not a posterior.
 
+### `varying_variance_gaussian` — a spread per group, and the pooling decided by the data
+
+*Use it for:* "how much buffer does **this** segment need?" — a service level, a
+payment-delay reserve, a worst-case lead time. Any question whose answer is a *tail*
+rather than an average.
+
+`pooled_gaussian` estimates a level per group and one spread for the whole dataset. It
+has to: one shared `sigma` is what makes its posterior closed form. The consequence is
+that two segments with the same average must receive the same interval, whatever the
+data says about how scattered each one is — and a decision about a tail reads exactly
+that interval. Measured on the six-segment fixture in
+`test/sql/f8_segment_spread.test`, two segments with an identical 30.0-day mean delay
+need 95 % buffers a day and a half apart, and no fit of `pooled_gaussian` can produce
+the difference: there is no row in its output where the difference could appear.
+
+This family fixes that, and one other thing, at the price of the closed form:
+
+| | `pooled_gaussian` | `varying_variance_gaussian` |
+|---|---|---|
+| Residual spread | one, shared | one **per group** |
+| Pooling strength | `pool_scale`, an analyst setting | `pool_scale`, a **parameter with a posterior** |
+| Posterior | closed form, `exact` engine | sampled, `nuts` engine |
+
+The second row matters as much as the first. In `pooled_gaussian` how hard a thin group
+is shrunk toward the population is a number somebody typed; here it is estimated from
+how far apart the groups actually turn out to be, and its own uncertainty widens every
+group effect. A panel whose segments sit on top of each other learns a small
+`pool_scale` and pools hard; a panel whose segments are genuinely different learns a
+large one and leaves them alone.
+
+**Why a separate family rather than a mode of `pooled_gaussian`.** Either change alone
+destroys conjugacy, so a combined family would be exact and instantaneous under some
+configurations and sampled and slow under others, with `__engine__` varying by config
+slot under one name. `pooled_gaussian`'s warranty is that its posterior is a formula
+cross-checked by three engines; a family with two warranties has neither.
+
+**On the name.** `hierarchical_gaussian` was the obvious candidate and was rejected:
+`pooled_gaussian` is hierarchical too — it has group effects drawn toward a common
+level — so the pair would give you nothing to choose on. `heteroscedastic_gaussian`
+says the right thing but has two accepted spellings, and the family id is a string you
+type and that feeds `model_id`. What is left is the plain description: the variance
+**varies**, within a group and between them.
+
+> **In detail.** The model, and the parameterisation, which is fixed and not
+> selectable:
+>
+> ```text
+>   y_i     ~ N(x_i'beta + eta_g(i),  sigma_g(i)^2)
+>   eta_g   = tau * z_g,                   z_g ~ N(0, 1)
+>   sigma_g = exp(mu_s + tau_s * w_g),     w_g ~ N(0, 1)
+> ```
+>
+> reported as `pool_scale` = `tau`, `sigma_pop` = `exp(mu_s)`, `sigma_spread` =
+> `tau_s`, plus `group_effect` and `sigma` per group.
+>
+> **Non-centred, from the start.** The textbook form writes `eta_g ~ N(0, tau^2)`
+> directly, and it is unusable: where `tau` is small the admissible `eta` shrink with
+> it, so the posterior is a funnel (Neal 2003) whose curvature changes by orders of
+> magnitude and which no single step size can explore. Writing `eta_g = tau * z_g`
+> makes `z` a priori standard normal and independent of `tau`. There is no `centred`
+> option, because the premise of the closed catalog is that a caller cannot select a
+> bad parameterisation.
+>
+> **The hyperpriors are declared on the natural scale, and this differs from
+> `payer_alive` on purpose.** A flat prior on `log tau` is `p(tau) ∝ 1/tau`, which for
+> a hierarchical variance leaves the *posterior* improper — the likelihood is bounded
+> as `tau → 0` and `1/tau` is not integrable there. Flat on `tau` is proper for three
+> or more groups, which is why fewer than three is a refusal.
+>
+> **The default `pool_scale` hyperprior is the response's own standard deviation**, and
+> it is the one concrete prior default in this extension.
+> [§3](#3-priors-and-why-the-defaults-look-the-way-they-do) rejects concrete defaults
+> because they are claims about *units*; a scale taken from the data makes no such claim — double the observations and
+> the prior doubles with them. It is not flat because flat was measured and rejected:
+> under `p(tau) ∝ 1` the upper tail is long enough that the sampler diverges in it, 34
+> times in 8 000 draws on the eight-group fixture, and every divergence is a refusal.
+> The spread-of-spreads prior `sigma_spread` defaults to a half-Normal at **one log
+> unit**, where a concrete number *is* admissible: a log unit is a factor of e, which
+> means the same thing in euros and in kilograms.
+>
+> **This family asks the sampler for a finer step** than the others — an acceptance
+> target of 0.95 against `nuts-rs`'s 0.8, the same dial as Stan's `adapt_delta` and
+> raised for the same models. It costs leapfrog steps, not correctness. It is declared
+> by the family and is not reachable from SQL.
+>
+> **Budget more draws than the default.** A hierarchical posterior mixes more slowly
+> than a conjugate one: the unpenalised intercept and the group effects trade off along
+> a ridge that a diagonal mass matrix cannot precondition, which costs effective sample
+> size rather than correctness. Measured on an eight-group panel, 4 × 1 000 draws lands
+> R̂ just above the 1.01 gate and 4 × 2 000 clears it. The diagnostics say so; a
+> `degenerate` verdict here usually means "take more draws", not "the model is wrong".
+
 ## 5. Engines
 
 An **engine** turns a model into draws. The choice is invisible to your SQL — same
@@ -249,7 +341,7 @@ on the `__engine__` row so a reviewer can see which one ran.
 | `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | available wherever a gradient is |
 | `exact` | Samples the closed-form posterior directly. No approximation. | default for `conjugate_anomaly` and `pooled_gaussian` |
 | `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on `pooled_gaussian`; the only engine for `payer_alive` |
-| `nuts` | General-purpose sampler for models with no closed form. | planned (0.2) |
+| `nuts` | General-purpose sampler for models with no closed form. | default for `varying_variance_gaussian`; available wherever a gradient is |
 
 Where a closed form exists, `exact` is both faster and more accurate, so it is the
 default. `laplace` and `nuts` exist because they generalise to families that have no
@@ -304,6 +396,39 @@ the group's own observation count, not the size of the table. That is a strong r
 to leave `exact` in place here: an anomaly model earns its keep on exactly the thin
 lanes where the approximation is worst, and too narrow is the direction that
 manufactures both false alarms and unearned all-clears.
+
+### Where the Laplace approximation is **not** admissible: `varying_variance_gaussian`
+
+This is the family the roadmap predicted would break it, and the prediction held. The
+SBC suite was run per engine, and the two engines disagree completely.
+
+| | `nuts` | `laplace` |
+|---|---|---|
+| `pool_scale` | 13.3 | **3 942** |
+| `sigma_spread` | 6.3 | **4 403** |
+| `sigma_pop` | 19.8 | 181 |
+| `intercept` | 16.0 | 246 |
+| `group_effect` (5 groups) | 9.8 – 24.6 | 131 – 178 |
+| `sigma` (5 groups) | 12.8 – 21.0 | 126 – 170 |
+
+χ² at 15 degrees of freedom, 1 024 replications, five groups of ten observations; the
+threshold is 37.7. Under NUTS every one of the fourteen parameters is calibrated. Under
+Laplace **not one of them is**, the two learned scales are wrong by two orders of
+magnitude, and the strong negative slope of their rank histograms (−0.75 and −0.79)
+says the approximation places them far *above* the truth rather than merely too
+narrowly around it. On top of that, the mode search does not converge at all on 3.1 %
+of replications: for those there is no curvature, so there is no posterior to be
+miscalibrated.
+
+That is why `nuts` is this family's default, and why the number in this table is
+recorded rather than the threshold being loosened until it went green. The result also
+sharpens the note in [§8](#8-how-we-know-it-is-right): SBC per family is not enough,
+because *per engine* is where this appeared.
+
+Laplace remains reachable by explicit `engine` for anyone who wants a fast
+approximation and has read this section. It is not certified, and the numbers above are
+what "not certified" means here.
+
 
 ### `censored_aft` — a bridged Laplace posterior
 
@@ -513,6 +638,16 @@ of 25.
 So every family gets at least one assertion on a linear combination of its parameters,
 not only on each parameter separately. Marginal checks cannot see a joint error, and a
 joint error is what produces a confidently wrong interval.
+
+For `varying_variance_gaussian` that assertion is the posterior spread of a group's
+**level**, `intercept + group_effect[g]` — the quantity every statement about that
+group is made of. It has an external reference: where the pooling is weak, a group's
+level is data-dominated and its posterior standard deviation is `sigma_g / sqrt(n_g)`.
+Measured on a six-group panel, the joint answer is 0.169 against a reference of 0.162,
+while adding the two *marginal* variances — which is what treating the parameters as
+independent would give — returns 3.86, twenty-three times larger. Both halves are
+asserted, because a test that only checked the first would pass without the correlation
+being right.
 
 ## 9. Further reading
 

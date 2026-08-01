@@ -146,6 +146,7 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
      "  WHEN 3 THEN 'pooled_gaussian'"
      "  WHEN 5 THEN 'payer_alive'"
      "  WHEN 7 THEN 'conjugate_anomaly'"
+     "  WHEN 8 THEN 'varying_variance_gaussian'"
      "  ELSE 'unknown' END"},
 
     {nullptr, nullptr, {nullptr}, {{nullptr, nullptr}}, nullptr}};

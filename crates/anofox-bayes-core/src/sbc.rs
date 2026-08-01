@@ -345,7 +345,7 @@ mod families {
 
     use crate::catalog::{
         f2_censored_aft::CensoredAft, f3_pooled_gaussian::PooledGaussian, f5_btyd::PayerAlive,
-        f7_conjugate::ConjugateAnomaly, ModelFamily,
+        f7_conjugate::ConjugateAnomaly, f8_varying_variance::VaryingVarianceGaussian, ModelFamily,
     };
     use crate::config::Config;
     use crate::data::testing::Frame;
@@ -1087,6 +1087,348 @@ mod families {
                 .map(|j| sample.values.chunks(p).map(|c| c[j]).collect())
                 .collect())
         }
+    }
+
+    /// F8, `varying_variance_gaussian`, under proper priors on every coordinate.
+    ///
+    /// **This suite is the arbiter of the family's default engine**, and it is the
+    /// reason the family exists in the shape it does. Its variance components —
+    /// `pool_scale`, `sigma_spread` and every group's own `sigma` — are exactly where a
+    /// Gaussian approximation at the mode is least honest, so running it per engine is
+    /// not a formality: the two engines are expected to disagree, and the disagreement
+    /// is the finding.
+    ///
+    /// Every parameter the family reports is ranked, including each group's, because
+    /// per-group `sigma` is the quantity agent 04's tail decision reads and a suite that
+    /// certified only the population level would certify the wrong thing.
+    ///
+    /// **The priors must be explicit.** This family's default `pool_scale` hyperprior is
+    /// the response's own standard deviation, which is scale-free and right for fitting
+    /// and impossible to draw a truth from — the prior would depend on the data it is
+    /// supposed to have generated. So the suite states all six.
+    struct F8VaryingVariance {
+        n_groups: usize,
+        n_per_group: usize,
+        intercept_scale: f64,
+        pool_scale: f64,
+        sigma_log_mean: f64,
+        sigma_log_sd: f64,
+        sigma_spread: f64,
+        engine: EngineKind,
+        /// See [`F3Slopes::thin`]. `1` for Laplace, which draws independently.
+        thin: usize,
+    }
+
+    impl F8VaryingVariance {
+        fn keys(&self) -> Vec<String> {
+            (0..self.n_groups).map(|g| format!("G{g:02}")).collect()
+        }
+
+        fn config(&self) -> String {
+            format!(
+                r#"{{"y": "y", "group": "segment",
+                     "prior": {{"intercept_scale": {}, "pool_scale": {},
+                                "sigma_log_mean": {}, "sigma_log_sd": {},
+                                "sigma_spread": {}}}}}"#,
+                self.intercept_scale,
+                self.pool_scale,
+                self.sigma_log_mean,
+                self.sigma_log_sd,
+                self.sigma_spread
+            )
+        }
+    }
+
+    impl SbcModel for F8VaryingVariance {
+        /// In the order `param_names()` reports them, which is what
+        /// `simulate_and_fit` reads back off the draws.
+        fn param_names(&self) -> Vec<String> {
+            let mut names = vec![
+                "intercept".to_string(),
+                "pool_scale".to_string(),
+                "sigma_pop".to_string(),
+                "sigma_spread".to_string(),
+            ];
+            for k in self.keys() {
+                names.push(format!("group_effect[{k}]"));
+            }
+            for k in self.keys() {
+                names.push(format!("sigma[{k}]"));
+            }
+            names
+        }
+
+        /// The generative model, written in the same order.
+        ///
+        /// The group-level quantities are drawn as the *constrained* `eta_g` and
+        /// `sigma_g` rather than as the non-centred `z_g` and `w_g`, because those are
+        /// what the family reports and therefore what a rank has to be taken of. Drawing
+        /// `eta_g = tau * N(0, 1)` is exactly the non-centred prior read forwards, so
+        /// the two descriptions are the same distribution.
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            let intercept = self.intercept_scale * rng.standard_normal();
+            let tau = (self.pool_scale * rng.standard_normal()).abs();
+            let mu_s = self.sigma_log_mean + self.sigma_log_sd * rng.standard_normal();
+            let tau_s = (self.sigma_spread * rng.standard_normal()).abs();
+
+            let mut truth = vec![intercept, tau, mu_s.exp(), tau_s];
+            let eta: Vec<f64> = (0..self.n_groups)
+                .map(|_| tau * rng.standard_normal())
+                .collect();
+            let sigma: Vec<f64> = (0..self.n_groups)
+                .map(|_| (mu_s + tau_s * rng.standard_normal()).exp())
+                .collect();
+            truth.extend(eta);
+            truth.extend(sigma);
+            Ok(truth)
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            let intercept = truth[0];
+            let eta = &truth[4..4 + self.n_groups];
+            let sigma = &truth[4 + self.n_groups..4 + 2 * self.n_groups];
+
+            let keys = self.keys();
+            let mut y = Vec::with_capacity(self.n_groups * self.n_per_group);
+            let mut g = Vec::with_capacity(self.n_groups * self.n_per_group);
+            for j in 0..self.n_groups {
+                for _ in 0..self.n_per_group {
+                    y.push(intercept + eta[j] + sigma[j] * rng.standard_normal());
+                    g.push(keys[j].as_str());
+                }
+            }
+            let frame = Frame::new(y.len()).numeric("y", y).key("segment", g);
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let model =
+                VaryingVarianceGaussian.compile(&Config::parse(&self.config()).unwrap(), &view)?;
+
+            // A replication the family refused would contribute no ranks, and dropping
+            // it silently would certify only the replications that happened to be easy.
+            if !model.readiness().status.is_actionable() {
+                return Err(BayesError::Internal(format!(
+                    "an SBC replication was refused ({:?})",
+                    model.readiness().reasons
+                )));
+            }
+
+            let opts = SampleOptions {
+                n_chains: 1,
+                n_draws: n_draws * self.thin,
+                n_warmup: crate::engines::DEFAULT_WARMUP,
+                seed: rng.uniform().to_bits(),
+                sample_from: crate::types::SampleFrom::Posterior,
+            };
+            let sample = match self.engine {
+                EngineKind::Nuts => NutsEngine.sample(&*model, &opts)?,
+                EngineKind::Laplace => LaplaceEngine.sample(&*model, &opts)?,
+                EngineKind::Exact => ExactEngine.sample(&*model, &opts)?,
+            };
+
+            // The family's own parameter order, resolved by name rather than assumed,
+            // so a future reordering fails loudly instead of ranking the wrong column.
+            let p = model.param_names().len();
+            let slot = |group: &str, name: &str| {
+                model
+                    .param_names()
+                    .iter()
+                    .position(|q| q.group_id == group && q.name == name)
+                    .unwrap_or_else(|| panic!("no parameter {group}/{name}"))
+            };
+            let mut wanted = vec![
+                slot(crate::types::GLOBAL_GROUP, "intercept"),
+                slot(crate::types::GLOBAL_GROUP, "pool_scale"),
+                slot(crate::types::GLOBAL_GROUP, "sigma_pop"),
+                slot(crate::types::GLOBAL_GROUP, "sigma_spread"),
+            ];
+            for k in &keys {
+                wanted.push(slot(k, "group_effect"));
+            }
+            for k in &keys {
+                wanted.push(slot(k, "sigma"));
+            }
+
+            Ok(wanted
+                .into_iter()
+                .map(|j| {
+                    sample
+                        .values
+                        .chunks(p)
+                        .skip(self.thin - 1)
+                        .step_by(self.thin)
+                        .map(|c| c[j])
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    fn f8_base(engine: EngineKind, thin: usize) -> F8VaryingVariance {
+        F8VaryingVariance {
+            // Five groups of ten: small on purpose. A hierarchical model earns its keep
+            // where the groups are thin, and that is also where a Gaussian
+            // approximation to a variance is at its worst, so certifying only a
+            // comfortable panel would certify the case nobody needs the family for.
+            n_groups: 5,
+            n_per_group: 10,
+            intercept_scale: 5.0,
+            pool_scale: 1.0,
+            sigma_log_mean: 0.0,
+            sigma_log_sd: 0.5,
+            sigma_spread: 0.5,
+            engine,
+            thin,
+        }
+    }
+
+    /// **The gate, and the reason `nuts` is this family's default engine.**
+    ///
+    /// Every reported parameter is ranked, including each group's own `sigma`, which is
+    /// the number a tail decision reads.
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn f8_is_calibrated_under_the_nuts_engine() {
+        // Every fifth draw: consecutive NUTS draws are correlated and SBC ranks assume
+        // exchangeability. This family mixes more slowly than F3 -- the group effects
+        // and the unpenalised intercept trade off along a ridge a diagonal mass matrix
+        // cannot precondition -- so it is thinned harder than F3's suite.
+        let hists = run_sbc(&f8_base(EngineKind::Nuts, 10), REPLICATIONS, BINS, 801).unwrap();
+        assert_calibrated(&hists, "f8/nuts");
+    }
+
+    /// **The suite above, proved to be a gate**, by the same construction F3 uses: the
+    /// whole pipeline with every draw pulled 40 % of the way toward its own posterior
+    /// mean. A pass here would mean the suite certifies nothing.
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn a_deliberately_overconfident_varying_variance_posterior_is_rejected() {
+        let model = Narrowed {
+            inner: f8_base(EngineKind::Nuts, 10),
+            factor: 0.6,
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 802).unwrap();
+        for h in &hists {
+            println!(
+                "f8/nuts/narrowed/{}: chi2 {:.1}, slope {:+.3}",
+                h.param,
+                h.chi_squared(),
+                h.slope()
+            );
+            assert!(
+                !h.passes(CRITICAL_15_DF),
+                "{}: a posterior 40% too narrow passed the calibration gate \
+                 (chi-squared {:.1}); the gate is not a gate",
+                h.param,
+                h.chi_squared()
+            );
+        }
+    }
+
+    /// **The Laplace path, measured rather than assumed — and it is the expected
+    /// failure.**
+    ///
+    /// `ROADMAP.md` §2 predicted this before the family was written: a Gaussian fitted
+    /// at the mode on the unconstrained scale is at its worst for a variance parameter
+    /// near zero, and a hierarchical variance parameter over five thin groups is
+    /// exactly that. Running the suite per engine is what turns the prediction into a
+    /// measurement.
+    ///
+    /// The loop is written out here rather than handed to [`run_sbc`] because the
+    /// failure is coarser than miscalibration: on a large share of replications the
+    /// Newton search **does not converge at all**, so there is no mode, no curvature and
+    /// no posterior to rank. `run_sbc` would propagate the first such error and report
+    /// nothing. What is reported instead is the share of replications Laplace could not
+    /// fit, which is the honest headline.
+    ///
+    /// The rank histograms are printed for the replications it *could* fit and are
+    /// **not** asserted on, because that subset is conditioned on the fits that happened
+    /// to be easy — the same objection this file raises against silently dropping a
+    /// refused replication. They are evidence, not a certificate.
+    ///
+    /// This is a measurement, not a gate, and loosening a threshold until it went green
+    /// would have been the one move that turns calibration into decoration.
+    #[test]
+    #[ignore = "slow, and a measurement rather than a gate: see docs/THEORY.md"]
+    fn f8_under_laplace_is_measured_and_is_not_certified() {
+        let model = f8_base(EngineKind::Laplace, 1);
+        let names = model.param_names();
+        let mut hists: Vec<RankHistogram> = names
+            .iter()
+            .map(|n| RankHistogram::new(n.clone(), BINS + 1))
+            .collect();
+        let mut failures = 0u32;
+
+        for replication in 0..REPLICATIONS {
+            let mut rng = BayesRng::for_chain(803, replication);
+            let truth = model.draw_prior(&mut rng).unwrap();
+            match model.simulate_and_fit(&truth, &mut rng, BINS) {
+                Ok(draws) => {
+                    for (p, hist) in hists.iter_mut().enumerate() {
+                        hist.record(draws[p].iter().filter(|d| **d < truth[p]).count());
+                    }
+                }
+                Err(_) => failures += 1,
+            }
+        }
+
+        let rate = failures as f64 / REPLICATIONS as f64;
+        println!(
+            "f8/laplace: the mode search failed on {failures} of {REPLICATIONS} \
+             replications ({:.1} %)",
+            100.0 * rate
+        );
+        for h in &hists {
+            println!(
+                "f8/laplace/{}: chi2 {:.1} (df {}), slope {:+.3}, n {} [conditioned on \
+                 the replications Laplace could fit, so not a certificate]",
+                h.param,
+                h.chi_squared(),
+                h.degrees_of_freedom(),
+                h.slope(),
+                h.n_replications
+            );
+        }
+
+        // What was measured when the family shipped, pinned so that an improvement is
+        // noticed on purpose rather than passing unremarked:
+        //
+        //   mode search failed on 32 of 1024 replications (3.1 %)
+        //   pool_scale    chi2 3942, slope -0.75
+        //   sigma_spread  chi2 4403, slope -0.79
+        //   intercept      chi2  246;  group_effect 131-178;  sigma 126-170
+        //
+        // against a 37.7 threshold. Not one parameter is calibrated, the two learned
+        // scales are wrong by two orders of magnitude, and the strong negative slope
+        // says the approximation puts them far *above* the truth rather than merely too
+        // narrowly around it. `default_engine()` is `Nuts` because of this table.
+        assert!(
+            failures > 0,
+            "Laplace fitted every replication of a five-group hierarchical posterior. \
+             That is not what was measured when this family shipped; re-measure the \
+             calibration and revisit `default_engine`"
+        );
+        for name in ["pool_scale", "sigma_spread"] {
+            let h = hists.iter().find(|h| h.param == name).unwrap();
+            assert!(
+                h.chi_squared() > 20.0 * CRITICAL_15_DF,
+                "{name} under Laplace came in at chi-squared {:.1}, far better than the \
+                 {:.0}-plus measured when this family shipped. Good news, and it means \
+                 the Laplace verdict in docs/THEORY.md needs re-deriving rather than \
+                 quietly inheriting",
+                h.chi_squared(),
+                20.0 * CRITICAL_15_DF
+            );
+        }
+        assert!(
+            !hists.iter().any(|h| h.passes(CRITICAL_15_DF)),
+            "some parameter is calibrated under Laplace; the blanket statement in \
+             docs/THEORY.md no longer holds"
+        );
     }
 
     /// The run that decides whether `payer_alive` may ship on Laplace at all.

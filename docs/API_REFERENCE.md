@@ -216,10 +216,12 @@ what an anomaly model is looking at. Both engines have their own calibration sui
 `exact` posterior and a `laplace` one look identical in SQL and do not carry the same
 warranty: the first is the posterior, the second is a Gaussian approximation to it.
 The family that ran is on the table too, as `__family__`: `2` for `censored_aft`,
-`3` for `pooled_gaussian`, `7` for `conjugate_anomaly` — the catalog F-numbers, decoded by
+`3` for `pooled_gaussian`, `7` for `conjugate_anomaly`, `8` for
+`varying_variance_gaussian` — the catalog F-numbers where one applies, decoded by
 `__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. The family that
 ran is on the table too, as `__family__`: `3` for `pooled_gaussian`, `5` for
-`payer_alive`, `7` for `conjugate_anomaly` — the catalog F-numbers, decoded by
+`payer_alive`, `7` for `conjugate_anomaly`, `8` for `varying_variance_gaussian` —
+decoded by
 `anofox_bayes_family_text(param, value)`. See
 [the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
@@ -630,6 +632,101 @@ worked end to end in `test/sql/f5_payer_alive.test`.
   posterior. The reason names which of the four mode checks failed. Fix `age` first
   (it is usually the last transaction date rather than today); if the shape is real,
   set a proper `prior`.
+
+---
+
+### 2.4 `varying_variance_gaussian` (no F-number)
+
+> Gaussian linear model with a residual scale per group and a learned pooling scale,
+> non-centred; the family for questions about a group's tail rather than its level.
+
+Use it when the decision reads a **spread**: a service level, a payment-delay buffer, a
+worst-case lead time. [`pooled_gaussian`](#22-pooled_gaussian-f3) has one residual scale
+for the whole design, so two groups with the same mean necessarily get the same
+predictive interval — that is structural and no setting changes it. Here each group has
+its own `sigma`, drawn from a shared hyperprior so a thin group borrows its spread from
+the rest rather than reporting noise.
+
+The second difference is `pool_scale`. In `pooled_gaussian` it is a number you supply;
+here it is a **parameter with a posterior**, estimated from how far apart the groups
+turn out to be, and its uncertainty widens every group effect. That is why it appears
+under `prior` here and at the top level there: what you set is the *scale of its
+hyperprior*, not the pooling itself. Writing it at the top level is an error naming the
+slot.
+
+`__family__` is `8` rather than an F-number: this family is the hierarchical substrate
+the BRD's F4 and F6 will be built on, not either of them.
+
+**Config slots**
+
+| Slot | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `y` | column | **yes** | — | The response. |
+| `group` | column | **yes** | — | One level and one scale per group. Required: a family about per-group variance has nothing to say without groups. |
+| `x` | column or list of columns | no | `[]` | Predictors, with population-level coefficients. |
+| `intercept` | flag | no | `1` | `0` drops the intercept; at least one of `x` or `intercept` must remain. |
+| `prior` | struct | no | see below | The hyperpriors. |
+| `draws`, `chains`, `warmup`, `seed`, `engine` | | | | [§1.2](#12-common-config-slots) |
+
+**`prior` slots**
+
+| Slot | Default | Meaning |
+|---|---|---|
+| `pool_scale` | **the response's own standard deviation** | > 0. Half-Normal scale for `pool_scale`, the spread of group levels. |
+| `sigma_spread` | `1.0` | > 0. Half-Normal scale for `sigma_spread`, the spread of `log sigma` across groups. One log unit is a factor of e. |
+| `sigma_log_mean` | `0.0` | Mean of the Normal prior on `log(sigma_pop)`. |
+| `sigma_log_sd` | flat | > 0. Its standard deviation; flat by default. |
+| `beta_scale` | flat | > 0. `N(0, beta_scale^2)` on each predictor coefficient. |
+| `intercept_scale` | flat | > 0. Flat by default, for the reason `pooled_gaussian` gives. |
+
+`pool_scale` is the one prior in this extension with a concrete default, and it is
+concrete only in form: it is taken from the data, so it rescales with your units and
+asserts nothing about them. Flat was measured and rejected — its upper tail makes the
+sampler diverge, and a divergence is a refusal. See
+[Theory §4](THEORY.md#varying_variance_gaussian--a-spread-per-group-and-the-pooling-decided-by-the-data).
+
+**Parameters emitted**
+
+| `param` | `group_id` | Meaning |
+|---|---|---|
+| `intercept` | `__global__` | Population level, unless `intercept: 0` |
+| `beta[<column>]` | `__global__` | One per entry of `x` |
+| `pool_scale` | `__global__` | Learned spread of the group levels |
+| `sigma_pop` | `__global__` | Population-level residual scale |
+| `sigma_spread` | `__global__` | Spread of `log sigma` across groups |
+| `group_effect` | the group key | That group's deviation from `intercept` |
+| `sigma` | the group key | **That group's own residual scale** |
+
+A group's level is `intercept + group_effect`, and its predictive for one more
+observation is that plus `sigma * z`. Both parts matter: the two are strongly
+anti-correlated, so combining them draw by draw is not the same as combining their
+intervals.
+
+**Engines**
+
+`nuts` is the default and is the only engine certified here. `laplace` is reachable and
+is **not certified**: its SBC suite fails on every parameter, by two orders of magnitude
+on the learned scales, and its mode search does not converge at all on about 3 % of
+fits. The numbers are in [Theory §5](THEORY.md#5-engines). `exact` is refused — there is
+no closed form.
+
+**Budget**
+
+Expect to set `draws` above the 1000 default. A hierarchical posterior mixes more
+slowly than a conjugate one; measured on an eight-group panel, 4 × 1000 draws leaves R̂
+just above the 1.01 gate and 4 × 2000 clears it. A `degenerate` verdict here usually
+means "take more draws".
+
+**Refusals**
+
+* Fewer than **three** groups is `insufficient_data`: `pool_scale` is a parameter, and
+  fewer than three groups cannot identify it. The message names `pooled_gaussian`,
+  which takes the pooling as a setting instead.
+* Fewer than two groups with two or more observations each is `insufficient_data`:
+  there is nothing for `sigma_spread` to be estimated from.
+* Every observation identical is `degenerate`: the residual scale is zero and
+  `log sigma` has no mode.
+* `sample_from: 'prior'` is an error — the prior has no closed-form draw here.
 
 ---
 

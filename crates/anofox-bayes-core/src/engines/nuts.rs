@@ -123,6 +123,10 @@ impl Engine for NutsEngine {
             // does not use. It is set anyway so that a reader of the settings is not
             // left wondering which seed is in force.
             settings.seed = opts.seed;
+            // The family's own geometry decides how finely the step size is tuned; see
+            // `LogPosterior::target_accept`. Families that do not override it get
+            // `nuts-rs`'s default and are unaffected.
+            settings.adapt_options.step_size_settings.target_accept = target.target_accept();
 
             let mut sampler = None;
             let mut last_error = None;

@@ -20,6 +20,7 @@ pub mod f2_censored_aft;
 pub mod f3_pooled_gaussian;
 pub mod f5_btyd;
 pub mod f7_conjugate;
+pub mod f8_varying_variance;
 
 use crate::config::Config;
 use crate::data::DataView;
@@ -349,6 +350,24 @@ pub trait LogPosterior {
     /// since they generally know their own answer.
     fn initial(&self) -> Vec<f64>;
 
+    /// The Hamiltonian acceptance rate a Markov sampler should adapt its step size to
+    /// for **this** posterior.
+    ///
+    /// A family declares it; a caller cannot, which is the same rule as for every other
+    /// parameterisation decision (HLD §3.2). The default is `nuts-rs`'s own 0.8, which
+    /// is right for the GLM-shaped posteriors the conjugate families produce, and every
+    /// family that does not override this is bit-for-bit unaffected.
+    ///
+    /// It exists because a hierarchical posterior needs a smaller step than a Gaussian
+    /// one for the same acceptance behaviour: the curvature varies sharply along the
+    /// variance components, and a step tuned to the bulk overshoots in the tail and is
+    /// reported as a divergence. Stan's `adapt_delta` is the same dial and is raised for
+    /// the same models and the same reason. Raising it costs leapfrog steps, not
+    /// correctness -- the target distribution is untouched.
+    fn target_accept(&self) -> f64 {
+        0.8
+    }
+
     /// Map unconstrained coordinates to the parameters the draws table reports.
     ///
     /// `out` has one slot per [`CompiledModel::param_names`] entry, which need not
@@ -380,6 +399,7 @@ pub fn all() -> &'static [&'static dyn ModelFamily] {
         &f3_pooled_gaussian::PooledGaussian,
         &f5_btyd::PayerAlive,
         &f7_conjugate::ConjugateAnomaly,
+        &f8_varying_variance::VaryingVarianceGaussian,
     ];
     FAMILIES
 }

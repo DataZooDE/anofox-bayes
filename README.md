@@ -72,8 +72,9 @@ catalog of model families and tune documented options; you cannot write your own
 likelihood. That restriction is what lets each family ship with fixed parameterisation
 decisions, a validated config schema and its own calibration suite.
 
-Today the catalog is three families — enough for anomaly detection, intervention
-measurement and customer-churn scoring. See [the roadmap](#roadmap).
+Today the catalog is five families — enough for anomaly detection, intervention
+measurement, censored durations, customer-churn scoring and per-segment service levels.
+See [the roadmap](#roadmap).
 
 ## Install
 
@@ -110,20 +111,21 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 | `conjugate_anomaly` | A level or rate per group; anomaly detection | `mu`, `sigma` (Normal) or `lambda` (Poisson) |
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
 | `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
+| `varying_variance_gaussian` | A *spread* per group: service levels, buffers, "which segments are unpredictable" | `intercept`, `beta[…]`, `pool_scale`, `sigma_pop`, `sigma_spread`, plus `group_effect` and `sigma` per group |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by
 predictors → `pooled_gaussian`; a repeat-purchase history and a churn question →
-`payer_alive`.**
+`payer_alive`; a question about a group's spread rather than its level →
+`varying_variance_gaussian`.**
 
 Three engines: `exact` (closed-form, the default), `laplace` (a Gaussian at the mode)
 and `nuts` (the No-U-Turn Sampler, via [`nuts-rs`](https://github.com/pymc-devs/nuts-rs)).
 Switching between them changes no caller SQL.
 
-Planned, and *not* present today: hierarchical negative-binomial (F1), censored
-survival (F2), payment delay (F4), payer-alive/BTYD (F5) and elasticity (F6). See
+Planned, and *not* present today: hierarchical negative-binomial (F1), a native payment
+delay model (F4) and elasticity (F6) — the last two now substitutable by
+`varying_variance_gaussian`, which is the hierarchical layer they were waiting on. See
 [the roadmap](#roadmap).
-survival (F2), payment delay (F4), elasticity (F6), and the
-NUTS engine. See [the roadmap](#roadmap).
 
 There is deliberately **no `predict` function** — posterior prediction is a join over
 the draws table, which is both simpler and faster. See

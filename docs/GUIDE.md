@@ -133,10 +133,20 @@ CREATE TABLE draws AS SELECT * FROM anofox_bayes_fit(...);
 | "What's the effect of price on volume, controlling for season?" | `pooled_gaussian` |
 | "Is this customer still a customer, or have they quietly gone?" | `payer_alive` |
 | "Which accounts on my dunning list are worth chasing?" | `payer_alive` |
+| "How much buffer does *this* segment need to cover 95 % of cases?" | `varying_variance_gaussian` |
+| "Which segments are unpredictable, as opposed to merely worse?" | `varying_variance_gaussian` |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`. A response explained by
 predictors → `pooled_gaussian`. A repeat-purchase history and a churn question →
-`payer_alive`.**
+`payer_alive`. A question about a group's *spread* rather than its level →
+`varying_variance_gaussian`.**
+
+The last row is the one people get wrong. `pooled_gaussian` will happily fit a panel by
+segment and give you an interval per segment — but it has a single residual scale for
+the whole design, so those intervals differ only by how much *data* each segment has,
+never by how variable each segment actually is. Two segments with the same mean get the
+same interval. If your decision reads a tail, that is the wrong model no matter how the
+numbers look.
 
 Every config slot is in the [API Reference](API_REFERENCE.md); the models themselves
 are described in [Theory §4](THEORY.md#4-the-shipped-families).

@@ -104,6 +104,16 @@ pub enum FamilyCode {
     PayerAlive = 5,
     /// F7 — conjugate anomaly (Normal / Poisson closed forms).
     ConjugateAnomaly = 7,
+    /// Gaussian linear model with a **per-group** residual variance and a **learned**
+    /// pooling scale.
+    ///
+    /// **Why 8 and not an F-number.** The BRD's grid runs F1–F7 and this family is
+    /// none of them: it is the hierarchical substrate that F4 (payment delay per
+    /// segment) and F6 (elasticity pooled by segment) will be written on top of, not
+    /// either of those likelihoods. Borrowing F4's number would say a persisted table
+    /// contains a payment-delay model when it does not. The next unused code is the
+    /// documented answer for a family outside the grid.
+    VaryingVarianceGaussian = 8,
 }
 
 impl FamilyCode {
@@ -115,6 +125,7 @@ impl FamilyCode {
             FamilyCode::PooledGaussian => "pooled_gaussian",
             FamilyCode::PayerAlive => "payer_alive",
             FamilyCode::ConjugateAnomaly => "conjugate_anomaly",
+            FamilyCode::VaryingVarianceGaussian => "varying_variance_gaussian",
         }
     }
 
@@ -125,6 +136,7 @@ impl FamilyCode {
             3 => Some(FamilyCode::PooledGaussian),
             5 => Some(FamilyCode::PayerAlive),
             7 => Some(FamilyCode::ConjugateAnomaly),
+            8 => Some(FamilyCode::VaryingVarianceGaussian),
             _ => None,
         }
     }
@@ -289,10 +301,22 @@ mod tests {
             FamilyCode::PooledGaussian,
             FamilyCode::PayerAlive,
             FamilyCode::ConjugateAnomaly,
+            FamilyCode::VaryingVarianceGaussian,
         ] {
             assert_eq!(FamilyCode::from_code(code as i32), Some(code));
         }
         assert_eq!(FamilyCode::PayerAlive.as_str(), "payer_alive");
+        // Outside the BRD's F1-F7 planning grid, so it takes the next unused code
+        // rather than borrowing an F-number that names a different likelihood.
+        assert_eq!(FamilyCode::VaryingVarianceGaussian as i32, 8);
+        assert_eq!(
+            FamilyCode::from_code(8),
+            Some(FamilyCode::VaryingVarianceGaussian)
+        );
+        assert_eq!(
+            FamilyCode::VaryingVarianceGaussian.as_str(),
+            "varying_variance_gaussian"
+        );
         // The gaps are families the catalog does not ship, not aliases for one it
         // does -- decoding one must fail rather than pick a neighbour.
         assert_eq!(FamilyCode::from_code(1), None);
