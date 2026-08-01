@@ -8,7 +8,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Rust targets (for local development)
-.PHONY: rust_release rust_debug test_rust test_sbc format_rust format_rust_fix clean_all
+.PHONY: rust_release rust_debug test_rust test_sbc lint format_rust format_rust_fix clean_all
 
 rust_release:
 	cargo build --release
@@ -25,6 +25,11 @@ test_rust:
 # family per engine), so it is #[ignore]d and only run explicitly / in CI.
 test_sbc:
 	cargo test --workspace --release -- --ignored --nocapture
+
+# What CI gates on, and therefore what to run before pushing. `-D warnings` is CI's
+# setting; running anything laxer locally just moves the failure to the pipeline.
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # Named `format_rust` rather than `format`: extension-ci-tools already defines
 # `format`/`format-fix` for the C++ side, and overriding them silently drops the

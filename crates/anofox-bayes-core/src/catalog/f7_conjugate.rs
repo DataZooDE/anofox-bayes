@@ -253,9 +253,12 @@ impl Prior {
 }
 
 /// The closed-form posterior for one group.
+/// The closed-form posterior for one group.
+///
+/// The group's key is not stored: it already travels on every `ParamName` this family
+/// emits, and a second copy would be a second thing to keep in step.
 #[derive(Debug, Clone)]
 struct GroupPosterior {
-    key: String,
     kind: PosteriorKind,
     readiness: Readiness,
 }
@@ -298,10 +301,7 @@ impl GroupPosterior {
         let alpha_n = prior.alpha0 + n as f64 / 2.0;
 
         if n == 0 {
-            return Ok(Self::unfittable(
-                key.clone(),
-                format!("group '{key}': no observations"),
-            ));
+            return Ok(Self::unfittable(format!("group '{key}': no observations")));
         }
 
         let ybar = ys.iter().sum::<f64>() / n as f64;
@@ -321,7 +321,7 @@ impl GroupPosterior {
                     "group '{key}': {n} observations are too few to identify a mean and a variance"
                 )
             };
-            return Ok(Self::unfittable(key, reason));
+            return Ok(Self::unfittable(reason));
         }
 
         let readiness = if n < min_obs {
@@ -333,7 +333,6 @@ impl GroupPosterior {
         };
 
         Ok(Self {
-            key,
             kind: PosteriorKind::Nig {
                 mu_n,
                 kappa_n,
@@ -379,10 +378,9 @@ impl GroupPosterior {
         let b_n = prior.b0 + total_exposure;
 
         if a_n <= 0.0 || b_n <= 0.0 {
-            return Ok(Self::unfittable(
-                key.clone(),
-                format!("group '{key}': total exposure is zero, so no rate is identifiable"),
-            ));
+            return Ok(Self::unfittable(format!(
+                "group '{key}': total exposure is zero, so no rate is identifiable"
+            )));
         }
 
         let readiness = if n < min_obs {
@@ -394,7 +392,6 @@ impl GroupPosterior {
         };
 
         Ok(Self {
-            key,
             kind: PosteriorKind::Gamma { a_n, b_n },
             readiness,
         })
@@ -406,9 +403,8 @@ impl GroupPosterior {
     /// only honest answer: a number here would be indistinguishable from an estimate,
     /// and the whole point of the refusal path is that an agent can tell the two
     /// apart.
-    fn unfittable(key: String, reason: String) -> Self {
+    fn unfittable(reason: String) -> Self {
         Self {
-            key,
             kind: PosteriorKind::Nig {
                 mu_n: f64::NAN,
                 kappa_n: f64::NAN,

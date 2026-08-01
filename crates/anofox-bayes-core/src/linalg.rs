@@ -51,7 +51,11 @@ pub fn cholesky(a: &Mat<f64>) -> BayesResult<Mat<f64>> {
                 // original diagonal makes the test independent of the units the data
                 // happens to be measured in.
                 let tolerance = 1e-12 * a[(i, i)].abs().max(1.0);
-                if !(sum > tolerance) || !sum.is_finite() {
+                // The finiteness test comes first and is not folded into the
+                // comparison. `sum <= tolerance` is *false* for a NaN, so testing it
+                // alone would wave a NaN pivot straight through; ordering the checks
+                // this way rejects it, and says so.
+                if !sum.is_finite() || sum <= tolerance {
                     return Err(BayesError::NotPositiveDefinite(format!(
                         "leading minor {} is {sum}, at or below the rank tolerance {tolerance}",
                         i + 1

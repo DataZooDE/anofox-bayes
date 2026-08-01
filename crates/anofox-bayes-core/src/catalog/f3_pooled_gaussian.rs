@@ -51,7 +51,7 @@ use crate::draws::ParamName;
 use crate::errors::{BayesError, BayesResult};
 use crate::linalg::{cholesky, sample_mvn, solve_with};
 use crate::rng::BayesRng;
-use crate::types::{EngineKind, GLOBAL_GROUP};
+use crate::types::EngineKind;
 
 use super::{CompiledModel, ExactPosterior, ModelFamily, Readiness};
 use faer::Mat;
@@ -427,12 +427,12 @@ impl CompiledPooledGaussian {
         let n = x.len();
         // L' x first, then L (that product).
         let mut t = vec![0.0; n];
-        for i in 0..n {
-            t[i] = (i..n).map(|k| self.chol[(k, i)] * x[k]).sum();
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = (i..n).map(|k| self.chol[(k, i)] * x[k]).sum();
         }
         let mut out = vec![0.0; n];
-        for i in 0..n {
-            out[i] = (0..=i).map(|k| self.chol[(i, k)] * t[k]).sum();
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = (0..=i).map(|k| self.chol[(i, k)] * t[k]).sum();
         }
         out
     }

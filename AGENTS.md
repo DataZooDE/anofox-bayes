@@ -11,6 +11,7 @@ export VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 export GEN=ninja
 
 cargo test --workspace         # fast loop -- run this constantly
+make lint                      # clippy with -D warnings, exactly as CI runs it
 make release                   # builds DuckDB the first time (30-60 min)
 make test                      # sqllogictest suite
 make test_sbc                  # calibration suites (slow, ~30 s, release mode)
@@ -113,7 +114,7 @@ bd sync                              # sync with git
 Work is not complete until `git push` succeeds.
 
 1. File issues for anything left over.
-2. Run the quality gates: `cargo test --workspace`, `make test`, `cargo fmt --all -- --check`.
+2. Run the quality gates CI runs: `cargo test --workspace`, `make lint`, `make test`, `cargo fmt --all -- --check`.
 3. Update issue status.
 4. `git pull --rebase && bd sync && git push`, then confirm `git status` says up to date.
 5. Hand off with context for the next session.
