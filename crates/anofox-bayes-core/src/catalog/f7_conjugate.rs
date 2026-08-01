@@ -371,9 +371,15 @@ impl GroupPosterior {
                 ));
             }
         }
-        let total_exposure = match exposure {
-            None => n as f64,
+        // Rows carrying no exposure carry no likelihood, and are tracked separately
+        // from `n` because they must not count towards readiness below.
+        let (total_exposure, n_informative) = match exposure {
+            // No exposure column means one unit of exposure per row, so every row is
+            // informative by construction.
+            None => (n as f64, n),
             Some(es) => {
+                let mut total = 0.0;
+                let mut informative = 0usize;
                 for (i, e) in es.iter().enumerate() {
                     if *e < 0.0 {
                         return Err(BayesError::config(
@@ -381,8 +387,34 @@ impl GroupPosterior {
                             format!("must be non-negative; row {i} of group '{key}' is {e}"),
                         ));
                     }
+                    if *e > 0.0 {
+                        informative += 1;
+                    } else if ys[i] > 0.0 {
+                        // y ~ Poisson(lambda * exposure) with zero exposure has mean
+                        // zero, so P(y > 0) = 0 for *every* lambda: this row is
+                        // impossible under the model rather than merely uninformative,
+                        // and no posterior conditions on it.
+                        //
+                        // Silently accepting it is worse than it looks. The conjugate
+                        // update accumulates the count into the shape and the exposure
+                        // into the rate, so a zero-exposure count raises `a_n` without
+                        // raising `b_n` and drags the posterior mean `a_n / b_n`
+                        // upwards -- impossible data returned as a confident claim of
+                        // a higher rate. Almost always a join that lost its
+                        // denominator; either way the caller has to see it.
+                        return Err(BayesError::config(
+                            "exposure",
+                            format!(
+                                "row {i} of group '{key}' has {y} events over zero \
+                                 exposure, which no rate can produce. Drop the row, or \
+                                 supply the exposure it was observed over",
+                                y = ys[i]
+                            ),
+                        ));
+                    }
+                    total += *e;
                 }
-                es.iter().sum()
+                (total, informative)
             }
         };
 
@@ -395,9 +427,15 @@ impl GroupPosterior {
             )));
         }
 
-        let readiness = if n < min_obs {
+        // Gate on informative rows, not on rows. A group of nothing but zero-exposure
+        // rows would otherwise clear `min_obs` and -- under a proper prior, where
+        // `a_n` and `b_n` are positive without any data -- report `Converged` while
+        // emitting draws from the prior alone: a fit that has seen no evidence,
+        // presented as one that has.
+        let readiness = if n_informative < min_obs {
             Readiness::insufficient(format!(
-                "group '{key}': {n} observations is below the min_obs threshold of {min_obs}"
+                "group '{key}': {n_informative} observations with non-zero exposure is \
+                 below the min_obs threshold of {min_obs}"
             ))
         } else {
             Readiness::ready()
@@ -1418,5 +1456,95 @@ mod tests {
         };
         assert_eq!(make(vec![1.0, 2.0, 3.0]), make(vec![1.0, 2.0, 3.0]));
         assert_ne!(make(vec![1.0, 2.0, 3.0]), make(vec![1.0, 2.0, 4.0]));
+    }
+    //=== Zero exposure ====================================================//
+
+    /// A count observed over zero exposure is impossible data, not evidence.
+    ///
+    /// `y ~ Poisson(lambda * exposure)` with `exposure = 0` has mean zero, so
+    /// `P(y > 0) = 0` for *every* lambda -- the likelihood is identically zero and no
+    /// posterior exists. The conjugate update does not notice: `a_n` accumulates the
+    /// count while `b_n` accumulates the exposure, so a zero-exposure row raises the
+    /// shape without raising the rate and the posterior mean `a_n / b_n` moves *up*.
+    /// Impossible data would come back as a confident claim of a higher rate.
+    #[test]
+    fn a_count_observed_over_zero_exposure_is_rejected_as_impossible() {
+        let frame = Frame::new(4)
+            .numeric("claims", vec![2.0, 3.0, 1.0, 5.0])
+            .numeric("shipments", vec![100.0, 120.0, 90.0, 0.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let err = compile(
+            r#"{"value": "claims", "likelihood": "poisson", "exposure": "shipments"}"#,
+            &view,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exposure") && msg.contains('3'),
+            "the message must name the slot and the offending row: {msg}"
+        );
+    }
+
+    /// The same row with a zero count is *consistent* -- observing nothing over no
+    /// exposure is exactly what the model predicts -- so it must be accepted rather
+    /// than rejected. It simply carries no information.
+    #[test]
+    fn a_zero_count_over_zero_exposure_is_consistent_and_accepted() {
+        let frame = Frame::new(4)
+            .numeric("claims", vec![2.0, 3.0, 1.0, 0.0])
+            .numeric("shipments", vec![100.0, 120.0, 90.0, 0.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        assert!(compile(
+            r#"{"value": "claims", "likelihood": "poisson", "exposure": "shipments"}"#,
+            &view,
+        )
+        .is_ok());
+    }
+
+    /// ...and carrying no information means it must not count towards readiness.
+    ///
+    /// Otherwise a group of nothing but zero-exposure rows clears `min_obs`, and with
+    /// a proper prior it reports `Converged` while emitting draws from the prior
+    /// alone -- a fit that has seen no evidence, presented as one that has.
+    #[test]
+    fn zero_exposure_rows_do_not_count_towards_the_readiness_threshold() {
+        // EMPTY has four rows and none of them informative; REAL has three, all
+        // informative, so it clears the same threshold and isolates the claim.
+        let frame = Frame::new(7)
+            .numeric("claims", vec![0.0, 0.0, 0.0, 0.0, 2.0, 3.0, 4.0])
+            .numeric("shipments", vec![0.0, 0.0, 0.0, 0.0, 50.0, 60.0, 55.0])
+            .key(
+                "lane",
+                vec!["EMPTY", "EMPTY", "EMPTY", "EMPTY", "REAL", "REAL", "REAL"],
+            );
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(
+            r#"{"value": "claims", "likelihood": "poisson", "exposure": "shipments",
+                "group": "lane", "prior": {"a0": 1.0, "b0": 1.0}, "min_obs": 3}"#,
+            &view,
+        )
+        .unwrap();
+
+        // The all-zero-exposure lane has 4 rows and 0 informative ones, so it is below
+        // a threshold of 3 and must say so rather than reporting the prior as a fit.
+        let verdict = model.readiness();
+        assert_ne!(
+            verdict.status,
+            FitStatus::Converged,
+            "a lane with no informative rows must not report as converged"
+        );
+        assert!(
+            verdict.reasons.iter().any(|r| r.contains("EMPTY")),
+            "{:?}",
+            verdict.reasons
+        );
+        assert_eq!(
+            model.n_groups_unready(),
+            1,
+            "exactly the EMPTY lane is unready"
+        );
     }
 }
