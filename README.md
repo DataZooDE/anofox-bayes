@@ -47,25 +47,29 @@ branchable. There is no notebook experience and none is planned.
 
 The extension is distributed for DuckDB **v1.4.5 LTS** and **v1.5.5**.
 
-Because `anofox-bayes` is BSL-licensed it is **not** published to the DuckDB
-community repository; it is served from the DataZoo distribution channel, like
-`erpl` and `anofox-statistics`:
+Because `anofox-bayes` is BSL-licensed it will **not** be published to the DuckDB
+community repository. It is intended to ship from the DataZoo distribution channel,
+like `erpl` and `anofox-statistics`:
 
 ```sql
+-- Not live yet -- see below.
 INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';
 LOAD anofox_bayes;
-
-SELECT anofox_bayes_version(), anofox_bayes_draws_schema_version();
--- 0.1.0 | 1
 ```
+
+> **No binaries are published yet.** The release pipeline is in place but has never
+> run, and the channel needs a `DEPLOY_S3_BUCKET` variable plus an IAM OIDC trust-policy
+> entry for this repository before it can. Until then, **build from source.**
 
 ### From source
 
 ```bash
 git clone --recurse-submodules https://github.com/DataZooDE/anofox-bayes.git
 cd anofox-bayes
+export VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 
 make release -j$(nproc)      # or: GEN=ninja make release
+                             # the first build compiles DuckDB: 30-60 minutes
 
 # build/release/extension/anofox_bayes/anofox_bayes.duckdb_extension
 # build/release/duckdb          (a shell with the extension linked in)
