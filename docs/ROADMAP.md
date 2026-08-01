@@ -24,7 +24,7 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 3 | F5 payer-alive (BG/NBD) | 05 | Blocker | 8–12 | — |
 | 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 blocker; 01, 04, 06 degradation | Unblocks 02 outright; gives 01/04/06 an honest interim path | 6–9 | statistics exposing the vcov matrix |
 | 3 | F5 payer-alive (BG/NBD) | 05 | **Shipped.** Agent 05 unblocked | 8–12 | — |
-| 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | Blocker for 06 — the interaction-column workaround left 10 of 12 intervals not covering | 12–18 | gap 6 for the learned scale |
+| 4 | Random slopes ~~+ learned pooling scale~~ | 06 blocker; 03 degradation | **Random slopes shipped** in `pooled_gaussian`; the learned scale is not this family's and moves to gap 5's | 12–18 | gap 6 for the learned scale |
 | 5 | Per-group variance | 04 | Blocker for the tail question, which is why agent 04 exists | 5–8 with gap 4 | gap 4 |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | Dependency of gaps 4, 5, 7 | **done** | — |
 | 7 | F1 hierarchical negative binomial | 01 | Blocker natively; degraded path via gap 2 | 12–20 | gap 6 — **met** |
@@ -370,6 +370,52 @@ It does **not** fix the coverage problem — the scale is still an analyst dial 
 makes the model say what agent 06 means, which is a precondition for diagnosing the
 rest.
 
+> **Shipped, and the split held exactly.** `random_slopes` is a list of predictors,
+> each of which gains one column per group under the same `N(0, sigma^2 *
+> pool_scale^2)` prior as a group intercept. Parameters are named
+> `group_slope[<column>]`, carried across `group_id` like `group_effect`. No engine
+> work, no new calibration story: the posterior is still closed form, the ridge closed
+> form still holds to `1e-9` on a design containing group slopes, and `exact`,
+> `laplace` and `nuts` still agree.
+>
+> **Three findings worth carrying forward.**
+>
+> *The design is rank deficient by construction, and the prior is what fixes it.* The
+> group-slope columns for a predictor sum exactly to that predictor's fixed column —
+> the intercept-plus-group-dummies trap, one level up. `A = X'X + P` is positive
+> definite exactly when the *unpenalised* columns are independent, so the group block
+> being penalised is not a convenience, it is what makes "the population slope" and
+> "how this store differs from it" separable statements at all. The obvious defensive
+> move — refusing because `X` is singular — would have deleted the feature. Recorded
+> as a test in both directions.
+>
+> *NUTS mixes better here than the parallel track's note predicted, not worse.*
+> Measured on a four-store random-slopes design at `pool_scale = 0.5`, ESS over 8 000
+> draws was 1 114–6 196 with all eleven parameters inside five Monte Carlo standard
+> errors of the closed form. Random slopes did not make the group-effect ridge worse.
+> The plausible reason is that a tighter `pool_scale` conditions the group block, which
+> is a hint about what the non-centred parameterisation in the other family is for
+> rather than a licence to stop worrying: the pathology reported at ESS ~150 is a
+> function of the scale, and the scale is exactly what that family will be learning.
+>
+> *Laplace's understatement of `sigma` grows with the width of the design.* Each random
+> slope adds a group's worth of columns to `p` without adding an observation, and
+> Laplace centres `sigma` on the joint mode `2 s_n/(2 a_n + p)` against the exact
+> posterior mean `s_n/(a_n − 1)`. Measured 2.3 % low at n = 240, p = 10, against a
+> predicted 2.6 % — so the engine-agreement test pins the derived ratio rather than
+> loosening a tolerance until it passes. Any future family that widens a design without
+> lengthening it inherits this.
+>
+> **What it does and does not do for agent 06.** It removes the interaction-column
+> hack: the model now says "each store has its own elasticity, and stores are alike
+> until the data says otherwise" instead of "here are eight unrelated slopes, all
+> shrunk toward zero by a hand-tuned `beta_scale`". It does **not** fix the coverage
+> problem. `pool_scale` is still an analyst dial, and 10-of-12 intervals not covering
+> is a statement about how hard the pooling pulls — which is precisely the quantity a
+> learned scale would estimate and this family cannot. What has changed is that the
+> mis-coverage is now attributable to one named number rather than to a specification
+> that never expressed the question.
+
 The other two belong in a new family served by Laplace and NUTS. Folding them into
 `pooled_gaussian` would make one family bimodal: sometimes exact and instant, sometimes
 sampled and slow, decided by a config slot several levels deep. A caller reading
@@ -380,6 +426,11 @@ decisions with one calibration story; a family with two warranties has neither.
 The `beta_scale` complaint resolves inside the same decision: it shrinks every slope
 toward zero, which is a claim about the world ("effects are small") nobody asked to
 make. Shrinking group deviations toward a common mean is the random-slope structure.
+
+> **Enforced, not merely documented.** A `random_slopes` entry must also appear in `x`,
+> so the group deviation always has a population slope to deviate *from*. Without one
+> the deviations would be shrunk toward zero and the family would be making the
+> `beta_scale` claim under a different name. The refusal names the column and says why.
 
 **Naming is open.** `hierarchical_gaussian` is the obvious candidate and not obviously
 right, since `pooled_gaussian` is also hierarchical. Decide before the config surface is

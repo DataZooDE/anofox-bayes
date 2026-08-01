@@ -7,6 +7,38 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Added — `pooled_gaussian` random slopes
+
+Roadmap gap 4, first half. `docs/ROADMAP.md` §3.3 scoped it and the scope held: random
+slopes at a *fixed* `pool_scale` are a design-matrix change and nothing else, so the
+family keeps its closed-form warranty. A per-group `sigma` and a *learned* `pool_scale`
+break conjugacy and are not here.
+
+- **`random_slopes`** — a predictor or list of predictors, each of which gains one
+  column per group under the same `N(0, sigma^2 * pool_scale^2)` prior as a group
+  intercept. Emitted as `group_slope[<column>]`, one parameter name carried across
+  `group_id` exactly as `group_effect` is, so `GROUP BY param` stays meaningful at
+  hundreds of groups and an existing downstream query keeps working.
+- **An entry must also appear in `x`.** A random slope is a deviation *from* a
+  population slope; without one the group slopes would be shrunk toward zero, which
+  asserts the predictor has no effect — the claim `docs/ROADMAP.md` criticises
+  `beta_scale` for making. Refused with a message naming the column.
+- **The ridge closed form still holds exactly** on a design containing group slopes
+  (agreement to `1e-9` against an independently assembled and solved system), and
+  `exact`, `laplace` and `nuts` still agree on such a design.
+- **The design is rank deficient by construction and the prior is what fixes it.** A
+  predictor's group-slope columns sum to its fixed column — the intercept-plus-group-
+  dummies trap one level up. `X'X + P` is positive definite exactly when the
+  *unpenalised* columns are independent; rank deficiency there is still refused.
+- **Laplace understates `sigma` by more as the design widens.** Each random slope adds
+  columns without adding observations, and the mode-to-mean ratio
+  `sqrt((2(a_n-1))/(2 a_n + p))` falls with `p`. Measured 2.3 % at n = 240, p = 10.
+  The engine-agreement test pins the predicted ratio rather than loosening a tolerance.
+- New SBC suite `f3_random_slopes_are_calibrated_under_the_exact_engine` (χ² 18.5–26.7
+  at 15 df against a 37.7 threshold) and a `test/sql/f3_price_elasticity.test` scenario.
+- **Non-breaking.** A fit without `random_slopes` is unchanged, parameter for parameter
+  and draw for draw; `__schema_version__` and `ALGORITHM_VERSION` do not move.
+
 ### Changed — `conjugate_anomaly` fits its groups in parallel
 
 Roadmap gap 14, first of three. `docs/SCALABILITY.md` carries the measurements.

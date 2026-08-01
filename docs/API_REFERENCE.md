@@ -378,7 +378,8 @@ must look at before acting on any of it.
 | `x` | column or list of columns | no | `[]` | Predictors. A bare string is accepted for a single predictor. |
 | `intercept` | flag | no | `1` | `0` drops the intercept. |
 | `group` | column | no | none | Adds one intercept per group, partially pooled. |
-| `pool_scale` | double | no | `1.0` | > 0. Standard deviation of the `N(0, sigma^2 * pool_scale^2)` prior on each group intercept. |
+| `random_slopes` | column or list of columns | no | `[]` | Each named predictor also gets a per-group slope deviation, partially pooled. Requires `group`, and every entry must appear in `x`. |
+| `pool_scale` | double | no | `1.0` | > 0. Standard deviation of the `N(0, sigma^2 * pool_scale^2)` prior on each group deviation — intercepts and random slopes alike. |
 | `prior` | struct | no | flat | See below. |
 | `draws`, `seed`, `engine` | | | | [§1.2](#12-common-config-slots) |
 
@@ -396,11 +397,26 @@ At least one of `x`, `intercept` or `group` must be present:
 | `intercept` | `__global__` | `intercept` is not `0` |
 | `beta[<column>]` | `__global__` | one per entry of `x`, named after the column |
 | `group_effect` | the group key | `group` is set; one row-set per group |
+| `group_slope[<column>]` | the group key | one per entry of `random_slopes`, named after the column; one row-set per group |
 | `sigma` | `__global__` | always |
 
 Note the shape: `group_effect` is a *single parameter name* carried across many
 `group_id` values, not one name per group. Filter with
-`WHERE param = 'group_effect' AND group_id = 'S03'`.
+`WHERE param = 'group_effect' AND group_id = 'S03'`. `group_slope[price]` has the
+same shape, one name per predictor carried across every group key — so
+`GROUP BY param` stays a meaningful diagnostics query at hundreds of groups.
+
+A group's *total* response to a predictor is `beta[price] + group_slope[price]`, and
+the two are correlated in the posterior, so they must be added **within a draw**:
+
+```sql
+SELECT d.group_id AS store, median(b.value + d.value) AS elasticity
+FROM el AS d
+JOIN el AS b ON b.chain = d.chain AND b.draw = d.draw
+            AND b.param = 'beta[log_price]'
+WHERE d.param = 'group_slope[log_price]' AND d.draw >= 0
+GROUP BY d.group_id;
+```
 
 **Model**
 
@@ -440,6 +456,47 @@ needs a sampler rather than a formula. The `nuts` engine now exists; the family 
 would use it this way does not yet. Fixing it is the documented stepping stone, and small
 groups are therefore shrunk toward the population intercept while large ones are
 not.
+
+**Random slopes.** `random_slopes` lets each group have its own coefficient on a
+predictor, shrunk toward the population coefficient by the same `pool_scale`. This is
+a design-matrix change and nothing else — more columns, more entries on the diagonal
+prior precision — so the posterior stays closed form and all three engines still
+agree on it.
+
+Three things to be precise about, because they are three different claims:
+
+* `prior.beta_scale` shrinks the **population** slope `beta[price]` toward zero. That
+  says the effect is small, which is a claim about the world.
+* `pool_scale` shrinks each group's `group_slope[price]` toward the population slope.
+  That says only that groups are alike until the data says otherwise, which is what
+  an analyst asking for random slopes means.
+* The predictor **must also appear in `x`**, so the deviation is a deviation *from* a
+  population slope rather than from zero. Without it the group slopes would be shrunk
+  toward "this predictor has no effect", and the request is refused rather than
+  silently reinterpreted.
+
+One caveat that `pool_scale` cannot express: an intercept deviation is in units of the
+response and a slope deviation is in response *per unit of the predictor*, and a
+single `pool_scale` governs both. Centring and scaling the predictor is what makes the
+two comparable, and is worth doing before reading the shrinkage.
+
+The group-slope columns for a predictor sum exactly to that predictor's fixed column,
+so the design is rank deficient in the same way an intercept plus a full set of group
+dummies is. What identifies the split is the prior: the group block carries positive
+precision and the fixed block does not. A design whose *unpenalised* columns are
+linearly dependent is still refused.
+
+```sql
+-- Per-store price elasticity, with a thin store borrowing strength.
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, log_price, log_units FROM weekly),
+    'pooled_gaussian',
+    {'y': 'log_units', 'x': ['log_price'], 'group': 'store',
+     'random_slopes': ['log_price'], 'pool_scale': 1.5,
+     'draws': 2000, 'seed': 42});
+```
+
+Its executable specification is `test/sql/f3_price_elasticity.test`.
 
 **Example**
 

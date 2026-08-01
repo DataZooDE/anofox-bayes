@@ -516,6 +516,141 @@ mod families {
         }
     }
 
+    /// F3 with random slopes: a per-store price response, under proper priors
+    /// throughout.
+    ///
+    /// **Why every free parameter here really is priored**, which is what makes this a
+    /// certificate rather than a plausible-looking measurement. The intercept is fitted
+    /// out (`intercept: 0`) for the reason `F3Slopes` fits it out — this family never
+    /// penalises it, so there is no distribution to draw a truth from. What remains is
+    /// the population slope under `beta_scale`, each store's intercept deviation and
+    /// each store's slope deviation under `pool_scale`, and `sigma` under
+    /// `InvGamma(a0, s0)`. All four kinds are sigma-scaled Gaussians or the
+    /// inverse-gamma itself, so the truth can be drawn from exactly the prior the fit
+    /// applies.
+    ///
+    /// **What it certifies that `F3Slopes` does not.** The group-slope columns sum to
+    /// the fixed column, so the split between "the population elasticity" and "how this
+    /// store differs from it" is identified by the prior rather than by the data. A
+    /// mis-scaled `pool_scale` on the slope block would leave every marginal looking
+    /// reasonable and the shrinkage wrong; SBC ranks the truth against the posterior
+    /// and sees it.
+    struct F3RandomSlopes {
+        rows_per_group: usize,
+        n_groups: usize,
+        beta_scale: f64,
+        pool_scale: f64,
+        a0: f64,
+        s0: f64,
+    }
+
+    impl F3RandomSlopes {
+        /// The deterministic price ladder store `g` sees, shared across replications so
+        /// the design is a constant of the suite rather than another source of noise.
+        fn price(&self, i: usize) -> f64 {
+            ((i % 7) as f64) - 3.0
+        }
+    }
+
+    impl SbcModel for F3RandomSlopes {
+        fn param_names(&self) -> Vec<String> {
+            vec![
+                "beta[price]".into(),
+                "group_effect[S0]".into(),
+                "group_slope[price][S0]".into(),
+                "sigma".into(),
+            ]
+        }
+
+        /// `[beta, effect_0, slope_0, sigma, effect_1, slope_1, ...]`.
+        ///
+        /// The four tracked parameters come first because `run_sbc` ranks `truth[p]`
+        /// against `draws[p]` by position — a layout that merely *looked* natural
+        /// would rank a store's slope against another store's posterior and report a
+        /// uniform histogram for the wrong reason.
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            let sigma_sq = inv_gamma(rng, self.a0, self.s0)?;
+            let sigma = sigma_sq.sqrt();
+            let group = |rng: &mut BayesRng| sigma * self.pool_scale * rng.standard_normal();
+            let beta = sigma * self.beta_scale * rng.standard_normal();
+            let (effect0, slope0) = (group(rng), group(rng));
+            let mut out = vec![beta, effect0, slope0, sigma];
+            for _ in 1..self.n_groups {
+                out.push(group(rng));
+                out.push(group(rng));
+            }
+            Ok(out)
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            let g = self.n_groups;
+            let sigma = truth[3];
+            let effect = |s: usize| {
+                if s == 0 {
+                    truth[1]
+                } else {
+                    truth[4 + 2 * (s - 1)]
+                }
+            };
+            let slope = |s: usize| {
+                if s == 0 {
+                    truth[2]
+                } else {
+                    truth[5 + 2 * (s - 1)]
+                }
+            };
+            let n = self.rows_per_group * g;
+            let (mut y, mut price, mut store) = (Vec::new(), Vec::new(), Vec::new());
+            for s in 0..g {
+                for i in 0..self.rows_per_group {
+                    let p = self.price(i);
+                    price.push(p);
+                    y.push((truth[0] + slope(s)) * p + effect(s) + sigma * rng.standard_normal());
+                    store.push(format!("S{s}"));
+                }
+            }
+
+            let keys: Vec<&str> = store.iter().map(String::as_str).collect();
+            let frame = Frame::new(n)
+                .numeric("y", y)
+                .numeric("price", price)
+                .key("store", keys);
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let cfg = format!(
+                r#"{{"y": "y", "x": "price", "intercept": 0, "group": "store",
+                     "random_slopes": "price", "pool_scale": {},
+                     "prior": {{"beta_scale": {}, "a0": {}, "s0": {}}}}}"#,
+                self.pool_scale, self.beta_scale, self.a0, self.s0
+            );
+            let model = PooledGaussian.compile(&Config::parse(&cfg).unwrap(), &view)?;
+
+            let sample = ExactEngine.sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 1,
+                    n_draws,
+                    n_warmup: 0,
+                    seed: rng.uniform().to_bits(),
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )?;
+            let p = model.param_names().len();
+            // beta[price], the first store's intercept deviation, the first store's
+            // slope deviation, and sigma -- one of each kind the design contains.
+            let want = [0, 1, 1 + g, p - 1];
+            Ok(want
+                .iter()
+                .map(|&j| sample.values.chunks(p).map(|c| c[j]).collect())
+                .collect())
+        }
+    }
+
     /// A real fit, narrowed on purpose.
     ///
     /// **The fixture that proves the gate can fail.** A calibration suite that only
@@ -878,6 +1013,28 @@ mod families {
         };
         let hists = run_sbc(&model, REPLICATIONS, BINS, 102).unwrap();
         assert_calibrated(&hists, "f3/exact");
+    }
+
+    /// Random slopes certified under the exact engine.
+    ///
+    /// Run alongside `f3_is_calibrated_under_the_exact_engine` rather than in place of
+    /// it: the plain suite certifies the conjugate update on a fixed design, and this
+    /// one certifies that the group-slope columns and the prior precision on them were
+    /// assembled to mean what the family says they mean. A defect in either would leave
+    /// the other suite green.
+    #[test]
+    #[ignore = "slow: hundreds of complete fits"]
+    fn f3_random_slopes_are_calibrated_under_the_exact_engine() {
+        let model = F3RandomSlopes {
+            rows_per_group: 14,
+            n_groups: 3,
+            beta_scale: 1.0,
+            pool_scale: 0.5,
+            a0: 3.0,
+            s0: 3.0,
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 106).unwrap();
+        assert_calibrated(&hists, "f3_random_slopes/exact");
     }
 
     /// The Laplace path certified independently. This is the run that says *where*
