@@ -55,6 +55,18 @@ static void RegisterTelemetryOptions(ExtensionLoader &loader) {
 
 #endif // ANOFOX_TELEMETRY_ENABLED
 
+// How many worker threads a fit may use, when DuckDB's own `threads` is not the right
+// answer. 0 -- the default -- follows `SET threads`, which is what most callers want:
+// one knob that bounds the whole process. The override exists because a fit is one
+// operator inside a query, and the parallelism that suits a scan need not suit a
+// sampler holding four chains for several seconds each.
+static void RegisterThreadOption(ExtensionLoader &loader) {
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption("anofox_bayes_threads",
+	                          "Worker threads for a fit; 0 follows DuckDB's own `threads` setting",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+}
+
 void LoadInternal(ExtensionLoader &loader) {
 #ifdef ANOFOX_TELEMETRY_ENABLED
 	RegisterTelemetryOptions(loader);
@@ -68,6 +80,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	telemetry.CaptureExtensionLoad("anofox_bayes", version);
 #endif // ANOFOX_TELEMETRY_ENABLED
 
+	RegisterThreadOption(loader);
 	RegisterVersionFunctions(loader);
 	RegisterKeyedRandomFunctions(loader);
 	RegisterDiagnosticAggregates(loader);

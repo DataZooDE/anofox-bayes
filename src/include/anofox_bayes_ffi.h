@@ -89,8 +89,13 @@ bool anofox_bayes_ffi_data_add_key(AnofoxBayesData *data, AnofoxBayesStr name, c
                                    const uint8_t *valid, size_t len);
 
 // Returns NULL on failure with *out_error populated.
+// `threads` bounds the worker pool the fit may use: DuckDB's own thread budget, or a
+// caller's `anofox_bayes_threads` override. 0 means "no opinion" and leaves rayon on
+// its default, which is the machine's core count. It changes how long a fit takes and
+// never what it returns -- every parallel site keys its random stream on the identity
+// of the work rather than on scheduling.
 AnofoxBayesFit *anofox_bayes_ffi_fit(AnofoxBayesStr family, AnofoxBayesStr config_json, const AnofoxBayesData *data,
-                                     AnofoxBayesFfiError *out_error);
+                                     uint32_t threads, AnofoxBayesFfiError *out_error);
 void anofox_bayes_ffi_fit_free(AnofoxBayesFit *fit);
 size_t anofox_bayes_ffi_fit_row_count(const AnofoxBayesFit *fit);
 

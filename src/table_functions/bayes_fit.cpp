@@ -5,6 +5,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include "../include/anofox_bayes_extension.hpp"
@@ -80,6 +81,31 @@ struct BayesFitGlobalState : public GlobalTableFunctionState {
 		return 1;
 	}
 };
+
+// How many worker threads the fit may use.
+//
+// DuckDB's own budget by default, so `SET threads = n` bounds this extension the way
+// it bounds everything else. Before this existed the core ran on rayon's global pool,
+// sized from the machine's core count and reachable only through an environment
+// variable set before process start -- measured, `SET threads = 1` left the fit using
+// more than one core. For a database embedded in someone else's process, having no
+// in-process way to cap CPU is a defect rather than a missing tuning knob.
+//
+// `anofox_bayes_threads` overrides it for the case the single knob cannot express:
+// the fit is one operator in a query, and a caller may want it sized differently from
+// the scan feeding it. 0 means "follow DuckDB".
+uint32_t ResolveThreadBudget(ClientContext &context) {
+	Value override_value;
+	if (context.TryGetCurrentSetting("anofox_bayes_threads", override_value) && !override_value.IsNull()) {
+		auto requested = override_value.GetValue<int64_t>();
+		if (requested > 0) {
+			return static_cast<uint32_t>(requested);
+		}
+	}
+	// NumberOfThreads is the scheduler's own count and already reflects `SET threads`.
+	auto threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	return threads > 0 ? static_cast<uint32_t>(threads) : 1;
+}
 
 AnofoxBayesStr Borrow(const string &s) {
 	AnofoxBayesStr out;
@@ -184,7 +210,7 @@ OperatorResultType BayesFitInOut(ExecutionContext &context, TableFunctionInput &
 }
 
 // Run the fit. Called once, under the emitter thread's claim.
-void RunFit(const BayesFitBindData &bind_data, BayesFitGlobalState &gstate) {
+void RunFit(const BayesFitBindData &bind_data, BayesFitGlobalState &gstate, uint32_t threads) {
 	auto *data = anofox_bayes_ffi_data_new(gstate.n_rows);
 	if (!data) {
 		throw InternalException("anofox_bayes_fit: could not allocate the input relation");
@@ -219,7 +245,8 @@ void RunFit(const BayesFitBindData &bind_data, BayesFitGlobalState &gstate) {
 		AnofoxBayesFfiError error;
 		error.code = 0;
 		error.message[0] = 0;
-		gstate.fit = anofox_bayes_ffi_fit(Borrow(bind_data.family), Borrow(bind_data.config_json), data, &error);
+		gstate.fit =
+		    anofox_bayes_ffi_fit(Borrow(bind_data.family), Borrow(bind_data.config_json), data, threads, &error);
 		if (!gstate.fit) {
 			// The core's message already names the offending config slot or column,
 			// so it is surfaced verbatim rather than wrapped in something vaguer.
@@ -248,7 +275,7 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 	}
 
 	if (!gstate.fit) {
-		RunFit(bind_data, gstate);
+		RunFit(bind_data, gstate, ResolveThreadBudget(context.client));
 	}
 
 	idx_t capacity = STANDARD_VECTOR_SIZE;

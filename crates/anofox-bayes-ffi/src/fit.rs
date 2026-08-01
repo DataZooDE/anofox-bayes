@@ -216,6 +216,7 @@ pub unsafe extern "C" fn anofox_bayes_ffi_fit(
     family: BayesStr,
     config_json: BayesStr,
     data: *const BayesData,
+    threads: u32,
     out_error: *mut BayesFfiError,
 ) -> *mut BayesFit {
     let Some(err) = out_error.as_mut() else {
@@ -259,7 +260,13 @@ pub unsafe extern "C" fn anofox_bayes_ffi_fit(
                 )?;
             }
 
-            core_fit(family, &cfg, &view)
+            // The whole fit runs inside the caller's thread budget, not just the
+            // parts that happen to use rayon today: compile, sample and diagnostics
+            // are all parallel sites or may become ones, and a budget applied at only
+            // some of them is a budget a reader has to audit rather than trust.
+            anofox_bayes_core::parallel::with_thread_budget(threads as usize, || {
+                core_fit(family, &cfg, &view)
+            })
         },
     );
 
