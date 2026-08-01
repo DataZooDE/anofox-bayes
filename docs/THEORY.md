@@ -15,7 +15,7 @@ the parts headed **In detail** carry the mathematics and are safe to skip.
 1. [Why a distribution instead of a number](#1-why-a-distribution-instead-of-a-number)
 2. [What a draws table actually is](#2-what-a-draws-table-actually-is)
 3. [Priors, and why the defaults look the way they do](#3-priors-and-why-the-defaults-look-the-way-they-do)
-4. [The two shipped families](#4-the-two-shipped-families)
+4. [The shipped families](#4-the-shipped-families)
 5. [Engines: exact, Laplace, and what an approximation costs](#5-engines)
 6. [Diagnostics: is this fit safe to use?](#6-diagnostics)
 7. [Refusal, and why it is a feature](#7-refusal)
@@ -182,6 +182,60 @@ noisier data pools more at the same setting, which is what you want.
 > for now fixing the scale remains the documented stepping stone, and the value used is
 > recorded in the fit.
 
+### `payer_alive` — is this customer still a customer?
+
+*Use it for:* collections, dunning, retention — anywhere the question is whether a
+customer who has gone quiet has actually left.
+
+The difficulty is that customers of this kind never announce their departure. There is
+no cancellation event; there is only a purchase that has not happened yet, and a
+purchase that will never happen, and the two look identical. What separates them is
+*context*: three weeks of silence from someone who buys weekly means something very
+different from three weeks of silence from someone who buys twice a year.
+
+The model is **BG/NBD** — "buy till you die". Each customer has their own purchase
+rate and their own propensity to drop out, both unobserved; what the model estimates is
+the *distribution* of those two things across your base. Then any individual customer's
+`P(alive)` follows from where their own history sits against that population.
+
+Only three numbers per customer are needed: repeat purchases, when the last one was,
+and how long you have been watching. Everything else in a transaction history is
+irrelevant to this question, which is why a decade of data becomes one row.
+
+Two consequences worth knowing:
+
+- **A customer who has never repeated always scores 1.0.** Dropping out is something
+  that happens *after* a purchase, so a one-purchase customer has had no opportunity
+  to churn and the data says nothing either way. Their uncertainty is about how often
+  they buy, not about whether they are still there.
+- **`P(alive)` is a closed-form expression you can evaluate in SQL**, so a fitted model
+  scores tomorrow's customer list — or a list you never fitted — with a join and no
+  re-fit. This is the reason the family is BG/NBD rather than the older Pareto/NBD,
+  which fits marginally better on some data and whose `P(alive)` needs a hypergeometric
+  function that no database has.
+
+> **In detail.** Transactions are Poisson(`lambda`) while alive with
+> `lambda ~ Gamma(r, rate alpha)`; after each transaction the customer drops out with
+> probability `p ~ Beta(a, b)`. Integrating both out gives, per customer,
+> `ln L = lnΓ(r+x) − lnΓ(r) + r·ln(alpha) + lnΓ(b+x) + lnΓ(a+b) − lnΓ(b) − lnΓ(a+b+x)
+> + ln[(alpha+T)^−(r+x) + 1{x>0}·a/(b+x−1)·(alpha+t_x)^−(r+x)]`, and
+> `P(alive) = 1/(1 + 1{x>0}·a/(b+x−1)·((alpha+T)/(alpha+t_x))^(r+x))`. The two terms of
+> that bracket are the two histories consistent with the data — still alive at `T`, or
+> gone some time after `t_x` — and `P(alive)` is simply the first one's share.
+>
+> All four parameters are positive and fitted on the log scale; priors are declared
+> there too, so the default (flat on `log`) is the scale-free `p(θ) ∝ 1/θ` and the mode
+> is the maximum likelihood estimate.
+>
+> **Refusal.** BG/NBD's likelihood has boundary solutions. If no repeat buyer has been
+> seen to go quiet — every `t_x` equal to its `T` — the likelihood keeps increasing as
+> the dropout probability goes to zero and there is no interior maximum at all. The
+> family finds its own mode before any engine runs and checks four things about it: that
+> it is inside a sane range, that it is stationary, that its curvature is a covariance,
+> and that the resulting marginals are narrow enough to be intervals. Failing any of
+> them reports `degenerate` with `NULL` draws rather than a confident number derived
+> from curvature that is not a posterior.
+
 ## 5. Engines
 
 An **engine** turns a model into draws. The choice is invisible to your SQL — same
@@ -193,6 +247,9 @@ on the `__engine__` row so a reviewer can see which one ran.
 | `exact` | Samples the closed-form posterior directly. No approximation. | default for the two conjugate families |
 | `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on every family; **the** engine for `censored_aft` |
 | `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | available wherever a gradient is |
+| `exact` | Samples the closed-form posterior directly. No approximation. | default for `conjugate_anomaly` and `pooled_gaussian` |
+| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on `pooled_gaussian`; the only engine for `payer_alive` |
+| `nuts` | General-purpose sampler for models with no closed form. | planned (0.2) |
 
 Where a closed form exists, `exact` is both faster and more accurate, so it is the
 default. `laplace` and `nuts` exist because they generalise to families that have no
@@ -318,6 +375,16 @@ variance parameter's is not.
 > inverse of the negative Hessian there, obtained by differencing the *analytic
 > gradient* rather than the log density twice (second differences of a scalar lose
 > roughly two-thirds of the available precision).
+>
+> **Why `payer_alive` is served by Laplace and not by NUTS.** It has no closed form, so
+> the question was open. The case for the approximation is that it has only four
+> parameters and every customer in the base informs all four — the regime in which a
+> Gaussian at the mode is at its best — and the case is settled by its SBC suite rather
+> than by argument: measured over 1 024 replications at 800 customers, the rank
+> histograms for all four parameters are uniform (chi-squared 13–29 against a 37.7
+> threshold at 15 degrees of freedom, slopes below 0.04), and they stay uniform down to
+> 100 customers. NUTS would cost a large multiple of the runtime to reproduce a
+> posterior that is already calibrated.
 
 ## 6. Diagnostics
 
@@ -451,7 +518,7 @@ joint error is what produces a confidently wrong interval.
 
 - Gelman, Carlin, Stern, Dunson, Vehtari, Rubin, **Bayesian Data Analysis**, 3rd ed. —
   Ch. 2–3 for conjugate models, Ch. 14 for the linear model. The source for every
-  posterior in [§4](#4-the-two-shipped-families).
+  posterior in [§4](#4-the-shipped-families).
 - Vehtari, Gelman, Simpson, Carpenter, Bürkner (2021), *Rank-normalization, folding,
   and localization: An improved R̂ for assessing convergence of MCMC*, **Bayesian
   Analysis** 16(2). The definitions in [§6](#6-diagnostics).

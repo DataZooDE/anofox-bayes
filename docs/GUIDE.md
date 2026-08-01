@@ -130,12 +130,15 @@ CREATE TABLE draws AS SELECT * FROM anofox_bayes_fit(...);
 | "How many claims per thousand shipments?" | `conjugate_anomaly`, `likelihood: 'poisson'` |
 | "Did the change I made have an effect?" | `pooled_gaussian` |
 | "What's the effect of price on volume, controlling for season?" | `pooled_gaussian` |
+| "Is this customer still a customer, or have they quietly gone?" | `payer_alive` |
+| "Which accounts on my dunning list are worth chasing?" | `payer_alive` |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`. A response explained by
-predictors → `pooled_gaussian`.**
+predictors → `pooled_gaussian`. A repeat-purchase history and a churn question →
+`payer_alive`.**
 
-Every config slot for both is in the [API Reference](API_REFERENCE.md); the models
-themselves are described in [Theory §4](THEORY.md#4-the-two-shipped-families).
+Every config slot is in the [API Reference](API_REFERENCE.md); the models themselves
+are described in [Theory §4](THEORY.md#4-the-shipped-families).
 
 ## How do I…
 
@@ -382,6 +385,117 @@ Typical causes and what to do:
 Healthy groups in the same fit are unaffected: only the refused group's draws are
 `NULL`.
 
+### …tell which customers have quietly stopped buying?
+
+This is the `payer_alive` family, and it answers a question none of the others can:
+your customers never tell you they have left. There is no cancellation event — there
+is only a payment that did not arrive, and a payment that has not arrived *yet* looks
+exactly the same.
+
+**One row per customer, three numbers.** Whatever your transaction history looks like,
+it collapses to this:
+
+```sql
+CREATE VIEW payers AS
+SELECT customer_id,
+       count(*) - 1                                              AS frequency,  -- repeats after the first
+       date_diff('day', min(paid_on), max(paid_on))              AS recency,    -- first purchase to last
+       date_diff('day', min(paid_on), DATE '2026-08-01')         AS age         -- first purchase to today
+FROM payments
+GROUP BY customer_id;
+```
+
+Three things to get right, because each of them is a way to get a confident wrong
+answer:
+
+- **All three are measured from the customer's *first* purchase**, not from a calendar
+  date. `age` is how long you have been watching that customer, so a customer acquired
+  last month has a small `age` and their silence means much less.
+- **`frequency` counts *repeat* purchases**, so a customer who bought once has
+  `frequency = 0` and `recency = 0`. Such a customer always scores `P(alive) = 1`,
+  which is the model being careful rather than optimistic — churn can only be observed
+  *after* a repeat purchase, so there is no evidence either way.
+- **Use one unit throughout** (days, or weeks — it does not matter which, but `recency`
+  and `age` must agree).
+
+**The fit is over the population, not over customers.** Four numbers come back — `r`,
+`alpha`, `a`, `b` — describing how fast your base buys and how readily it churns.
+Individual customers are scored afterwards.
+
+```sql
+CREATE TABLE draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT frequency, recency, age FROM payers),
+    'payer_alive',
+    {'frequency': 'frequency', 'recency': 'recency', 'age': 'age',
+     'draws': 4000, 'seed': 42});
+```
+
+**Scoring is pure SQL, and needs no re-fit.** Reshape the draws once...
+
+```sql
+CREATE TABLE population AS
+SELECT draw,
+       max(value) FILTER (WHERE param = 'r')     AS r,
+       max(value) FILTER (WHERE param = 'alpha') AS alpha,
+       max(value) FILTER (WHERE param = 'a')     AS a,
+       max(value) FILTER (WHERE param = 'b')     AS b
+FROM draws WHERE draw >= 0 GROUP BY draw;
+```
+
+...then join any customer list against it. **This is the expression**, and it is the
+whole reason the family is BG/NBD rather than the better-known Pareto/NBD, whose
+equivalent cannot be written in SQL at all:
+
+```sql
+SELECT p.customer_id,
+       avg(1.0 / (1.0 + CASE WHEN frequency = 0 THEN 0.0 ELSE (a / (b + frequency - 1)) * pow((alpha + age) / (alpha + recency), r + frequency) END)) AS p_alive
+FROM payers p CROSS JOIN population d
+GROUP BY p.customer_id
+ORDER BY p_alive;
+```
+
+`avg` over the draws makes `p_alive` a posterior mean; swap it for
+`quantile_cont(..., 0.05)` if you want the pessimistic end, or keep the per-draw values
+and you have the full distribution of each customer's `P(alive)`.
+
+The customer list does **not** have to be the one you fitted. Yesterday's draws score
+today's arrivals, a segment you did not fit, or the same base re-cut a different way —
+the draws mention no customer, so they join against anything with those three columns.
+That is what makes this cheap enough to run daily.
+
+> **What the score is worth.** It is not "days since last payment" with extra steps. A
+> customer who paid 24 times in a year and has been quiet for 28 weeks scores *lower*
+> than one who paid five times and has been quiet for a year, because 28 weeks of
+> silence from someone buying fortnightly is overwhelming, and a year of silence from
+> an occasional buyer is not. A recency rule cannot express that; this is the reason
+> to fit a model at all.
+
+**If it refuses.** `payer_alive` returns `degenerate` when nobody in the base has ever
+been seen to stop — when every repeat buyer's last purchase sits at the very end of
+their observation window. That happens most often because `age` was taken as the last
+payment date rather than as today, and it is a genuine refusal: with no observed
+silence anywhere, the data contains nothing about how often customers churn, and any
+interval would be invented. Fix the `age` column first. If the shape is real —
+a base snapshotted at renewal, say — supply a proper prior:
+
+```sql
+{'frequency': 'frequency', 'recency': 'recency', 'age': 'age',
+ 'prior': {'r':     {'log_mean': 0.0, 'log_sd': 0.7},
+           'alpha': {'log_mean': 2.5, 'log_sd': 1.0},
+           'a':     {'log_mean': 0.0, 'log_sd': 0.7},
+           'b':     {'log_mean': 0.7, 'log_sd': 1.0}}}
+```
+
+Priors here are set **on the log scale** (`log_mean` is the log of a typical value,
+`log_sd` how many multiplicative factors of doubt around it), because all four
+parameters are positive and none has a natural unit. Leave them out and each is flat
+on that scale, which is the scale-free default and makes the answer the maximum
+likelihood estimate.
+
+A worked end-to-end version, including the refusal, is in
+[`test/sql/f5_payer_alive.test`](../test/sql/f5_payer_alive.test).
+
 ### …work with counts instead of measurements?
 
 Use the Poisson likelihood, and give it an `exposure` column so the answer is a
@@ -449,6 +563,8 @@ than exhausting memory. See [Scalability](SCALABILITY.md).
 | `invalid config at 'grup'` | A typo — the message names the slot and suggests the intended one |
 | `singular or rank-deficient design matrix` | Two predictors carry the same information (e.g. a constant column beside an intercept) |
 | Effect estimate looks far too large | A before/after comparison with no control group absorbs the underlying trend |
+| `payer_alive` says `degenerate` and every draw is `NULL` | No repeat buyer in the base has ever gone quiet — usually `age` was taken as the last payment date instead of today. [What to do](#tell-which-customers-have-quietly-stopped-buying) |
+| Every `payer_alive` customer scores `P(alive) = 1` | `frequency` counted *all* purchases instead of repeats, so nobody has had an opportunity to churn |
 | A forecast changes between runs of the same fit | The recipe uses `random()`, which the fit's `seed` does not cover. Use `anofox_bayes_std_normal(seed, key, draw)` instead and record the seed alongside `model_id` |
 | Every simulated row moves together; the band is implausibly smooth | The same `key` was passed for every row, so they all got the same shock. Key on the thing being simulated |
 | A predictive interval barely wider than the interval for the mean | The observation noise was never added — see [the what-if recipe](#ask-a-what-if-without-re-fitting) |

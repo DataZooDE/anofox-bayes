@@ -22,6 +22,8 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 1 | `random()` is not seeded by the fit | 01–07 | Degradation for all seven, including both shipped agents | 0.5 + 3 | — |
 | 2 | ~~Bridge `anofox-statistics` MAP+Laplace fits into the draws contract~~ **seam done, F2 shipped** | 02 unblocked; 01, 04, 06 still degraded | The seam and censored AFT (F2) have landed; the remaining likelihoods are small additions, costed in §3.1 | 6–9 | — |
 | 3 | F5 payer-alive (BG/NBD) | 05 | Blocker | 8–12 | — |
+| 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 blocker; 01, 04, 06 degradation | Unblocks 02 outright; gives 01/04/06 an honest interim path | 6–9 | statistics exposing the vcov matrix |
+| 3 | F5 payer-alive (BG/NBD) | 05 | **Shipped.** Agent 05 unblocked | 8–12 | — |
 | 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | Blocker for 06 — the interaction-column workaround left 10 of 12 intervals not covering | 12–18 | gap 6 for the learned scale |
 | 5 | Per-group variance | 04 | Blocker for the tail question, which is why agent 04 exists | 5–8 with gap 4 | gap 4 |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | Dependency of gaps 4, 5, 7 | **done** | — |
@@ -288,6 +290,23 @@ revision is bumped to something that does not.
 
 **Recommendation: no. Build F5 on MLE + Laplace, and record why.**
 
+> **Settled, and the answer held.** F5 ships on MLE + Laplace. The SBC suite is the
+> evidence: over 1 024 replications under proper log-normal priors, the rank
+> histograms for all four parameters are uniform — chi-squared 13.0 (`alpha`), 13.3
+> (`b`), 18.3 (`a`), 29.0 (`r`) against a 37.7 critical value at 15 degrees of
+> freedom, with every slope below 0.04 — and they stay uniform down to 100 customers
+> and up to 4 000. There is nothing for NUTS to fix here.
+>
+> Building it did surface two defects in the **Laplace engine**, both of which would
+> have bitten any future family with a likelihood evaluated per observation, and
+> neither of which the shipped families could expose because their gradients come from
+> precomputed sufficient statistics. The Newton search now carries a trust region — a
+> backtracking line search only shrinks a step that made things *worse*, so a leap into
+> a distant local optimum was accepted; measured, F5's first step from the conventional
+> start moved `ln a` by +14.6 onto a ridge 248 log-units below the true mode — and a
+> relative stopping rule, because an absolute `1e-8` gradient tolerance is below the
+> rounding error of a sum over a few thousand rows. Both are in `CHANGELOG.md`.
+
 BG/NBD's likelihood is elementary — a handful of terms in `r, α, a, b` and the
 per-customer sufficient statistics `(x, t_x, T)` — and `P(alive)` is closed form given
 the parameters. Four population-level parameters with thousands of customers informing
@@ -305,6 +324,15 @@ Residual risk: BG/NBD's likelihood surface is known to have flat ridges and boun
 solutions on some datasets, and a mode search landing on a boundary produces a
 curvature that is not a posterior. The refusal path must catch that — a boundary
 solution returns `degenerate`, not an interval.
+
+> **Handled.** The family finds its own mode at compile time, before any engine runs,
+> and applies four tests to the point: inside the admissible range, stationary (at a
+> tolerance that scales with the number of customers), curvature that factors, and a
+> marginal narrow enough to be an interval. The last of those is what catches the
+> flat ridge, which the other three pass. Failing any is `degenerate` with `NULL`
+> draws and a reason naming which. The fixture is a base in which no repeat buyer has
+> ever gone quiet — a subscription book snapshotted at renewal — where the likelihood
+> is maximised only as the dropout probability goes to zero.
 
 ### 3.3 Random slopes and per-group variance: extend `pooled_gaussian`, or a new family?
 

@@ -344,13 +344,14 @@ mod families {
     use anofox_stats_core::models::AftDistribution;
 
     use crate::catalog::{
-        f2_censored_aft::CensoredAft, f3_pooled_gaussian::PooledGaussian,
+        f2_censored_aft::CensoredAft, f3_pooled_gaussian::PooledGaussian, f5_btyd::PayerAlive,
         f7_conjugate::ConjugateAnomaly, ModelFamily,
     };
     use crate::config::Config;
     use crate::data::testing::Frame;
     use crate::engines::{Engine, ExactEngine, LaplaceEngine, NutsEngine, SampleOptions};
-    use crate::types::EngineKind;
+    use crate::errors::BayesError;
+    use crate::types::{EngineKind, FitStatus};
 
     /// Draw from `InvGamma(shape, rate)`.
     fn inv_gamma(rng: &mut BayesRng, shape: f64, rate: f64) -> BayesResult<f64> {
@@ -981,5 +982,128 @@ mod families {
                 h.slope()
             );
         }
+    }
+
+    /// F5 (BG/NBD) under proper log-normal priors on all four population parameters,
+    /// served by the Laplace engine.
+    ///
+    /// **This suite is the arbiter of the roadmap's deferred question** — whether F5
+    /// genuinely needs NUTS, or whether a Gaussian approximation at the mode is
+    /// adequate for four population parameters informed by a whole customer base. If
+    /// these ranks come out uniform, Laplace is certified for this family and NUTS
+    /// buys nothing at a large multiple of the runtime. If they bow, the family's
+    /// default engine has to change, and that is a finding rather than a test to
+    /// loosen.
+    ///
+    /// The priors are the ones a caller with a thin base would set, and they are
+    /// proper because SBC draws the truth from the prior — the same constraint, and
+    /// the same remedy, as for the other two families. A proper prior is also what
+    /// keeps the boundary solutions of `f5_btyd` out of the loop: a flat prior on
+    /// `ln a` is exactly what lets `a` run to zero, so a suite under the default
+    /// prior would be measuring the refusal path rather than the posterior.
+    struct F5PayerAlive {
+        n_customers: usize,
+        horizon: f64,
+        /// `(log_mean, log_sd)` for `r`, `alpha`, `a`, `b` in that order.
+        prior: [(f64, f64); 4],
+    }
+
+    impl F5PayerAlive {
+        fn config(&self) -> String {
+            let names = ["r", "alpha", "a", "b"];
+            let slots: Vec<String> = (0..4)
+                .map(|j| {
+                    format!(
+                        r#""{}": {{"log_mean": {}, "log_sd": {}}}"#,
+                        names[j], self.prior[j].0, self.prior[j].1
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"frequency": "x", "recency": "t_x", "age": "T", "min_customers": 1,
+                     "prior": {{{}}}}}"#,
+                slots.join(", ")
+            )
+        }
+    }
+
+    impl SbcModel for F5PayerAlive {
+        fn param_names(&self) -> Vec<String> {
+            vec!["r".into(), "alpha".into(), "a".into(), "b".into()]
+        }
+
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            Ok(self
+                .prior
+                .iter()
+                .map(|(m, s)| (m + s * rng.standard_normal()).exp())
+                .collect())
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            let base = crate::catalog::f5_btyd::testing::simulate(
+                rng,
+                self.n_customers,
+                truth[0],
+                truth[1],
+                truth[2],
+                truth[3],
+                self.horizon,
+            )?;
+            let frame = base.frame();
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let model = PayerAlive.compile(&Config::parse(&self.config()).unwrap(), &view)?;
+
+            // A replication the family refused carries no ranks, and quietly dropping
+            // it would bias the histogram toward whatever the surviving replications
+            // have in common. Failing loudly is the only honest handling: under a
+            // proper prior a refusal means the *prior* admits data the model cannot
+            // fit, which is a finding about the suite's own design.
+            if model.readiness().status != FitStatus::Converged {
+                return Err(BayesError::Internal(format!(
+                    "SBC replication refused by the family ({:?}); truth {truth:?}",
+                    model.readiness().reasons
+                )));
+            }
+
+            let sample = LaplaceEngine.sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 1,
+                    n_draws,
+                    seed: rng.uniform().to_bits(),
+                    n_warmup: 0,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )?;
+            let p = model.param_names().len();
+            Ok((0..4)
+                .map(|j| sample.values.chunks(p).map(|c| c[j]).collect())
+                .collect())
+        }
+    }
+
+    /// The run that decides whether `payer_alive` may ship on Laplace at all.
+    ///
+    /// 800 customers is a small base by the standards of the agent this family serves
+    /// — a collections book is tens of thousands — and certifying at the small end is
+    /// the point: if the approximation holds where the data is thinnest, it holds
+    /// above that too.
+    #[test]
+    #[ignore = "slow: hundreds of complete fits"]
+    fn f5_is_calibrated_under_the_laplace_engine() {
+        let model = F5PayerAlive {
+            n_customers: 800,
+            horizon: 52.0,
+            prior: [(0.0, 0.4), (2.5, 0.4), (0.0, 0.4), (1.0, 0.4)],
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 105).unwrap();
+        assert_calibrated(&hists, "f5/laplace");
     }
 }

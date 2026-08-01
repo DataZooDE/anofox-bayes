@@ -191,6 +191,9 @@ the posterior. If it happens, raise `warmup` first.
 Determinism holds for `nuts` exactly as for the other engines: the same seed gives
 byte-identical draws, whatever the chain count and whatever DuckDB's thread layout,
 because chains are seeded from `(seed, chain)` and run sequentially.
+| `exact` | **Available**, and the default for `conjugate_anomaly` and `pooled_gaussian`. Samples the closed-form conjugate posterior directly — no approximation, so where it applies it is both faster and more accurate. `payer_alive` has no closed form and rejects it: *"the exact engine cannot serve family 'payer_alive'"*. |
+| `laplace` | **Available on `pooled_gaussian`, and the default and only engine for `payer_alive`.** Fits a Gaussian at the posterior mode on an unconstrained scale. `conjugate_anomaly` exposes no gradient and rejects it: *"the laplace engine cannot serve family 'conjugate_anomaly'"*. |
+| `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2. Until then use 'exact' … or 'laplace' …"*. |
 
 Switching engines changes no caller SQL: same function, same output columns, same
 diagnostics. It does change `model_id`, because two posteriors carrying different
@@ -214,6 +217,9 @@ what an anomaly model is looking at. Both engines have their own calibration sui
 warranty: the first is the posterior, the second is a Gaussian approximation to it.
 The family that ran is on the table too, as `__family__`: `2` for `censored_aft`,
 `3` for `pooled_gaussian`, `7` for `conjugate_anomaly` — the catalog F-numbers, decoded by
+`__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. The family that
+ran is on the table too, as `__family__`: `3` for `pooled_gaussian`, `5` for
+`payer_alive`, `7` for `conjugate_anomaly` — the catalog F-numbers, decoded by
 `anofox_bayes_family_text(param, value)`. See
 [the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
@@ -564,6 +570,66 @@ how many groups the verdict is about. A refused group's draws are `NULL`, so it 
 appears in the table under its own name.
 
 **Worked example:** `test/sql/f2_delivery_promise.test`.
+### 2.3 `payer_alive` (F5)
+
+> BG/NBD buy-till-you-die model over per-customer (frequency, recency, age)
+> statistics, whose closed-form `P(alive)` rescores a customer base in SQL without
+> re-fitting.
+
+One row per customer. All three statistics are measured **from that customer's first
+transaction**, in one consistent time unit.
+
+**Config slots**
+
+| Slot | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `frequency` | column | **yes** | — | Repeat transactions *after* the first. A customer with one transaction has `0`. |
+| `recency` | column | **yes** | — | Time from the first transaction to the last. `0` when `frequency = 0`. |
+| `age` | column | **yes** | — | Time from the first transaction to the end of the observation window — normally *today*, not the last transaction. |
+| `min_customers` | integer ≥ 1 | no | `50` | Below this many customers the fit is reported `insufficient_data`. Four population parameters estimated from fewer describe the sample rather than the base. |
+| `prior.r.log_mean` | number | no | `0` | Prior mean of `ln r`. |
+| `prior.r.log_sd` | number > 0 | no | ∞ | Prior sd of `ln r`. Absent means flat on the log scale — the scale-free default. |
+| `prior.alpha.*`, `prior.a.*`, `prior.b.*` | | no | as above | Same two slots for each of the other three parameters. |
+
+There is **no `group` slot**. The four parameters are population level by
+construction; to fit segments separately, call the function once per segment.
+
+**Parameters emitted** — four, all at `group_id = '__global__'`:
+
+| Parameter | Meaning |
+|---|---|
+| `r`, `alpha` | Shape and rate of the `Gamma` spread of per-customer transaction rates. The population mean rate is `r/alpha`. |
+| `a`, `b` | Shape parameters of the `Beta` spread of per-customer dropout probability. The population mean dropout per transaction is `a/(a+b)`. |
+
+`a` and `b` are only weakly identified individually — the data speaks clearly about
+where the Beta sits and faintly about how wide it is — so read `a/(a+b)` per draw
+rather than either alone.
+
+**Scoring customers.** `P(alive)` is closed form and is evaluated in SQL against the
+draws, with no re-fit and against any customer list:
+
+```sql
+1.0 / (1.0 + CASE WHEN frequency = 0 THEN 0.0 ELSE (a / (b + frequency - 1)) * pow((alpha + age) / (alpha + recency), r + frequency) END)
+```
+
+Full recipe in [the guide](GUIDE.md#tell-which-customers-have-quietly-stopped-buying);
+worked end to end in `test/sql/f5_payer_alive.test`.
+
+**Validation and refusal**
+
+* `frequency` must be a non-negative whole number; `age` must be `> 0`; `recency`
+  must lie in `[0, age]`, and must be `> 0` whenever `frequency > 0`. Each violation
+  is a config error naming the slot and the offending row.
+* Fewer usable rows than parameters is `insufficient data: N usable rows for 4
+  parameters`.
+* A base with **no repeat transactions at all** is `__status__ = 1` (`degenerate`):
+  the likelihood does not contain `a` or `b` when every frequency is zero.
+* A base in which **no repeat buyer has been seen to go quiet** — every `recency`
+  equal to its `age` — is also `degenerate`, with `NULL` draws. The likelihood then
+  has no interior maximum, and a curvature computed where the search stopped is not a
+  posterior. The reason names which of the four mode checks failed. Fix `age` first
+  (it is usually the last transaction date rather than today); if the shape is real,
+  set a proper `prior`.
 
 ---
 
