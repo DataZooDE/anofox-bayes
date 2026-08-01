@@ -10,6 +10,7 @@ background.
 **Contents**
 
 - [The five-minute version](#the-five-minute-version)
+- [The six words you need](#the-six-words-you-need)
 - [Reading the output table](#reading-the-output-table)
 - [Choosing a family](#choosing-a-family)
 - [How do I…](#how-do-i)
@@ -60,7 +61,10 @@ GROUP BY region ORDER BY region;
 ```
 
 You have just fitted a Bayesian model per region and read a 95 % credible interval
-off it. Three things to notice, because they explain the rest of this guide:
+off it. (If those words are new, the [next section](#the-six-words-you-need) defines
+them — you do not need any statistics background for this guide.)
+
+Three things to notice, because they explain the rest:
 
 1. **The first argument is a subquery.** `TABLE sales` is a parser error.
 2. **The function returned a table of samples**, not a summary. `median` and the
@@ -68,6 +72,23 @@ off it. Three things to notice, because they explain the rest of this guide:
    can ask it anything later without re-fitting.
 3. **`WHERE param = 'mu' AND draw >= 0`.** The output holds several parameters plus
    some bookkeeping rows. Next section.
+
+## The six words you need
+
+Enough to read the rest of this page. [Theory](THEORY.md) explains each properly.
+
+| Term | In one line |
+|---|---|
+| **posterior** | The range of values the data says are plausible for an unknown quantity, and how plausible each is. The thing this extension computes. |
+| **draw** | One sample from that range. You get thousands; together they *are* the posterior. Each row of the output is one draw of one parameter. |
+| **credible interval** | "There is a 95 % probability the true value lies between these two numbers." Just two quantiles of the draws. |
+| **prior** | What you believed before seeing the data. Leave it out and you get the "let the data speak" default. [More](THEORY.md#3-priors-and-why-the-defaults-look-the-way-they-do) |
+| **ESS** (effective sample size) | How many *independent* draws yours are worth. Too low means your answer is noisy for sampling reasons, not data reasons — take more draws. |
+| **conjugate** | A model whose posterior has a closed-form solution, so it can be computed exactly instead of approximated. Both shipped families are conjugate. |
+
+Two more you will meet in error messages: a fit is **degenerate** when the draws are
+untrustworthy (take more), and reports **insufficient_data** when the data itself
+cannot answer the question ([what to do](#handle-a-refusal)).
 
 ## Reading the output table
 
