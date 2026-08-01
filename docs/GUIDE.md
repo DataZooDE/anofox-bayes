@@ -278,6 +278,11 @@ interval is wider, and confusing the two is the most common way a forecast inter
 ends up too tight:
 
 ```sql
+-- Seed DuckDB's RNG first. `random()` is NOT covered by the fit's `seed`, so without
+-- this the fit is reproducible and the forecast is not -- the same draws table gives
+-- a different answer on every run.
+SELECT setseed(0.42);
+
 CREATE TABLE y_pred AS
 SELECT m.row_id, m.draw,
        m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
@@ -407,6 +412,7 @@ than exhausting memory. See [Scalability](SCALABILITY.md).
 | `invalid config at 'grup'` | A typo — the message names the slot and suggests the intended one |
 | `singular or rank-deficient design matrix` | Two predictors carry the same information (e.g. a constant column beside an intercept) |
 | Effect estimate looks far too large | A before/after comparison with no control group absorbs the underlying trend |
+| A forecast changes between runs of the same fit | `random()` is not covered by the fit's `seed`. Call `setseed(...)` before any predictive step, and record the value alongside `model_id` |
 
 ---
 

@@ -120,6 +120,13 @@ Two of the inputs are not part of the caller's request, and both are deliberate:
   deliberately different. Without it a cache would serve the old, wrong answer for the
   new, correct request — which has already happened once during development.
 
+**One thing `model_id` does not cover.** It fingerprints the *fit*. Any step you run
+downstream of the draws — posterior prediction, forward simulation, anything using
+`random()` — draws its noise from DuckDB's own RNG, which the fit's `seed` does not
+touch. Call `setseed(...)` before such a step and record that value beside `model_id`,
+or the recommendation will not regenerate. See
+[the Guide](GUIDE.md#ask-a-what-if-without-re-fitting).
+
 Consequences worth relying on:
 
 * **Reproducibility.** Same inputs, same id, same numbers. An auditor can re-run a
