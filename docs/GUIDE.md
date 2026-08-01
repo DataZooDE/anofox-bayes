@@ -236,6 +236,45 @@ significant" but "is it bigger than what it cost us".
 > add a `treated` main effect when you have per-unit `group` intercepts: treatment
 > status is then a function of the unit and the two are not separately identifiable.
 
+### …let the effect differ by store, region or segment?
+
+Add the predictor to `random_slopes`. Each group then gets its own coefficient on it,
+shrunk toward the population coefficient — so a group with forty observations is
+believed and a group with five borrows strength.
+
+```sql
+CREATE TABLE el AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, log_price, log_units FROM weekly),
+    'pooled_gaussian',
+    {'y': 'log_units', 'x': ['log_price'], 'group': 'store',
+     'random_slopes': ['log_price'], 'pool_scale': 1.5,
+     'draws': 2000, 'seed': 42});
+
+-- A store's own elasticity is the population slope plus its deviation, added
+-- *within a draw* -- the two are correlated, so two medians would be wrong.
+SELECT d.group_id AS store,
+       round(median(b.value + d.value), 2)                       AS elasticity,
+       anofox_bayes_credible_interval(b.value + d.value, 0.95)   AS ci
+FROM el AS d
+JOIN el AS b ON b.chain = d.chain AND b.draw = d.draw
+            AND b.param = 'beta[log_price]'
+WHERE d.param = 'group_slope[log_price]' AND d.draw >= 0
+GROUP BY d.group_id;
+```
+
+> **What to know before you turn the dial.** The predictor must also be in `x` — a
+> random slope is a deviation *from* a population slope, and without one the model
+> would be shrinking every group toward "this predictor does nothing". `pool_scale` is
+> in **residual standard deviations** and governs the deviations, not the population
+> slope; `prior.beta_scale` is the one that shrinks the population slope toward zero,
+> which is a different and much stronger claim. And because one `pool_scale` governs
+> both intercept and slope deviations — which live on different scales — centre and
+> scale the predictor before reading the shrinkage.
+>
+> `pool_scale` is *not estimated*. It is your assumption about how alike the groups
+> are, and the intervals move with it.
+
 ### …get a service-level quantity?
 
 A service level is a **quantile of the posterior**, not mean-plus-k-sigma. The two

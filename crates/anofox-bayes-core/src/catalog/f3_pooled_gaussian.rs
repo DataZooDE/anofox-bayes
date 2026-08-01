@@ -44,6 +44,20 @@
 //! variance parameter, whose posterior is not conjugate and needs the NUTS engine
 //! (0.2). Fixing it is the documented stepping stone, and `pool_scale` is reported in
 //! the fit so nobody mistakes it for something the data chose.
+//!
+//! **Random slopes.** `random_slopes` extends the same structure from the intercept to
+//! a coefficient: group `g` gets its own deviation on predictor `x`, under the same
+//! `N(0, sigma^2 * pool_scale^2)` prior. This is a *design-matrix change and nothing
+//! else* — more columns, more entries on the diagonal prior precision — so the
+//! posterior stays closed form and the family keeps its warranty. Anything that does
+//! not (a per-group `sigma`, a *learned* `pool_scale`) is not conjugate and belongs to
+//! a different family rather than to a config slot here; see `docs/ROADMAP.md` §3.3.
+//!
+//! The predictor must also appear in `x`, so that the group deviation is a deviation
+//! *from* a population slope rather than from zero. Shrinking group slopes toward zero
+//! would assert the predictor has no effect, which is a claim about the world nobody
+//! asked to make; shrinking them toward a common slope asserts only that groups are
+//! alike until the data says otherwise.
 
 use crate::config::Config;
 use crate::data::DataView;
@@ -64,6 +78,7 @@ const SLOTS: &[&str] = &[
     "x",
     "intercept",
     "group",
+    "random_slopes",
     "pool_scale",
     "max_design_megabytes",
     "prior",
@@ -110,6 +125,7 @@ impl ModelFamily for PooledGaussian {
         let x_names = cfg.str_list("x")?;
         let intercept = cfg.f64_or("intercept", 1.0)? != 0.0;
         let group = cfg.opt_str("group")?.map(str::to_string);
+        let random_slopes = cfg.str_list("random_slopes")?;
         let pool_scale = cfg.positive_f64_or("pool_scale", 1.0)?;
         let max_design_megabytes = cfg.usize_in("max_design_megabytes", 512, 1, 1 << 20)?;
         // The precision added to the normal equations is 1/pool_scale^2. Below about
@@ -155,6 +171,63 @@ impl ModelFamily for PooledGaussian {
             ));
         }
 
+        // --- Random slopes. ---
+        //
+        // A random slope is the same object as a group intercept one level up: group
+        // `g` gets its own deviation on predictor `x`, under the same
+        // `N(0, sigma^2 * pool_scale^2)` prior. Two constraints make that sentence
+        // true rather than approximately true.
+        //
+        // *It needs groups to deviate between.* Without a `group` column there is no
+        // hierarchy and the slot is a request the family cannot honour.
+        //
+        // *It needs the predictor to carry a population slope.* The deviation's prior
+        // is centred at zero, so a random slope on a column absent from `x` would
+        // shrink every group's response toward *no effect at all* -- the same claim
+        // about the world that `beta_scale` makes and that nobody asked for. With the
+        // column in `x`, zero-centring the deviation says only "stores are alike until
+        // shown otherwise", which is the honest hierarchical structure and the reason
+        // this replaces the interaction-column workaround rather than dressing it up.
+        let slope_cols: Vec<usize> = {
+            let mut seen: Vec<&str> = Vec::new();
+            let mut cols = Vec::with_capacity(random_slopes.len());
+            for name in &random_slopes {
+                if group.is_none() {
+                    return Err(BayesError::config(
+                        "random_slopes",
+                        format!(
+                            "'{name}' asks for a per-group slope, but no `group` column is set. \
+                             A random slope is a deviation between groups; without groups there \
+                             is nothing for it to vary over"
+                        ),
+                    ));
+                }
+                if seen.contains(&name.as_str()) {
+                    return Err(BayesError::config(
+                        "random_slopes",
+                        format!("'{name}' is listed twice"),
+                    ));
+                }
+                seen.push(name.as_str());
+                match x_names.iter().position(|x| x == name) {
+                    Some(i) => cols.push(i),
+                    None => {
+                        return Err(BayesError::config(
+                            "random_slopes",
+                            format!(
+                                "'{name}' is not one of the predictors in `x`. A random slope is \
+                                 a per-group deviation *from* a population slope, so the \
+                                 predictor must carry one; without it the group slopes would be \
+                                 shrunk toward zero, which asserts the predictor has no effect. \
+                                 Add '{name}' to `x`"
+                            ),
+                        ));
+                    }
+                }
+            }
+            cols
+        };
+
         // --- Resolve columns and filter nulls, before any arithmetic. ---
         let mut numeric_cols: Vec<&str> = vec![y_name.as_str()];
         numeric_cols.extend(x_names.iter().map(String::as_str));
@@ -181,8 +254,11 @@ impl ModelFamily for PooledGaussian {
         // --- Assemble the design matrix. ---
         //
         // Column order is fixed and is what `param_names` mirrors: intercept, then
-        // predictors in the caller's order, then one column per group. Keeping the
-        // two in lockstep here means no later stage has to re-derive it.
+        // predictors in the caller's order, then one column per group, then -- for
+        // each random slope, in the caller's order -- one column per group. Keeping
+        // the two in lockstep here means no later stage has to re-derive it, and
+        // appending the slope block *after* the intercept block leaves every index a
+        // plain pooled fit already had exactly where it was.
         let n = rows.len();
         let mut params: Vec<ParamName> = Vec::new();
         if intercept {
@@ -193,6 +269,20 @@ impl ModelFamily for PooledGaussian {
         }
         for key in &group_keys {
             params.push(ParamName::grouped(key.clone(), "group_effect")?);
+        }
+        // `group_slope[<column>]`, one name per predictor carried across every group
+        // key -- the shape `group_effect` already has, so a caller filters with
+        // `WHERE param = 'group_slope[price]' AND group_id = 'S03'` exactly as they
+        // filter a group intercept. Naming it after the column rather than after the
+        // group is what keeps `GROUP BY param` a meaningful diagnostics query at
+        // hundreds of groups.
+        for &c in &slope_cols {
+            for key in &group_keys {
+                params.push(ParamName::grouped(
+                    key.clone(),
+                    format!("group_slope[{}]", x_names[c]),
+                )?);
+            }
         }
         // The design has one column per coefficient; `sigma` is a parameter of the
         // posterior but not of the linear predictor, so it is appended after the
@@ -277,21 +367,50 @@ impl ModelFamily for PooledGaussian {
             }
             if !group_keys.is_empty() {
                 x[(r, c + group_of_row[r])] = 1.0;
+                // One block of `group_keys.len()` columns per random slope, each
+                // carrying the predictor's own value on this group's rows and zero
+                // elsewhere. Summed over groups a block reproduces the fixed column
+                // exactly -- see the identifiability note below.
+                for (s, &col) in slope_cols.iter().enumerate() {
+                    let base = c + (s + 1) * group_keys.len();
+                    x[(r, base + group_of_row[r])] = x_cols[col].values[row];
+                }
             }
         }
 
         // --- Prior precision. ---
         //
         // Diagonal: `1/beta_scale^2` on the fixed effects (zero for the flat default)
-        // and `1/pool_scale^2` on the group effects, which is what makes the pooling
-        // partial rather than none.
+        // and `1/pool_scale^2` on every group column -- intercept deviations and slope
+        // deviations alike -- which is what makes the pooling partial rather than none.
+        //
+        // **Which scale governs what, precisely.** `beta_scale` shrinks the
+        // *population* slope `beta[price]` toward zero. `pool_scale` shrinks each
+        // store's `group_slope[price]` toward the population slope. They are different
+        // claims: the first says the effect is small, the second says stores are alike.
+        // Only the second is a thing an analyst asking for random slopes means.
+        //
+        // **Identifiability.** The group-slope columns for one predictor sum exactly to
+        // that predictor's fixed column, so `X` is rank deficient by construction --
+        // the same trap as an intercept plus a full set of group dummies, one level up.
+        // What resolves it is the prior: the group block carries positive precision and
+        // the fixed block does not, so `A = X'X + P` is positive definite. `A` is
+        // singular exactly when the *unpenalised* columns are linearly dependent, which
+        // is the case the Cholesky below reports.
+        //
+        // **One scale for both kinds of deviation.** An intercept deviation is in units
+        // of the response and a slope deviation is in response per unit of the
+        // predictor, so a single `pool_scale` means the same number is being asked to
+        // do two jobs. That is the cost of staying conjugate with one dial; centring
+        // and scaling the predictor is what makes the two comparable, and is worth
+        // doing before reading the shrinkage.
         let slope_precision = if beta_scale.is_finite() {
             1.0 / (beta_scale * beta_scale)
         } else {
             0.0
         };
         let group_precision = 1.0 / (pool_scale * pool_scale);
-        let n_fixed = p - group_keys.len();
+        let n_fixed = usize::from(intercept) + x_names.len();
         let first_slope = usize::from(intercept);
         let precision: Vec<f64> = (0..p)
             .map(|j| {
@@ -654,6 +773,15 @@ mod tests {
             .iter()
             .position(|p| p.name == name)
             .unwrap_or_else(|| panic!("no parameter named {name}"))
+    }
+
+    /// The same, for a parameter carried across many `group_id` values.
+    fn index_of_grouped(model: &dyn CompiledModel, name: &str, group_id: &str) -> usize {
+        model
+            .param_names()
+            .iter()
+            .position(|p| p.name == name && p.group_id == group_id)
+            .unwrap_or_else(|| panic!("no parameter named {name} for group {group_id}"))
     }
 
     /// Under a flat prior the posterior mean is exactly the least-squares estimate.
@@ -1126,6 +1254,402 @@ mod tests {
         let mut slot_a = vec![0.0; width];
         exact.sample_prior_into(&mut rng, &mut slot_a).unwrap();
         assert_eq!(slot_a, slot_b, "prior draws moved with the data");
+    }
+
+    //=== Random slopes ======================================================//
+
+    /// Solve `A b = rhs` by Gaussian elimination with partial pivoting.
+    ///
+    /// Deliberately *not* `crate::linalg::cholesky`: the point of the closed-form test
+    /// below is to check the design matrix and the prior precision the family
+    /// assembles, and reusing the family's own solver would leave a mis-assembled
+    /// system agreeing with itself.
+    fn gauss_solve(mut a: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Vec<f64> {
+        let n = rhs.len();
+        for col in 0..n {
+            let pivot = (col..n)
+                .max_by(|&i, &j| a[i][col].abs().partial_cmp(&a[j][col].abs()).unwrap())
+                .unwrap();
+            a.swap(col, pivot);
+            rhs.swap(col, pivot);
+            let d = a[col][col];
+            assert!(d.abs() > 1e-12, "singular test system at column {col}");
+            let pivot_row = a[col].clone();
+            for row in (col + 1)..n {
+                let f = a[row][col] / d;
+                for (slot, p) in a[row].iter_mut().zip(&pivot_row).skip(col) {
+                    *slot -= f * p;
+                }
+                rhs[row] -= f * rhs[col];
+            }
+        }
+        let mut out = vec![0.0; n];
+        for col in (0..n).rev() {
+            let s: f64 = ((col + 1)..n).map(|k| a[col][k] * out[k]).sum();
+            out[col] = (rhs[col] - s) / a[col][col];
+        }
+        out
+    }
+
+    /// The posterior mode of the coefficients, which for this family is also their
+    /// posterior mean. Read from the differentiable view so the check is exact rather
+    /// than Monte Carlo.
+    fn coefficient_modes(model: &dyn CompiledModel) -> Vec<f64> {
+        let d = model.as_differentiable().unwrap();
+        let theta = d.initial();
+        theta[..theta.len() - 1].to_vec()
+    }
+
+    /// A three-store panel with a genuinely per-store price response, used by the
+    /// random-slope tests. `slopes[g]` is store `g`'s own slope; `rows[g]` how many
+    /// observations it gets.
+    fn elasticity_frame(slopes: &[f64], rows: &[usize]) -> (Vec<f64>, Vec<f64>, Vec<String>) {
+        let (mut y, mut x, mut g) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, (&slope, &n)) in slopes.iter().zip(rows).enumerate() {
+            for i in 0..n {
+                // A deterministic price ladder, centred, so the store slope is not
+                // confounded with the store level.
+                let price = ((i % 5) as f64) - 2.0;
+                x.push(price);
+                y.push(10.0 + 2.0 * s as f64 + slope * price + ((i % 3) as f64 - 1.0) * 0.05);
+                g.push(format!("S{s}"));
+            }
+        }
+        (y, x, g)
+    }
+
+    /// **The closed-form warranty, extended.** Random slopes are a design-matrix
+    /// change and nothing else, so the posterior mean must still be the ridge/GLS
+    /// solution of `(X'X + P) b = X'y` for the design the family says it built. The
+    /// system is assembled and solved here independently, by hand.
+    ///
+    /// This is the test that would catch a group-slope column written into the wrong
+    /// row block, a prior precision applied to the fixed slope instead of the group
+    /// deviation, or a parameter list out of step with the columns.
+    #[test]
+    fn random_slopes_reproduce_the_ridge_closed_form() {
+        let (y, x, g) = elasticity_frame(&[-1.5, -0.6, -2.4], &[12, 12, 12]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y.clone())
+            .numeric("price", x.clone())
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let pool_scale = 0.7;
+        let model = compile(
+            &format!(
+                r#"{{"y": "units", "x": "price", "group": "store",
+                     "random_slopes": "price", "pool_scale": {pool_scale}}}"#
+            ),
+            &view,
+        )
+        .unwrap();
+
+        // Column order the family promises: intercept, beta[price], one group_effect
+        // per store, then one group_slope[price] per store.
+        assert_eq!(
+            model
+                .param_names()
+                .iter()
+                .map(|p| (p.name.as_str(), p.group_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("intercept", "__global__"),
+                ("beta[price]", "__global__"),
+                ("group_effect", "S0"),
+                ("group_effect", "S1"),
+                ("group_effect", "S2"),
+                ("group_slope[price]", "S0"),
+                ("group_slope[price]", "S1"),
+                ("group_slope[price]", "S2"),
+                ("sigma", "__global__"),
+            ]
+        );
+
+        // Build the same design by hand.
+        let p = 8;
+        let mut design = vec![vec![0.0; p]; n];
+        for r in 0..n {
+            let store: usize = g[r][1..].parse().unwrap();
+            design[r][0] = 1.0;
+            design[r][1] = x[r];
+            design[r][2 + store] = 1.0;
+            design[r][5 + store] = x[r];
+        }
+        // ...and its normal equations, with `1/pool_scale^2` on the group block only.
+        let lambda = 1.0 / (pool_scale * pool_scale);
+        let mut a = vec![vec![0.0; p]; p];
+        let mut rhs = vec![0.0; p];
+        for j in 0..p {
+            for k in 0..p {
+                a[j][k] = (0..n).map(|r| design[r][j] * design[r][k]).sum();
+            }
+            if j >= 2 {
+                a[j][j] += lambda;
+            }
+            rhs[j] = (0..n).map(|r| design[r][j] * y[r]).sum();
+        }
+        let want = gauss_solve(a, rhs);
+        let got = coefficient_modes(&*model);
+        for (j, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "coefficient {j} ({}): {a} vs ridge {b}",
+                model.param_names()[j].name
+            );
+        }
+
+        // ...and the sampler targets that same centre rather than merely the compile
+        // step computing it.
+        let cols = draw(&*model, 60_000, 77);
+        for (j, w) in want.iter().enumerate() {
+            let m = mean(&cols[j]);
+            assert!(
+                (m - w).abs() < 0.02,
+                "draw mean of {} is {m}, ridge says {w}",
+                model.param_names()[j].name
+            );
+        }
+    }
+
+    /// Partial pooling on the *slope*: a store with four price points has its own
+    /// elasticity pulled toward the population elasticity far harder than a store with
+    /// sixty. This is the whole reason to make the slope random rather than fitting an
+    /// interaction column per store, which shrinks nothing.
+    #[test]
+    fn a_thin_stores_slope_shrinks_toward_the_population_more_than_a_rich_stores() {
+        // Both S1 and S2 genuinely respond 0.9 more steeply than S0; S1 is observed
+        // four times and S2 sixty.
+        let (y, x, g) = elasticity_frame(&[-1.5, -2.4, -2.4], &[60, 4, 60]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let model = compile(
+            r#"{"y": "units", "x": "price", "group": "store",
+                "random_slopes": "price", "pool_scale": 0.4}"#,
+            &view,
+        )
+        .unwrap();
+        let cols = draw(&*model, 40_000, 78);
+        let thin = mean(&cols[index_of_grouped(&*model, "group_slope[price]", "S1")]);
+        let rich = mean(&cols[index_of_grouped(&*model, "group_slope[price]", "S2")]);
+
+        // Both deviations point the same way and the thin one is the smaller: it has
+        // been pulled further toward the population slope, which is where a group
+        // deviation's prior is centred.
+        assert!(
+            rich < 0.0,
+            "the rich store's deviation {rich} lost its sign"
+        );
+        assert!(
+            thin > rich,
+            "thin store {thin} should be shrunk above rich store {rich}"
+        );
+        assert!(
+            thin.abs() < 0.75 * rich.abs(),
+            "thin {thin} is barely shrunk against rich {rich}"
+        );
+    }
+
+    /// **Why a random slope is not rank deficient beside its own population slope.**
+    ///
+    /// The group-slope columns sum exactly to the fixed `price` column, so `X` really
+    /// is rank deficient — the same trap as an intercept plus a full set of group
+    /// dummies. What identifies the split is the prior: `1/pool_scale^2` sits on the
+    /// group block and nothing sits on the fixed slope, so `X'X + P` is positive
+    /// definite and the decomposition into "the population slope" and "how each store
+    /// differs from it" is a statement the model can make.
+    ///
+    /// Recorded as a test because the obvious defensive move — refusing the design
+    /// because `X` is singular — would delete the feature.
+    #[test]
+    fn a_random_slope_beside_its_population_slope_is_identified_by_the_prior() {
+        let (y, x, g) = elasticity_frame(&[-1.5, -0.6, -2.4], &[15, 15, 15]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let model = compile(
+            r#"{"y": "units", "x": "price", "group": "store",
+                "random_slopes": "price", "pool_scale": 1.0}"#,
+            &view,
+        )
+        .unwrap();
+        assert_eq!(model.readiness().status, FitStatus::Converged);
+
+        // The population slope recovers roughly the average of the three, and each
+        // store's deviation points the right way.
+        let modes = coefficient_modes(&*model);
+        let beta = modes[index_of(&*model, "beta[price]")];
+        assert!((beta + 1.5).abs() < 0.4, "population slope {beta}");
+        let dev = |k: &str| modes[index_of_grouped(&*model, "group_slope[price]", k)];
+        assert!(dev("S1") > dev("S0"), "S1 is the flattest store");
+        assert!(dev("S2") < dev("S0"), "S2 is the steepest store");
+    }
+
+    /// The prior identifies the *pooled* collinearity and nothing else. A design whose
+    /// unpenalised block is rank deficient still has infinitely many answers, and a
+    /// random-slopes request does not launder that.
+    #[test]
+    fn a_rank_deficient_random_slopes_design_refuses() {
+        let (y, x, g) = elasticity_frame(&[-1.5, -0.6, -2.4], &[15, 15, 15]);
+        let n = y.len();
+        let dup: Vec<f64> = x.iter().map(|v| 2.0 * v).collect();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .numeric("price_twice", dup)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let err = compile(
+            r#"{"y": "units", "x": ["price", "price_twice"], "group": "store",
+                "random_slopes": "price", "pool_scale": 1.0}"#,
+            &view,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BayesError::SingularMatrix), "{err}");
+    }
+
+    /// A random slope is a deviation *from* a population slope. Without that
+    /// population slope in `x` the deviations would shrink toward zero, which asserts
+    /// the predictor has no effect — the exact claim about the world that the roadmap
+    /// criticises `beta_scale` for making. Refuse rather than make it silently.
+    #[test]
+    fn a_random_slope_on_a_predictor_outside_x_is_a_config_error() {
+        let (y, x, g) = elasticity_frame(&[-1.5, -0.6, -2.4], &[15, 15, 15]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let err = compile(
+            r#"{"y": "units", "x": "price", "group": "store", "random_slopes": "promo"}"#,
+            &view,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, BayesError::Config { ref slot, .. } if slot == "random_slopes"),
+            "{msg}"
+        );
+        assert!(msg.contains("promo"), "{msg}");
+        assert!(msg.contains('x'), "{msg}");
+    }
+
+    #[test]
+    fn a_random_slope_without_a_group_column_is_a_config_error() {
+        let (y, x, _) = elasticity_frame(&[-1.5], &[20]);
+        let n = y.len();
+        let frame = Frame::new(n).numeric("units", y).numeric("price", x);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let err = compile(
+            r#"{"y": "units", "x": "price", "random_slopes": "price"}"#,
+            &view,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BayesError::Config { ref slot, .. } if slot == "random_slopes"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("group"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_random_slope_column_is_a_config_error() {
+        let (y, x, g) = elasticity_frame(&[-1.5, -0.6], &[15, 15]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let err = compile(
+            r#"{"y": "units", "x": "price", "group": "store",
+                "random_slopes": ["price", "price"]}"#,
+            &view,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BayesError::Config { ref slot, .. } if slot == "random_slopes"),
+            "{err}"
+        );
+    }
+
+    /// Every group multiplies the parameter count by one more column per random
+    /// slope, so the identifiability floor and the design budget both have to see the
+    /// wider design rather than the one `group` alone would have produced.
+    #[test]
+    fn random_slopes_are_counted_by_the_identifiability_floor() {
+        // 4 groups x 2 rows = 8 observations; intercept + slope + 4 effects + 4
+        // slopes = 10 coefficients.
+        let (y, x, g) = elasticity_frame(&[-1.0, -1.0, -1.0, -1.0], &[2, 2, 2, 2]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let err = compile(
+            r#"{"y": "units", "x": "price", "group": "store", "random_slopes": "price"}"#,
+            &view,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BayesError::InsufficientData { params: 10, .. }),
+            "{err}"
+        );
+    }
+
+    /// Asking for no random slopes must leave the shipped fit bit-for-bit unchanged.
+    #[test]
+    fn the_random_slopes_slot_leaves_a_plain_pooled_fit_untouched() {
+        let (y, x, g) = elasticity_frame(&[-1.5, -0.6], &[20, 20]);
+        let n = y.len();
+        let keys: Vec<&str> = g.iter().map(String::as_str).collect();
+        let frame = Frame::new(n)
+            .numeric("units", y)
+            .numeric("price", x)
+            .key("store", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let bare = compile(r#"{"y": "units", "x": "price", "group": "store"}"#, &view).unwrap();
+        let empty = compile(
+            r#"{"y": "units", "x": "price", "group": "store", "random_slopes": []}"#,
+            &view,
+        )
+        .unwrap();
+        assert_eq!(bare.param_names(), empty.param_names());
+        assert_eq!(coefficient_modes(&*bare), coefficient_modes(&*empty));
     }
 
     /// The new slot must not change what a default fit does. `intercept_scale`

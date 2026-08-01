@@ -161,6 +161,29 @@ instead of reporting noise; a group with three hundred is left alone. How hard t
 shrinkage pulls is `pool_scale`, measured **in residual standard deviations** — so
 noisier data pools more at the same setting, which is what you want.
 
+**Random slopes.** `random_slopes` extends that from the level to the *effect*: each
+group gets its own coefficient on a named predictor, shrunk toward the population
+coefficient by the same `pool_scale`. "This store's customers are twice as
+price-sensitive as the average, and this newly-opened one probably is not as unusual
+as its five weeks suggest" is a sentence the model can now make, and could not before.
+
+The alternative people reach for — one interaction column per group — fits every group
+independently and shrinks nothing, so the thin group reports whatever its handful of
+rows happen to say. That is the workaround this replaces.
+
+Two boundaries worth stating, because they are the reason this is a small change and
+not a new family:
+
+- The predictor must also be a fixed effect (`x`), so that a group's deviation is a
+  deviation *from* a population slope. Shrinking group slopes toward **zero** would
+  assert the predictor has no effect, which is a claim about the world nobody asked to
+  make; shrinking them toward a common slope asserts only that groups are alike until
+  shown otherwise. The request is refused rather than reinterpreted.
+- `pool_scale` is still **fixed**, and a per-group `sigma` is still unavailable. Both
+  break conjugacy and belong to a sampled family — see `ROADMAP.md` §3.3. Random slopes
+  at a fixed scale do not: they are more columns with a Gaussian prior, and nothing
+  else.
+
 > **In detail.** `y = Xβ + ε`, `ε ~ N(0, sigma²)`, with a Normal-Inverse-Gamma prior on
 > `(β, sigma²)`. With `A = X'X + P` and `b_n = A⁻¹X'y`:
 > `sigma² | y ~ InvGamma(a_n, s_n)`, `β | sigma², y ~ N(b_n, sigma²A⁻¹)`,
@@ -175,6 +198,21 @@ noisier data pools more at the same setting, which is what you want.
 > intercept is never penalised: it lives on the scale of the response, where a prior
 > centred at zero means something nobody intends, and shrinking it silently pushes
 > every slope the other way to compensate.
+>
+> A **random slope** on predictor `c` adds one column per group carrying `c`'s value on
+> that group's rows and zero elsewhere, with the same `1/pool_scale²` on its diagonal.
+> Those columns sum exactly to `c`'s fixed column, so `X` is rank deficient by
+> construction — the same trap as an intercept plus a full set of group dummies. What
+> resolves it is the prior: `A = X'X + P` is positive definite exactly when the
+> *unpenalised* columns are linearly independent, and the group block is penalised.
+> Rank deficiency among the unpenalised columns is still refused.
+>
+> One consequence to know about: each random slope adds a group's worth of columns to
+> `p` without adding an observation, and the Laplace engine centres `sigma` on the joint
+> mode `2·s_n/(2·a_n + p)` against the exact posterior mean `s_n/(a_n − 1)`. So Laplace
+> understates `sigma` by `√((2(a_n−1))/(2·a_n + p))`, and random slopes make that gap
+> wider. It is derived rather than tolerated — the engine-agreement test asserts the
+> predicted ratio — and `exact` remains the default.
 >
 > **Not estimated:** `pool_scale` is fixed by configuration. Estimating it makes the
 > posterior non-conjugate and needs a general sampler. The NUTS engine that such a

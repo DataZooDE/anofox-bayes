@@ -1,0 +1,221 @@
+# name: test/sql/f3_price_elasticity.test
+# description: F3 random slopes, exercised as the per-store price-elasticity agent
+# group: [sql]
+
+require anofox_bayes
+
+#######################################
+# Setup: eight stores whose customers genuinely differ
+#######################################
+
+# A log-log demand model: log(units) = a_s + b_s * log(price). The elasticity `b_s`
+# is the decision -- it says how much volume a price move costs -- and it is *not*
+# the same in every store. S00 sits in a price-sensitive catchment at -2.3; S07 is a
+# captive location at -0.9; the rest are spread evenly between.
+#
+# S07 is also the store the model exists for: it opened recently and has been through
+# five price points, not forty. An unpooled per-store regression would report its
+# elasticity with a confidence that five observations cannot support, and a single
+# pooled elasticity would report the average and be wrong for every store.
+statement ok
+CREATE TABLE weekly AS
+SELECT 'S' || lpad(s::VARCHAR, 2, '0')          AS store,
+       w                                        AS week,
+       ((w % 5) - 2) * 0.2                      AS log_price,
+       4.0 + 0.10 * s
+         + (-2.3 + 0.2 * s) * (((w % 5) - 2) * 0.2)
+         + ((s * 3 + w * 5) % 7 - 3) * 0.03      AS log_units
+FROM generate_series(0, 6) AS a(s), generate_series(0, 39) AS b(w)
+UNION ALL
+SELECT 'S07',
+       w,
+       ((w % 5) - 2) * 0.2,
+       4.0 + 0.10 * 7
+         + (-0.9) * (((w % 5) - 2) * 0.2)
+         + ((7 * 3 + w * 5) % 7 - 3) * 0.03
+FROM generate_series(0, 4) AS c(w);
+
+statement ok
+CREATE TABLE truth AS
+SELECT 'S' || lpad(s::VARCHAR, 2, '0') AS store, -2.3 + 0.2 * s AS true_elasticity
+FROM generate_series(0, 7) AS t(s);
+
+query II
+SELECT count(*), count(DISTINCT store) FROM weekly;
+----
+285	8
+
+#######################################
+# Fit: one population elasticity, plus a per-store deviation from it
+#######################################
+
+# `random_slopes` is what makes this the model the question asks for. Without it the
+# only way to let stores respond differently is one interaction column per store,
+# which fits eight independent slopes with no shrinkage at all -- so the thin store
+# gets whatever its five weeks happen to say.
+#
+# `pool_scale` is measured in *residual standard deviations*, and it governs the
+# store deviations rather than the population slope. It is a dial the analyst sets:
+# nothing here estimates it.
+statement ok
+CREATE TABLE el AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, week, log_price, log_units FROM weekly),
+    'pooled_gaussian',
+    {'y': 'log_units',
+     'x': ['log_price'],
+     'group': 'store',
+     'random_slopes': ['log_price'],
+     'pool_scale': 1.5,
+     'draws': 2000,
+     'seed': 42}
+);
+
+query I
+SELECT value = 0 FROM el WHERE param = '__status__';
+----
+true
+
+query I
+SELECT value FROM el WHERE param = '__n_obs__';
+----
+285.0
+
+# intercept, beta[log_price], group_effect, group_slope[log_price], sigma.
+query I
+SELECT count(DISTINCT param) FROM el WHERE draw >= 0;
+----
+5
+
+# 19 parameters -- 1 intercept + 1 population slope + 8 store effects + 8 store
+# slopes + sigma -- times 2000 draws, plus the metadata rows.
+query I
+SELECT count(*) = 19 * 2000 + 11 FROM el;
+----
+true
+
+# A store slope is one parameter name carried across group keys, exactly as
+# `group_effect` is, so it is filtered the same way.
+query I
+SELECT count(DISTINCT group_id) FROM el
+WHERE param = 'group_slope[log_price]' AND draw >= 0;
+----
+8
+
+#######################################
+# The decision: what is each store's own elasticity?
+#######################################
+
+# A store's elasticity is the population slope plus its own deviation, and the two
+# are correlated in the posterior -- so they must be added *within a draw*, not as
+# two medians. This is the join the draws contract is designed around.
+statement ok
+CREATE TABLE store_elasticity AS
+SELECT d.group_id AS store, d.chain, d.draw, b.value + d.value AS elasticity
+FROM el AS d
+JOIN el AS b
+  ON b.chain = d.chain AND b.draw = d.draw AND b.param = 'beta[log_price]'
+WHERE d.param = 'group_slope[log_price]' AND d.draw >= 0;
+
+# Every well-observed store recovers the elasticity that was injected into it.
+query I
+SELECT count(*) FROM (
+    SELECT store, median(elasticity) AS est FROM store_elasticity GROUP BY store
+) AS e
+JOIN truth AS t USING (store)
+WHERE t.store <> 'S07' AND abs(e.est - t.true_elasticity) > 0.15;
+----
+0
+
+# ...and they are ordered as injected: S00 is the most price-sensitive store and S06
+# the least, which a single pooled slope could not have said at all.
+query I
+SELECT (SELECT median(elasticity) FROM store_elasticity WHERE store = 'S00')
+     < (SELECT median(elasticity) FROM store_elasticity WHERE store = 'S06') - 0.8;
+----
+true
+
+#######################################
+# Pooling: the thin store borrows strength
+#######################################
+
+# S07's five weeks say it is captive (-0.9). The population says -1.6. The posterior
+# lands strictly between the two -- nearer its own data than the population, but not
+# at it -- which is the whole reason the slope is random rather than fixed.
+query II
+SELECT (SELECT median(elasticity) FROM store_elasticity WHERE store = 'S07')
+     > (SELECT median(value) FROM el WHERE param = 'beta[log_price]' AND draw >= 0)
+       AS pulled_up_from_the_population,
+       (SELECT median(elasticity) FROM store_elasticity WHERE store = 'S07')
+     < (SELECT true_elasticity FROM truth WHERE store = 'S07')
+       AS pulled_back_toward_it;
+----
+true	true
+
+# ...and it says so honestly: five weeks buy a visibly wider interval than forty.
+query I
+SELECT (SELECT quantile_cont(elasticity, 0.975) - quantile_cont(elasticity, 0.025)
+        FROM store_elasticity WHERE store = 'S07')
+     > 1.3 * (SELECT quantile_cont(elasticity, 0.975) - quantile_cont(elasticity, 0.025)
+              FROM store_elasticity WHERE store = 'S00');
+----
+true
+
+# The commercial question, answered from the draws: is a price rise in S07 safe?
+# Demand there is inelastic if the elasticity is above -1, and after pooling the
+# model is *not* confident that it is -- which is the right answer on five weeks.
+query I
+SELECT avg(CASE WHEN elasticity > -1.0 THEN 1.0 ELSE 0.0 END) < 0.5
+FROM store_elasticity WHERE store = 'S07';
+----
+true
+
+#######################################
+# Diagnostics gate
+#######################################
+
+query I
+SELECT count(*) FROM (
+    SELECT group_id, param
+    FROM el WHERE draw >= 0
+    GROUP BY group_id, param
+    HAVING NOT anofox_bayes_ess_gate(value, chain, draw, 400)
+);
+----
+0
+
+#######################################
+# Refusal
+#######################################
+
+# A random slope is a deviation *from* a population slope. Asking for one on a
+# predictor that carries no population slope would shrink every store toward "price
+# does not matter", which is a claim about the world nobody made.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, log_price, log_units FROM weekly), 'pooled_gaussian',
+    {'y': 'log_units', 'x': ['log_price'], 'group': 'store',
+     'random_slopes': ['week'], 'draws': 100});
+----
+not one of the predictors
+
+# Without groups there is nothing for a slope to vary over.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, log_price, log_units FROM weekly), 'pooled_gaussian',
+    {'y': 'log_units', 'x': ['log_price'],
+     'random_slopes': ['log_price'], 'draws': 100});
+----
+no `group` column is set
+
+# The prior identifies the population slope against its own store deviations, and
+# nothing more. A duplicated predictor is still rank deficient, and is still refused
+# rather than answered arbitrarily.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, log_price, 2 * log_price AS log_price_twice, log_units FROM weekly),
+    'pooled_gaussian',
+    {'y': 'log_units', 'x': ['log_price', 'log_price_twice'], 'group': 'store',
+     'random_slopes': ['log_price'], 'draws': 100});
+----
+singular or rank-deficient

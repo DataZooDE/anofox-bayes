@@ -455,6 +455,169 @@ mod tests {
         });
     }
 
+    /// A per-store price panel with a genuinely per-store elasticity — the shape a
+    /// random-slopes fit exists for.
+    fn store_frame(n_per_store: usize, slopes: &[f64]) -> (Frame, Vec<String>) {
+        let n = n_per_store * slopes.len();
+        let (mut y, mut price, mut store) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, &slope) in slopes.iter().enumerate() {
+            for i in 0..n_per_store {
+                let p = ((i % 7) as f64) - 3.0;
+                price.push(p);
+                y.push(20.0 + 3.0 * s as f64 + slope * p + ((i % 5) as f64 - 2.0) * 0.4);
+                store.push(format!("S{s}"));
+            }
+        }
+        let keys: Vec<String> = store.clone();
+        let frame = Frame::new(n).numeric("units", y).numeric("price", price);
+        (frame, keys)
+    }
+
+    /// **The warranty, on a random-slopes design: all three engines still agree.**
+    ///
+    /// `pooled_gaussian` promises a closed-form posterior cross-checked by independent
+    /// derivations. Random slopes are a design-matrix change, so that promise has to
+    /// survive them unchanged — and this is the test that says whether it did, across
+    /// `exact` (the formula), `laplace` (a Gaussian fit to the same log density) and
+    /// `nuts` (a Markov chain over it).
+    ///
+    /// The tolerances are not the same for the two comparisons and should not be.
+    /// `laplace` differs from `exact` by a genuine `O(1/n)` approximation error on
+    /// `sigma`, which is a property of the method rather than of the code; `nuts` is
+    /// asymptotically exact, so it is held to five Monte Carlo standard errors with the
+    /// effective sample size *measured* from its own draws.
+    ///
+    /// **Recorded finding, because it is the reason the numbers below look the way they
+    /// do.** `pooled_gaussian` with a `group` column already mixes badly under NUTS:
+    /// the unpenalised intercept and the pooled group effects form a ridge that is not
+    /// axis-aligned, and a diagonal mass matrix cannot precondition it. Random slopes
+    /// add a second such ridge per predictor. The test therefore *prints* the effective
+    /// sample size per parameter and gates on a floor low enough to be honest about
+    /// what the sampler achieves rather than on one that would flake — the fit's own
+    /// diagnostics, not this test, are what refuse a chain that explored too little.
+    #[test]
+    fn all_three_engines_agree_on_a_random_slopes_design() {
+        let (frame, keys) = store_frame(60, &[-1.5, -0.6, -2.4, -1.2]);
+        let key_ref: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let frame = frame.key("store", key_ref);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(
+                    r#"{"y": "units", "x": "price", "group": "store",
+                        "random_slopes": "price", "pool_scale": 0.5}"#,
+                )
+                .unwrap(),
+                &view,
+            )
+            .unwrap();
+        let p = model.param_names().len();
+        assert_eq!(
+            p, 11,
+            "intercept + slope + 4 effects + 4 group slopes + sigma"
+        );
+
+        let n_indep = 200_000;
+        let indep_opts = |seed| SampleOptions {
+            n_chains: 1,
+            n_draws: n_indep,
+            n_warmup: 0,
+            seed,
+            sample_from: crate::types::SampleFrom::Posterior,
+        };
+        let exact = ExactEngine.sample(&*model, &indep_opts(21)).unwrap();
+        let laplace = crate::engines::LaplaceEngine
+            .sample(&*model, &indep_opts(22))
+            .unwrap();
+        let nuts_opts = SampleOptions {
+            n_chains: 4,
+            n_draws: 2000,
+            n_warmup: 1000,
+            seed: 23,
+            sample_from: crate::types::SampleFrom::Posterior,
+        };
+        let nuts = NutsEngine.sample(&*model, &nuts_opts).unwrap();
+
+        for j in 0..p {
+            let name = &model.param_names()[j].name;
+            let group = &model.param_names()[j].group_id;
+            let ecol = column(&exact.values, p, j);
+            let lcol = column(&laplace.values, p, j);
+            let ncol = column(&nuts.values, p, j);
+            let (em, esd) = mean_sd(&ecol);
+            let (lm, lsd) = mean_sd(&lcol);
+            let (nm, nsd) = mean_sd(&ncol);
+
+            let chains: Vec<Vec<f64>> = (0..nuts_opts.n_chains)
+                .map(|c| ncol[c * nuts_opts.n_draws..(c + 1) * nuts_opts.n_draws].to_vec())
+                .collect();
+            let ess = ess_bulk(&chains);
+            println!(
+                "{name}/{group}: exact ({em:.5}, {esd:.5}) laplace ({lm:.5}, {lsd:.5}) \
+                 nuts ({nm:.5}, {nsd:.5}) ess {ess:.0}"
+            );
+
+            // --- laplace vs exact.
+            if name == "sigma" {
+                // **A derived offset, pinned rather than tolerated.** `sigma` is the
+                // one coordinate whose posterior is not Gaussian on the unconstrained
+                // scale, so Laplace centres it on the joint mode
+                // `sigma^2 = 2 s_n / (2 a_n + p)` while the exact posterior mean of
+                // `sigma^2` is `s_n / (a_n - 1)`. The ratio is a function of the
+                // *shape* alone and so is computable here from the request:
+                // `a_n = (n - n_flat)/2` with two flat coefficients (the intercept and
+                // the population slope; every group column is penalised by
+                // `pool_scale`), against `p` coefficients in the design.
+                //
+                // This is the number random slopes move. Each one adds a group's worth
+                // of columns to `p` without adding an observation, so the Laplace
+                // engine's understatement of `sigma` grows with the width of the
+                // design. Asserting the predicted ratio rather than a round tolerance
+                // is what turns that from a mystery into a documented cost.
+                let n_obs = model.n_obs() as f64;
+                let a_n = (n_obs - 2.0) / 2.0;
+                let predicted = ((2.0 * (a_n - 1.0)) / (2.0 * a_n + p as f64)).sqrt();
+                let ratio = lm / em;
+                println!("  sigma laplace/exact {ratio:.5}, mode/mean predicts {predicted:.5}");
+                assert!(
+                    (ratio - predicted).abs() < 0.005,
+                    "sigma: laplace/exact {ratio} vs the predicted mode-to-mean ratio \
+                     {predicted}; the Laplace error on this family's variance parameter \
+                     is a known O(1/n) offset and this is where its size is pinned"
+                );
+            } else {
+                // The coefficients' conditional posterior is exactly Gaussian, so the
+                // two engines agree far inside this band.
+                assert!(
+                    (lm - em).abs() < 0.02 * esd,
+                    "{name}/{group}: laplace mean {lm} vs exact {em}"
+                );
+            }
+            assert!(
+                (lsd - esd).abs() < 0.05 * esd,
+                "{name}/{group}: laplace sd {lsd} vs exact {esd}"
+            );
+
+            // --- nuts vs exact, at five measured Monte Carlo standard errors.
+            assert!(ess > 100.0, "{name}/{group}: implausibly low ESS {ess}");
+            let mcse_mean = esd * (1.0 / ess + 1.0 / n_indep as f64).sqrt();
+            let mcse_sd = esd * (0.5 / ess + 0.5 / n_indep as f64).sqrt();
+            assert!(
+                (nm - em).abs() < 5.0 * mcse_mean,
+                "{name}/{group}: nuts mean {nm} vs exact {em}, gap {} exceeds {}",
+                (nm - em).abs(),
+                5.0 * mcse_mean
+            );
+            assert!(
+                (nsd - esd).abs() < 5.0 * mcse_sd,
+                "{name}/{group}: nuts sd {nsd} vs exact {esd}, gap {} exceeds {}",
+                (nsd - esd).abs(),
+                5.0 * mcse_sd
+            );
+        }
+    }
+
     /// Warmup draws are adaptation, not posterior samples: the step size and mass
     /// matrix are still moving, so they are draws from a sequence of different
     /// samplers. Emitting them would bias every quantile a caller reads, and nothing
