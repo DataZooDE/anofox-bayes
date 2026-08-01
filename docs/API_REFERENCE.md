@@ -401,12 +401,14 @@ anofox_bayes_ess_tail(value, chain, draw)  -> DOUBLE
 | `anofox_bayes_ess_bulk` | Bulk effective sample size: how many independent draws the posterior *mean* is worth. | the draws cannot be assessed |
 | `anofox_bayes_ess_tail` | Tail ESS: how many independent draws the 5 % and 95 % *quantiles* are worth. Gate service-level and safety-stock decisions on this rather than on bulk ESS. | the draws cannot be assessed |
 
-> **v0.1: `anofox_bayes_rhat` always returns `NULL`.** Every shipped engine draws
-> independently and therefore reports one chain, and split-R̂ is not defined for a
-> single chain. `NULL` rather than `1.0` is deliberate: an agent gating on
-> `rhat <= 1.01` must not be told "converged" by a statistic that was never
-> computed. Gate on ESS in v0.1; R̂ becomes meaningful when the NUTS engine lands
-> in 0.2.
+> **`anofox_bayes_rhat` is `NULL` unless you ask for more than one chain.** Sampling
+> defaults to `chains = 1`, and split-R̂ is not defined for a single chain. Set
+> `{'chains': 4}` to make it available. The default is deliberate: R̂ exists to catch
+> a Markov chain that has not mixed, and both shipped engines draw *independently*,
+> so a second chain buys an R̂ of 1.0 that means nothing. `NULL` rather than `1.0`
+> matters for the same reason — an agent gating on `rhat <= 1.01` must not be told
+> "converged" by a statistic that was never computed. **Gate on ESS**; R̂ becomes
+> load-bearing when the NUTS engine lands in 0.2.
 
 Filter to real parameters before diagnosing — sample statistics and metadata rows
 are not posterior draws:
@@ -474,6 +476,49 @@ See [TELEMETRY.md](../TELEMETRY.md) for what is and is not collected.
 
 ---
 
+## Decision macros
+
+SQL macros over a draws table. Each is a short expression you could write by hand;
+shipping them makes the idiom consistent and discoverable, and a macro is transparent
+in `duckdb_functions()` — which matters when the output goes into an audit trail.
+
+All are **aggregates over `value`**, so they compose with `GROUP BY group_id, param`
+exactly as the underlying quantile functions do. Filter to real draws first
+(`WHERE draw >= 0`).
+
+| Macro | Returns | Notes |
+|---|---|---|
+| `anofox_bayes_credible_lower(value, level)` | DOUBLE | Lower end of an equal-tailed interval |
+| `anofox_bayes_credible_upper(value, level)` | DOUBLE | Upper end |
+| `anofox_bayes_credible_interval(value, level)` | STRUCT(lower, median, upper) | The interval as one column |
+| `anofox_bayes_prob_greater(value, threshold)` | DOUBLE | `P(param > threshold)` |
+| `anofox_bayes_prob_less(value, threshold)` | DOUBLE | `P(param < threshold)` |
+| `anofox_bayes_service_level_quantile(value, level)` | DOUBLE | The quantity covering demand in `level` of futures |
+| `anofox_bayes_status_text(param, value)` | VARCHAR | `converged` / `degenerate` / `insufficient_data` / `failed` |
+| `anofox_bayes_is_actionable(param, value)` | BOOLEAN | True only for `converged` |
+
+`anofox_bayes_prob_greater` is the one that earns its place: *"is the effect bigger
+than the rollout cost?"* is a mean of an indicator over the draws, with no
+distributional theory in between.
+
+```sql
+-- Is the intervention worth 5 units per store-month?
+SELECT anofox_bayes_prob_greater(value, 5.0) AS p_worth_it,
+       anofox_bayes_credible_interval(value, 0.95) AS ci
+FROM dd WHERE param = 'beta[treated_post]' AND draw >= 0;
+```
+
+`anofox_bayes_service_level_quantile` is a posterior quantile, **not** mean-plus-k-sigma.
+The two coincide only when the posterior happens to be symmetric, and the whole reason
+to carry a posterior is that it often is not.
+
+```sql
+-- The gate, in one row.
+SELECT anofox_bayes_status_text(param, value)  AS status,
+       anofox_bayes_is_actionable(param, value) AS safe_to_act_on
+FROM draws;
+```
+
 ## 6. Not implemented
 
 Listed so they are not mistaken for API. None of the following exist in v0.1;
@@ -484,13 +529,12 @@ calling them is a syntax or binder error.
 | `anofox_bayes_predict(...)` — posterior-predictive samples | 0.3 | BRD BR-10 |
 | Prior-predictive check function | 0.3 | BRD BR-11 |
 | `anofox_bayes_draws(model_id)` / `anofox_bayes_status(model_id)` | — | Superseded in v0.1: draws are the caller's own table, and status travels on a `__status__` row inside it. |
-| Decision-helper macros (`credible_interval`, service-level quantiles) | 0.3 | |
 | `anofox_scenario` catalog registration / branch-versioned counterfactuals | 0.2–0.3 | BRD BR-9 |
 | Async / job-style fit (`fit_async` + polling) | deferred | HLD §6; v0.1 accepts blocking table-function semantics |
-| `laplace` engine | 0.2 | Config value is recognised and rejected with an explanatory error |
+| `anofox_bayes_predict` (posterior-/prior-predictive) | 0.3 | HLD §9 |
 | `nuts` engine | 0.2 | Config value is recognised and rejected with an explanatory error |
 | Families F1, F2, F4, F5, F6 | 0.2–0.3 | See [BRD §6](BRD.md) |
-| `chains` config slot / multi-chain sampling | 0.2 | Arrives with NUTS; until then `anofox_bayes_rhat` is `NULL` |
+
 
 A two-argument `anofox_bayes_fit(data, family)` form is **not** planned. DuckDB
 refuses to bind a function that has a `TABLE` parameter and multiple overloads,
