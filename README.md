@@ -43,10 +43,15 @@ GROUP BY region ORDER BY region;
 
 A 95 % credible interval per region, from ten rows of data and one query.
 
-**→ [User Guide](docs/GUIDE.md)** — task-oriented: find an anomaly, measure an
-intervention, set a service level, check the fit.
+> **To run that today you have to build from source** — there are no published
+> binaries yet, and the first build compiles DuckDB, so budget 30–60 minutes.
+> [Details below](#install).
+
+**→ [User Guide](docs/GUIDE.md)** — task-oriented: get your table into shape, find an
+anomaly, measure an intervention, set a service level, check the fit.
 **→ [Theory](docs/THEORY.md)** — what the numbers mean, written for people who have
 never done Bayesian statistics.
+**→ [Evaluating it?](#for-reviewers)** — models, priors and validation, directly.
 
 ---
 
@@ -108,8 +113,12 @@ Rule of thumb: **one number per group → `conjugate_anomaly`; a response explai
 predictors → `pooled_gaussian`.**
 
 Planned, and *not* present today: hierarchical negative-binomial (F1), censored
-survival (F2), payment delay (F4), payer-alive/BTYD (F5), elasticity (F6), the NUTS
-engine, and a posterior-predictive table function. See [the roadmap](#roadmap).
+survival (F2), payment delay (F4), payer-alive/BTYD (F5), elasticity (F6), and the
+NUTS engine. See [the roadmap](#roadmap).
+
+There is deliberately **no `predict` function** — posterior prediction is a join over
+the draws table, which is both simpler and faster. See
+[the Guide](docs/GUIDE.md#ask-a-what-if-without-re-fitting).
 
 ## How it works, in three properties
 
@@ -147,11 +156,28 @@ test suite, so they cannot drift from the implementation.
 |---|---|
 | **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, exact + Laplace engines, diagnostics, calibration suites |
 | v0.2 | NUTS engine, hierarchical negative-binomial (F1), censored survival (F2) |
-| v0.3 | Payment delay, BTYD, elasticity families; posterior-predictive function; scenario integration |
+| v0.3 | Payment delay, BTYD, elasticity families; scenario integration |
 
 Breaking changes are expected at v0.x. Use the
 [issues page](https://github.com/DataZooDE/anofox-bayes/issues) to report a bug or ask
 for a family.
+
+## For reviewers
+
+Deciding whether to trust it? These are the direct links, so you do not have to read
+linearly:
+
+| Question | Where |
+|---|---|
+| What model is actually fitted? | [Theory §4](docs/THEORY.md#4-the-two-shipped-families) (equations) · [API §2](docs/API_REFERENCE.md) (slots) |
+| What are the default priors, and why? | [Theory §3](docs/THEORY.md#3-priors-and-why-the-defaults-look-the-way-they-do) |
+| Exact or approximate? | [Theory §5](docs/THEORY.md#5-engines) — and where the approximation is admissible, measured |
+| How is it validated? | [Theory §8](docs/THEORY.md#8-how-we-know-it-is-right) · [`validation/`](validation/) for the PyMC suite |
+| What does it refuse to answer? | [Theory §7](docs/THEORY.md#7-refusal) |
+| Runtime and memory | [Scalability](docs/SCALABILITY.md) — measured, with known gaps |
+
+The mathematics also lives beside the code, in the module documentation of
+[`crates/anofox-bayes-core/src/catalog/`](crates/anofox-bayes-core/src/catalog/).
 
 ## Validation
 

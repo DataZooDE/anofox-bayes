@@ -10,7 +10,7 @@ background.
 **Contents**
 
 - [The five-minute version](#the-five-minute-version)
-- [The six words you need](#the-six-words-you-need)
+- [The words you need](#the-words-you-need)
 - [Reading the output table](#reading-the-output-table)
 - [Choosing a family](#choosing-a-family)
 - [How do I…](#how-do-i)
@@ -61,7 +61,7 @@ GROUP BY region ORDER BY region;
 ```
 
 You have just fitted a Bayesian model per region and read a 95 % credible interval
-off it. (If those words are new, the [next section](#the-six-words-you-need) defines
+off it. (If those words are new, the [next section](#the-words-you-need) defines
 them — you do not need any statistics background for this guide.)
 
 Three things to notice, because they explain the rest:
@@ -73,7 +73,7 @@ Three things to notice, because they explain the rest:
 3. **`WHERE param = 'mu' AND draw >= 0`.** The output holds several parameters plus
    some bookkeeping rows. Next section.
 
-## The six words you need
+## The words you need
 
 Enough to read the rest of this page. [Theory](THEORY.md) explains each properly.
 
@@ -85,6 +85,9 @@ Enough to read the rest of this page. [Theory](THEORY.md) explains each properly
 | **prior** | What you believed before seeing the data. Leave it out and you get the "let the data speak" default. [More](THEORY.md#3-priors-and-why-the-defaults-look-the-way-they-do) |
 | **ESS** (effective sample size) | How many *independent* draws yours are worth. Too low means your answer is noisy for sampling reasons, not data reasons — take more draws. |
 | **conjugate** | A model whose posterior has a closed-form solution, so it can be computed exactly instead of approximated. Both shipped families are conjugate. |
+| **parameter** | One unknown the model estimates, named in the `param` column. `mu` is a group's level, `sigma` its variability, `lambda` a rate, `beta[x]` the effect of predictor `x`. |
+| **exposure** | The denominator of a rate — shipments, consignments, store-weeks. Lets you compare units of different sizes. |
+| **R-hat** | A convergence check that compares independent chains. In v0.1 it is `NULL` and that is correct: both engines draw independently, so there is nothing to check. Gate on ESS instead. |
 
 Two more you will meet in error messages: a fit is **degenerate** when the draws are
 untrustworthy (take more), and reports **insufficient_data** when the data itself
@@ -105,7 +108,7 @@ One row per (parameter, draw). With 2 regions × 2 parameters × 1000 draws you 
 |---|---|
 | The draws of one parameter | `WHERE param = 'mu' AND draw >= 0` |
 | All real draws, no bookkeeping | `WHERE draw >= 0` |
-| The fit's status | `WHERE param = '__status__'` |
+| The fit's status | `WHERE param = '__status__'` (or use the status macros, which find the row themselves) |
 
 `draw >= 0` is the important habit: rows with `draw = -1` are model metadata
 (status, seed, row counts), not samples. Full schema in the
@@ -134,6 +137,44 @@ Every config slot for both is in the [API Reference](API_REFERENCE.md); the mode
 themselves are described in [Theory §4](THEORY.md#4-the-two-shipped-families).
 
 ## How do I…
+
+> The recipes below use table names like `invoices`, `panel` and `contract` as
+> stand-ins for **your** data — they are patterns to adapt, not scripts to paste. The
+> only fully self-contained examples are [the five-minute version](#the-five-minute-version)
+> above and the files in [`test/sql/`](../test/sql/), which are the test suite and
+> therefore always current.
+
+### …get my table into the shape it expects?
+
+Two columns is the minimum: something to measure, and optionally something to group
+by. Most real preparation is one `SELECT`.
+
+```sql
+-- Typical: derive the measure, pick the grain, drop rows that cannot contribute.
+CREATE VIEW lane_costs AS
+SELECT carrier || '/' || origin || '-' || destination AS lane,   -- the grain
+       freight_charge / NULLIF(weight_kg, 0)          AS cost_per_kg,
+       invoice_date
+FROM invoices
+WHERE invoice_date >= DATE '2025-01-01'      -- filter *before* fitting: every row of
+  AND freight_charge > 0                     -- the subquery is buffered in memory
+  AND weight_kg > 0;
+```
+
+Three decisions to make deliberately:
+
+**The grain.** `group` defines what gets its own estimate. Finer grain means more
+groups, each with less data — and a group with one row will be
+[refused](#handle-a-refusal). Coarsen until every group has at least a handful of
+observations.
+
+**NULLs.** A row is dropped if *any* column the model reads is NULL, so you do not
+need to pre-clean — but you should know how many rows that removes. `__n_obs__` in the
+output tells you how many survived.
+
+**Rates, not counts.** If groups differ in size, use the Poisson likelihood with an
+`exposure` column rather than comparing raw counts — see
+[below](#work-with-counts-instead-of-measurements).
 
 ### …find which group is behaving abnormally?
 
@@ -251,6 +292,8 @@ A worked end-to-end version, including a counterfactual, is in
 Two checks. First, did the model refuse?
 
 ```sql
+-- No WHERE clause: these two macros scan for the __status__ row themselves, which is
+-- why they take `param` as well as `value`.
 SELECT anofox_bayes_status_text(param, value)   AS status,
        anofox_bayes_is_actionable(param, value) AS safe_to_act_on
 FROM draws;

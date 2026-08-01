@@ -70,13 +70,38 @@ jobs:
       # windows_amd64_mingw: rtools42 MinGW lacks libbcrypt.a needed by Rust getrandom 0.3+
       exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw'
 
+  # Whether the distribution channel is configured at all.
+  #
+  # DEPLOY_S3_BUCKET is a repository *variable*, so this is readable without exposing
+  # anything. Until it and the matching IAM OIDC trust-policy entry exist, every
+  # deploy job fails on AccessDenied -- and a pipeline that is permanently red for a
+  # known reason trains everyone to ignore it, including on the day it goes red for an
+  # unknown one. Skip instead, and say so.
+  deploy-configured:
+    name: Distribution channel configured?
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        run: |
+          if [ -n "${{ vars.DEPLOY_S3_BUCKET }}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Deploy skipped::DEPLOY_S3_BUCKET is not set, so the \
+            distribution channel is not configured yet. Builds still ran and are \
+            attached as artifacts; publishing is skipped rather than failed."
+          fi
+
   duckdb-lts-deploy:
     name: Deploy extension binaries (v1.4.5 LTS)
-    needs: duckdb-lts-build
-    # Run the deploy step even when a non-essential build matrix entry fails.
-    # The deploy job itself fans out per arch and only pushes the artifacts
-    # that actually exist.
-    if: ${{ !cancelled() && needs.duckdb-lts-build.result != 'skipped' }}
+    needs: [duckdb-lts-build, deploy-configured]
+    # Run the deploy step even when a non-essential build matrix entry fails -- it
+    # fans out per arch and only pushes the artifacts that actually exist -- but not
+    # at all until the channel is configured.
+    if: ${{ !cancelled() && needs.duckdb-lts-build.result != 'skipped'
+            && needs.deploy-configured.outputs.ready == 'true' }}
     uses: ./.github/workflows/_extension_deploy.yml
     secrets: inherit
     with:
@@ -102,8 +127,9 @@ jobs:
 
   duckdb-latest-deploy:
     name: Deploy extension binaries (v1.5.5)
-    needs: duckdb-latest-build
-    if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped' }}
+    needs: [duckdb-latest-build, deploy-configured]
+    if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped'
+            && needs.deploy-configured.outputs.ready == 'true' }}
     uses: ./.github/workflows/_extension_deploy.yml
     secrets: inherit
     with:
