@@ -230,33 +230,38 @@ pub unsafe extern "C" fn anofox_bayes_ffi_fit(
         return std::ptr::null_mut();
     };
 
-    let result = (|| {
-        let cfg = Config::parse(config_json)?;
+    let result = crate::guard(
+        Err(BayesError::Internal(
+            "the fit panicked; this is a bug, not a data problem".to_string(),
+        )),
+        || {
+            let cfg = Config::parse(config_json)?;
 
-        let mut view = DataView::new(data.n_rows);
-        for (name, values, valid) in &data.numeric {
-            view.add_numeric(name.clone(), NumericColumn { values, valid })?;
-        }
-        // Key columns are stored as owned `String`s; the view needs `&str` slices,
-        // which must outlive it -- hence materialising them here rather than inside
-        // the loop, where they would be dropped at the end of each iteration.
-        let key_refs: Vec<Vec<&str>> = data
-            .keys
-            .iter()
-            .map(|(_, values, _)| values.iter().map(String::as_str).collect())
-            .collect();
-        for (i, (name, _, valid)) in data.keys.iter().enumerate() {
-            view.add_key(
-                name.clone(),
-                KeyColumn {
-                    values: &key_refs[i],
-                    valid,
-                },
-            )?;
-        }
+            let mut view = DataView::new(data.n_rows);
+            for (name, values, valid) in &data.numeric {
+                view.add_numeric(name.clone(), NumericColumn { values, valid })?;
+            }
+            // Key columns are stored as owned `String`s; the view needs `&str` slices,
+            // which must outlive it -- hence materialising them here rather than inside
+            // the loop, where they would be dropped at the end of each iteration.
+            let key_refs: Vec<Vec<&str>> = data
+                .keys
+                .iter()
+                .map(|(_, values, _)| values.iter().map(String::as_str).collect())
+                .collect();
+            for (i, (name, _, valid)) in data.keys.iter().enumerate() {
+                view.add_key(
+                    name.clone(),
+                    KeyColumn {
+                        values: &key_refs[i],
+                        valid,
+                    },
+                )?;
+            }
 
-        core_fit(family, &cfg, &view)
-    })();
+            core_fit(family, &cfg, &view)
+        },
+    );
 
     match result {
         Ok(fit) => {
@@ -327,20 +332,22 @@ pub unsafe extern "C" fn anofox_bayes_ffi_fit_rows(
         return 0;
     }
 
-    let mut written = 0;
-    while written < max {
-        let Some(row) = fit.fit.posterior.row_at(offset + written) else {
-            break;
-        };
-        *out_model_id.add(written) = BayesStr::from(row.model_id);
-        *out_group_id.add(written) = BayesStr::from(row.group_id);
-        *out_chain.add(written) = row.chain;
-        *out_draw.add(written) = row.draw;
-        *out_param.add(written) = BayesStr::from(row.param);
-        *out_value.add(written) = row.value;
-        written += 1;
-    }
-    written
+    crate::guard(0, || {
+        let mut written = 0;
+        while written < max {
+            let Some(row) = fit.fit.posterior.row_at(offset + written) else {
+                break;
+            };
+            *out_model_id.add(written) = BayesStr::from(row.model_id);
+            *out_group_id.add(written) = BayesStr::from(row.group_id);
+            *out_chain.add(written) = row.chain;
+            *out_draw.add(written) = row.draw;
+            *out_param.add(written) = BayesStr::from(row.param);
+            *out_value.add(written) = row.value;
+            written += 1;
+        }
+        written
+    })
 }
 
 /// The fit's status code, and its reasons joined by newlines.

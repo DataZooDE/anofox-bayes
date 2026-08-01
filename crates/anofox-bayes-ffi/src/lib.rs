@@ -15,6 +15,35 @@
 mod fit;
 pub use fit::*;
 
+/// Run `body`, converting a panic into `fallback` instead of letting it escape.
+///
+/// **Every `extern "C"` function in this crate must go through this.** A Rust panic
+/// that unwinds across an FFI boundary is undefined behaviour — not "probably fine",
+/// not "aborts cleanly", but UB — and the boundary here is a C++ DuckDB process
+/// belonging to a customer. The mathematics is panic-free by intent, but "by intent"
+/// is not a guarantee: a slice index or an arithmetic overflow anywhere in the call
+/// graph would do it, and the call graph is the entire core crate.
+///
+/// The panic message is printed to stderr before being swallowed, so a bug still
+/// leaves evidence rather than silently becoming a null return.
+///
+/// `AssertUnwindSafe` is warranted because every one of these functions either owns
+/// its state exclusively for the call or works through raw pointers whose invariants
+/// the caller already guarantees; there is no shared Rust-side state that a partial
+/// unwind could leave inconsistent.
+pub(crate) fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!(
+                "anofox_bayes: a panic was caught at the FFI boundary and converted \
+                 into a failure. This is a bug -- please report it."
+            );
+            fallback
+        }
+    }
+}
+
 use anofox_bayes_core::{diagnostics, DRAWS_SCHEMA_VERSION};
 use std::os::raw::c_char;
 
@@ -86,33 +115,34 @@ pub unsafe extern "C" fn anofox_bayes_ffi_diagnostic(
     let chains = std::slice::from_raw_parts(chains, n);
     let draws = std::slice::from_raw_parts(draws, n);
 
-    let ordered = diagnostics::chains_from_rows(values, chains, draws);
-    if ordered.is_empty() {
-        return true;
-    }
+    let computed = guard(None, || {
+        let ordered = diagnostics::chains_from_rows(values, chains, draws);
+        if ordered.is_empty() {
+            return Some(None);
+        }
+        match kind {
+            DIAGNOSTIC_RHAT => Some(diagnostics::rhat(&ordered)),
+            DIAGNOSTIC_ESS_BULK => Some(defined_if_positive(diagnostics::ess_bulk(&ordered))),
+            DIAGNOSTIC_ESS_TAIL => Some(defined_if_positive(diagnostics::ess_tail(&ordered))),
+            _ => None,
+        }
+    });
 
-    match kind {
-        DIAGNOSTIC_RHAT => {
-            if let Some(r) = diagnostics::rhat(&ordered) {
-                *out_value = r;
-                *out_defined = true;
-            }
+    match computed {
+        // Unknown kind, or a panic: a misuse the caller must hear about.
+        None => false,
+        Some(None) => true,
+        Some(Some(value)) => {
+            *out_value = value;
+            *out_defined = true;
+            true
         }
-        DIAGNOSTIC_ESS_BULK | DIAGNOSTIC_ESS_TAIL => {
-            let ess = if kind == DIAGNOSTIC_ESS_BULK {
-                diagnostics::ess_bulk(&ordered)
-            } else {
-                diagnostics::ess_tail(&ordered)
-            };
-            // Zero is this estimator's "not assessable" signal, not a measurement.
-            if ess > 0.0 {
-                *out_value = ess;
-                *out_defined = true;
-            }
-        }
-        _ => return false,
     }
-    true
+}
+
+/// Zero is the ESS estimator's "not assessable" signal, not a measurement.
+fn defined_if_positive(ess: f64) -> Option<f64> {
+    (ess > 0.0).then_some(ess)
 }
 
 #[cfg(test)]
@@ -128,6 +158,22 @@ mod tests {
         // Safe: the pointer comes from a `concat!` literal with an explicit NUL.
         let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
         assert_eq!(s, VERSION);
+    }
+
+    /// The guard is the only thing standing between a bug in the core and undefined
+    /// behaviour in a customer's DuckDB process, so it is worth proving it fires
+    /// rather than assuming it does. Panic output is silenced for the duration so a
+    /// passing test run does not print an alarming backtrace.
+    #[test]
+    fn the_ffi_guard_converts_a_panic_into_its_fallback() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = guard(-1i32, || panic!("simulated bug in the core"));
+        std::panic::set_hook(previous);
+
+        assert_eq!(caught, -1, "a panic must become the fallback, not unwind");
+        // ...and the happy path is untouched.
+        assert_eq!(guard(-1i32, || 7), 7);
     }
 
     #[test]
