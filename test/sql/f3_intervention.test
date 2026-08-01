@@ -1,0 +1,211 @@
+# name: test/sql/f3_intervention.test
+# description: F3 pooled Gaussian linear, exercised as the intervention-evaluation agent
+# group: [sql]
+
+require anofox_bayes
+
+#######################################
+# Setup: a difference-in-differences panel
+#######################################
+
+# Twelve stores over 24 months. Six get a merchandising change in month 12; six do
+# not. Both groups share a seasonal pattern and a mild upward trend, so a naive
+# before/after comparison would credit the intervention with the trend as well --
+# which is exactly what difference-in-differences exists to avoid.
+#
+# The true incremental effect is +8.0 units per store-month.
+statement ok
+CREATE TABLE panel AS
+SELECT
+    'S' || lpad(s::VARCHAR, 2, '0')      AS store,
+    m                                     AS month,
+    (s < 6)::INTEGER                      AS treated,
+    (m >= 12)::INTEGER                    AS post,
+    ((s < 6) AND (m >= 12))::INTEGER      AS treated_post,
+    100.0
+      + 0.8 * m                                  -- shared trend
+      + 6.0 * sin(m * 2 * pi() / 12)             -- shared seasonality
+      + 5.0 * s                                  -- persistent store level
+      + CASE WHEN s < 6 AND m >= 12 THEN 8.0 ELSE 0.0 END  -- the intervention
+      + ((s * 7 + m * 3) % 5 - 2) * 0.4          -- deterministic idiosyncratic noise
+    AS units
+FROM generate_series(0, 11) AS a(s), generate_series(0, 23) AS b(m);
+
+#######################################
+# Fit: the diff-in-diff regression
+#######################################
+
+# The coefficient on treated_post *is* the causal effect. Store-level intercepts are
+# partially pooled so a store with a short history borrows strength from the rest
+# rather than contributing noise.
+#
+# `treated` is deliberately NOT a predictor: with a store effect per store, treatment
+# status is a function of the store and its main effect is not separately identified.
+# Including it would leave the two trading off against each other, which is the
+# textbook specification error in a panel diff-in-diff. The interaction remains
+# identified, which is the term the decision actually rests on.
+statement ok
+CREATE TABLE dd AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, units, treated, post, treated_post, month FROM panel),
+    'pooled_gaussian',
+    {'y': 'units',
+     'x': ['post', 'treated_post', 'month'],
+     'group': 'store',
+     'pool_scale': 20.0,
+     'draws': 4000,
+     'seed': 42}
+);
+
+query I
+SELECT value = 0 FROM dd WHERE param = '__status__';
+----
+true
+
+query I
+SELECT value FROM dd WHERE param = '__n_obs__';
+----
+288.0
+
+# Distinct parameter names: intercept, three slopes, the shared group_effect name,
+# and sigma.
+query I
+SELECT count(DISTINCT param) FROM dd WHERE draw >= 0;
+----
+6
+
+#######################################
+# The decision: how much of the change was the intervention?
+#######################################
+
+# The posterior for the interaction term is the effect estimate, with its interval.
+# The true value is 8.0, and the 95% credible interval must cover it while excluding
+# zero. The interval is asserted as a property rather than as three literals: its
+# width is a function of the residual variance, so pinning digits would make the test
+# brittle against changes that are not regressions.
+query IIII
+SELECT round(quantile_cont(value, 0.500), 1) AS effect,
+       quantile_cont(value, 0.025) < 8.0 AS covers_below,
+       quantile_cont(value, 0.975) > 8.0 AS covers_above,
+       quantile_cont(value, 0.025) > 0.0 AS excludes_zero
+FROM dd WHERE param = 'beta[treated_post]' AND draw >= 0;
+----
+8.0	true	true	true
+
+# P(effect > 0): the question a decision-maker actually asks, answered directly from
+# the draws with no p-value in sight.
+query I
+SELECT avg(CASE WHEN value > 0 THEN 1.0 ELSE 0.0 END) = 1.0
+FROM dd WHERE param = 'beta[treated_post]' AND draw >= 0;
+----
+true
+
+# ...and the sharper commercial question: is the effect big enough to be worth the
+# rollout cost of 5 units per store-month?
+query I
+SELECT avg(CASE WHEN value > 5.0 THEN 1.0 ELSE 0.0 END) > 0.99
+FROM dd WHERE param = 'beta[treated_post]' AND draw >= 0;
+----
+true
+
+# The whole point of the control group. A naive before/after comparison on the
+# treated stores alone credits the intervention with the shared trend as well, and
+# overstates the effect by more than half; the diff-in-diff estimate does not.
+query II
+SELECT round((SELECT avg(units) FILTER (WHERE post = 1) - avg(units) FILTER (WHERE post = 0)
+              FROM panel WHERE treated = 1), 1) AS naive,
+       round((SELECT median(value) FROM dd WHERE param = 'beta[treated_post]' AND draw >= 0), 1) AS diff_in_diff;
+----
+17.6	8.0
+
+#######################################
+# Placebo: the same design with no intervention
+#######################################
+
+# Run the identical model on the control stores alone, with a fake intervention date.
+# A method that finds an effect here is finding an artefact of the specification, so
+# the credible interval must straddle zero.
+statement ok
+CREATE TABLE placebo AS
+SELECT store, units, month,
+       (store IN ('S06', 'S07', 'S08'))::INTEGER AS treated,
+       (month >= 12)::INTEGER AS post,
+       ((store IN ('S06', 'S07', 'S08')) AND month >= 12)::INTEGER AS treated_post
+FROM panel WHERE treated = 0;
+
+query I
+SELECT quantile_cont(value, 0.025) < 0 AND quantile_cont(value, 0.975) > 0
+FROM anofox_bayes_fit(
+    (SELECT store, units, treated, post, treated_post, month FROM placebo),
+    'pooled_gaussian',
+    {'y': 'units', 'x': ['post', 'treated_post', 'month'],
+     'group': 'store', 'pool_scale': 20.0, 'draws': 4000, 'seed': 42})
+WHERE param = 'beta[treated_post]' AND draw >= 0;
+----
+true
+
+#######################################
+# Diagnostics gate
+#######################################
+
+query I
+SELECT count(*) FROM (
+    SELECT group_id, param
+    FROM dd WHERE draw >= 0
+    GROUP BY group_id, param
+    HAVING anofox_bayes_ess_bulk(value, chain, draw) < 400
+        OR anofox_bayes_ess_tail(value, chain, draw) < 400
+);
+----
+0
+
+#######################################
+# Refusal: a design that cannot answer the question
+#######################################
+
+# Without a control group, `treated` is constant and `treated_post` is identical to
+# `post`. There is no way to separate the intervention from the trend, and the model
+# says so instead of reporting whichever of the infinitely many answers it hit first.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT store, units, treated, post, treated_post, month FROM panel WHERE treated = 1),
+    'pooled_gaussian',
+    {'y': 'units', 'x': ['post', 'treated_post'], 'draws': 500});
+----
+singular or rank-deficient
+
+# A perfectly explained response leaves no residual variance to estimate, so the fit
+# is degenerate rather than infinitely confident.
+statement ok
+CREATE TABLE exact_line AS
+SELECT i AS x, 2.0 + 3.0 * i AS y FROM generate_series(0, 9) AS t(i);
+
+query I
+SELECT value FROM anofox_bayes_fit(
+    (SELECT x, y FROM exact_line), 'pooled_gaussian',
+    {'y': 'y', 'x': 'x', 'draws': 100})
+WHERE param = '__status__';
+----
+1.0
+
+query I
+SELECT bool_and(value IS NULL) FROM anofox_bayes_fit(
+    (SELECT x, y FROM exact_line), 'pooled_gaussian',
+    {'y': 'y', 'x': 'x', 'draws': 100})
+WHERE draw >= 0;
+----
+true
+
+#######################################
+# Both families share one interface
+#######################################
+
+# The caller's SQL differs only in the family name and its config slots; the output
+# contract, the diagnostics and the gate are identical.
+query I
+SELECT count(*) = 6 FROM (
+    DESCRIBE SELECT * FROM anofox_bayes_fit(
+        (SELECT units FROM panel), 'pooled_gaussian', {'y': 'units', 'draws': 100})
+);
+----
+true
