@@ -15,9 +15,9 @@ This document is the plan for the other five, plus the defects in what already s
 ## 1. The gaps
 
 Originally ranked by agents unblocked per engineer-day; the table now records **state**,
-since most of it is done. Ten of the fourteen are closed — three of those with a named
-remainder rather than cleanly — two are in progress, and two are unstarted with their
-estimates revised. Where an estimate turned out wrong it says so; the point of writing
+since most of it is done. Eleven of the fourteen are closed — three of those with a
+named remainder rather than cleanly, and one closed by deciding not to build it (§3.4)
+— two are in progress, and one is unstarted. Where an estimate turned out wrong it says so; the point of writing
 them down was to find out.
 
 | # | Gap | Agents | State | Remaining |
@@ -29,8 +29,8 @@ them down was to find out.
 | 5 | Per-group variance + learned pooling scale | 04, 06 | In progress — a new family, non-centred, on Laplace + NUTS | — |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | **Done.** Pinned `=0.18.3`; byte-identical across thread counts | — |
 | 7 | F1 hierarchical negative binomial | 01 | In progress — bridged path assessed first, per the deferral | — |
-| 8 | F4 payment delay, native | 04 | Not started. `pooled_gaussian` on log-delay is already a lognormal model | 8–12 d, after gaps 4 and 5 |
-| 9 | F6 hierarchical elasticity, native | 06 | Not started. Largely covered by random slopes, which is what elasticity needs | 6–10 d, and re-estimate — gap 4 took most of it |
+| 8 | F4 payment delay, native | 04 | Not started, and the same question as §3.4 applies: `pooled_gaussian` on log-delay is already a lognormal model, and `censored_aft` covers the case where some invoices have not been paid yet | Decide before building; 8–12 d if built |
+| 9 | F6 hierarchical elasticity, native | 06 | **Closed without building it** — random slopes on a log-log model *are* hierarchical elasticity. Reasoning in §3.4 | — |
 | 10 | `conjugate_anomaly` has no `as_differentiable` | none | **Done.** All three engines now serve it, so a closed form has three independent derivations | — |
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | **Done.** `__group_status__` names the refused groups; the collapsed verdict is deliberately unchanged | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | **Done.** `sample_from: 'prior'`, refused unless the prior is proper | — |
@@ -440,6 +440,42 @@ make. Shrinking group deviations toward a common mean is the random-slope struct
 right, since `pooled_gaussian` is also hierarchical. Decide before the config surface is
 public — a family id feeds `model_id`, so renaming one invalidates every persisted fit.
 
+### 3.4 Is a native elasticity family (F6) worth building, now that random slopes ship?
+
+**Recommendation: no. Close it, and say why loudly enough that it is not reopened by
+default.**
+
+A constant-elasticity demand model is `log(units) = a_s + b_s · log(price)`, and `b_s`
+— how much volume a price move costs — is the decision. That is a linear model in logs
+with a per-group slope, which is exactly what `pooled_gaussian` with `random_slopes`
+now fits. It is not an approximation of F6; it is F6, spelled in the columns the caller
+already has. The recipe is in [the Guide](GUIDE.md), and
+`test/sql/f3_price_elasticity.test` is its executable specification: eight stores whose
+true elasticities span −2.3 to −0.9, seven recovered within 0.15, and a five-week store
+pulled from its own −0.9 toward the population with a 1.5× wider interval.
+
+So a native F6 would be `pooled_gaussian` with `log()` applied for you. Against that:
+
+*It would split one model across two family ids.* `model_id` includes the family, so
+identical mathematics under two names produces two ids, two caches, and two bodies of
+calibration evidence for one posterior. §3.3 rejected the mirror image of this — one
+family with two warranties — for the same reason: a family is a fixed set of
+parameterisation decisions **with one calibration story**.
+
+*The one thing it could add that `pooled_gaussian` cannot express is a sign
+constraint*, elasticity < 0. That needs a truncated prior, which is not conjugate — so
+it costs the exact engine, and buys a new SBC suite and a second warranty. It is also a
+claim about the world nobody asked us to make, which is the objection this document
+already raises against `beta_scale`. And it is the wrong remedy: a measured *positive*
+elasticity is almost always confounding — a promotion, a stockout, a price change that
+followed demand rather than led it — so constraining the sign hides the diagnostic
+instead of fixing the data.
+
+**What would change this:** a customer needing elasticity on a likelihood
+`pooled_gaussian` does not have — count data with a log link, say, where the response
+cannot be logged because it is sometimes zero. That is a different likelihood rather
+than a different family for the same one, and it would be scoped as such.
+
 ### Known gap: the counterfactual suite does not run in CI
 
 `test/sql/scenario_counterfactual.test` is a specification rather than a running test.
@@ -518,6 +554,10 @@ nutpie. We write the adapter and nothing below it.
 
 **Gaussian processes, state-space models, time-varying parameters.** No agent needs
 them; `anofox-forecast` covers time-series intervals.
+
+**A native elasticity family.** See §3.4 — random slopes on a log-log model are
+hierarchical elasticity, and a second family id for the same mathematics splits
+`model_id`, the cache and the calibration evidence to save a `log()`.
 
 **An `anofox_bayes_predict` table function.** Not a scheduling decision: DuckDB permits
 at most one subquery parameter per table function, so a function taking both draws and
