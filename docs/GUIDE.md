@@ -32,6 +32,7 @@ background.
 Ten rows, one query, an answer you can read.
 
 ```sql
+INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';   -- start duckdb with -unsigned
 LOAD anofox_bayes;
 
 CREATE TABLE sales(region VARCHAR, units DOUBLE);

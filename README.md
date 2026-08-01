@@ -13,6 +13,7 @@ every downstream question — intervals, probabilities, service levels, what-ifs
 plain SQL. No Python, no sampler sidecar.
 
 ```sql
+INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';   -- start duckdb with -unsigned
 LOAD anofox_bayes;
 
 CREATE TABLE sales(region VARCHAR, units DOUBLE);
@@ -42,10 +43,6 @@ GROUP BY region ORDER BY region;
 ```
 
 A 95 % credible interval per region, from ten rows of data and one query.
-
-> **To run that today you have to build from source** — there are no published
-> binaries yet, and the first build compiles DuckDB, so budget 30–60 minutes.
-> [Details below](#install).
 
 **→ [User Guide](docs/GUIDE.md)** — task-oriented: get your table into shape, find an
 anomaly, measure an intervention, set a service level, check the fit.
@@ -80,9 +77,19 @@ measurement. See [the roadmap](#roadmap).
 
 ## Install
 
-> **No binaries are published yet.** The release pipeline and the S3 channel are
-> configured; publishing is blocked on one IAM trust-policy entry — see
-> [docs/RELEASING.md](docs/RELEASING.md). Build from source until then.
+`anofox-bayes` is BSL-licensed, so it is served from the DataZoo channel rather than
+the DuckDB community repository. Binaries are published for DuckDB **v1.4.5 LTS** and
+**v1.5.5**, on linux/macOS/Windows (amd64 + arm64) and WASM.
+
+```sql
+INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';
+LOAD anofox_bayes;
+```
+
+The binaries are **unsigned**, so start DuckDB with `-unsigned` (CLI) or
+`allow_unsigned_extensions` (client libraries).
+
+### From source
 
 ```bash
 git clone --recurse-submodules https://github.com/DataZooDE/anofox-bayes.git
@@ -95,13 +102,6 @@ make release -j$(nproc)      # the first build compiles DuckDB: 30-60 minutes
 
 Needs a stable Rust toolchain, CMake 3.15+, and a C++ compiler. Full development
 setup in [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Once published it will install from the DataZoo channel — `anofox-bayes` is
-BSL-licensed, so it will not go to the DuckDB community repository:
-
-```sql
-INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';   -- not live yet
-```
 
 ## The catalog
 
