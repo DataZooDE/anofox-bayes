@@ -152,4 +152,11 @@ jobs:
           git fetch --tags --force
           export EXT_VERSION=`git tag --points-at HEAD | head -1`
           export EXT_VERSION=${EXT_VERSION:=`git log -1 --format=%h`}
-          ${{ inputs.deploy_script }} ${{ inputs.extension_name }} $EXT_VERSION $DUCKDB_VERSION ${{ matrix.duckdb_arch }} $BUCKET_NAME ${{inputs.deploy_latest || 'true' && 'false'}} ${{inputs.deploy_versioned || 'true' && 'false'}}
+          # Every argument quoted. Unquoted, an empty $BUCKET_NAME simply vanishes
+          # and every later argument shifts one position left -- so the script reads
+          # the `copy_to_latest` flag as the bucket and uploads to a bucket literally
+          # named "true". That is not a hypothetical: it is exactly what this
+          # pipeline did before DEPLOY_S3_BUCKET was set, and the only reason it
+          # failed rather than publishing to a stranger's bucket is that nobody owns
+          # one called "true".
+          ${{ inputs.deploy_script }} "${{ inputs.extension_name }}" "$EXT_VERSION" "$DUCKDB_VERSION" "${{ matrix.duckdb_arch }}" "$BUCKET_NAME" "${{inputs.deploy_latest || 'true' && 'false'}}" "${{inputs.deploy_versioned || 'true' && 'false'}}"

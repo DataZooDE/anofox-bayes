@@ -13,6 +13,31 @@
 
 set -e
 
+# Refuse to run on a malformed invocation.
+#
+# The bucket arrives from a CI variable that may simply not be set. Unquoted, an
+# empty argument disappears and every later one shifts left, so the script would
+# cheerfully upload to a bucket named after whatever flag took its place. Checking
+# the count and the shape costs nothing and turns a silent mis-upload into a refusal.
+if [ "$#" -lt 5 ]; then
+  echo "error: expected at least 5 arguments, got $#." >&2
+  echo "usage: $0 <name> <ext_version> <duckdb_version> <arch> <s3_bucket> [latest] [versioned]" >&2
+  exit 1
+fi
+for arg_index in 1 2 3 4 5; do
+  eval "arg_value=\${$arg_index}"
+  if [ -z "$arg_value" ]; then
+    echo "error: argument $arg_index is empty. Is DEPLOY_S3_BUCKET set on this repository?" >&2
+    exit 1
+  fi
+done
+case "$5" in
+  true|false)
+    echo "error: bucket name is '$5', which is a boolean flag -- the arguments have" >&2
+    echo "       shifted, almost certainly because the bucket variable is unset." >&2
+    exit 1 ;;
+esac
+
 if [[ $4 == wasm* ]]; then
   ext="/tmp/extension/$1.duckdb_extension.wasm"
 else
