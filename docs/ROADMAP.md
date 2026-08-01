@@ -371,6 +371,21 @@ make. Shrinking group deviations toward a common mean is the random-slope struct
 right, since `pooled_gaussian` is also hierarchical. Decide before the config surface is
 public — a family id feeds `model_id`, so renaming one invalidates every persisted fit.
 
+### Known gap: the counterfactual suite does not run in CI
+
+`test/sql/scenario_counterfactual.test` is a specification rather than a running test.
+`require anofox_scenario` *skips* rather than fails when the extension will not load,
+anofox-scenario's binaries are unsigned, and `test/unittest` is a Catch binary with no
+`-unsigned` flag. A skipped suite reports as a pass, so `make test_scenario` now exits
+non-zero on a skip rather than letting it read as green.
+
+Fixing it needs one of two things, neither in this repository: signed anofox-scenario
+binaries, or a `test/unittest` that permits unsigned extensions. What has been verified
+by hand meanwhile: every statement in the suite executes without error with both
+extensions loaded in the shell, and the composition it depends on — fitting from an
+attached scenario catalog, with `model_id` diverging because the data fingerprint
+covers the branch's rows — is directly checked.
+
 ## 4. Quick wins
 
 Under a day each, independent of everything above, each fixing something currently
