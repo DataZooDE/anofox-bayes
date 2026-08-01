@@ -98,6 +98,8 @@ impl FitStatus {
 pub enum FamilyCode {
     /// F3 — pooled Gaussian linear model.
     PooledGaussian = 3,
+    /// F5 — payer-alive / BTYD (BG/NBD).
+    PayerAlive = 5,
     /// F7 — conjugate anomaly (Normal / Poisson closed forms).
     ConjugateAnomaly = 7,
 }
@@ -108,6 +110,7 @@ impl FamilyCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             FamilyCode::PooledGaussian => "pooled_gaussian",
+            FamilyCode::PayerAlive => "payer_alive",
             FamilyCode::ConjugateAnomaly => "conjugate_anomaly",
         }
     }
@@ -116,6 +119,7 @@ impl FamilyCode {
     pub fn from_code(code: i32) -> Option<Self> {
         match code {
             3 => Some(FamilyCode::PooledGaussian),
+            5 => Some(FamilyCode::PayerAlive),
             7 => Some(FamilyCode::ConjugateAnomaly),
             _ => None,
         }
@@ -233,10 +237,16 @@ mod tests {
     #[test]
     fn family_codes_are_stable_and_round_trip() {
         assert_eq!(FamilyCode::PooledGaussian as i32, 3);
+        assert_eq!(FamilyCode::PayerAlive as i32, 5);
         assert_eq!(FamilyCode::ConjugateAnomaly as i32, 7);
-        for code in [FamilyCode::PooledGaussian, FamilyCode::ConjugateAnomaly] {
+        for code in [
+            FamilyCode::PooledGaussian,
+            FamilyCode::PayerAlive,
+            FamilyCode::ConjugateAnomaly,
+        ] {
             assert_eq!(FamilyCode::from_code(code as i32), Some(code));
         }
+        assert_eq!(FamilyCode::PayerAlive.as_str(), "payer_alive");
         // The gaps are families the catalog does not ship, not aliases for one it
         // does -- decoding one must fail rather than pick a neighbour.
         assert_eq!(FamilyCode::from_code(1), None);

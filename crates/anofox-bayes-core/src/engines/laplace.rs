@@ -49,6 +49,57 @@ pub struct LaplaceEngine;
 const MAX_NEWTON: u32 = 100;
 const GRAD_TOLERANCE: f64 = 1e-8;
 
+/// Relative improvement in the log density below which the search has finished.
+///
+/// [`GRAD_TOLERANCE`] alone is not a sufficient stopping rule, and the reason is
+/// arithmetic rather than modelling. The gradient of a log posterior is a **sum over
+/// observations**, so its rounding error grows with the sample: `pooled_gaussian`
+/// reaches an absolute `1e-8` because its gradient is assembled from precomputed
+/// sufficient statistics, while a family that walks its observations — `payer_alive`
+/// evaluates a log-gamma per customer — carries a noise floor nearer `1e-9 * n`. Above
+/// a few thousand rows that floor sits *above* `1e-8`, and a search that has genuinely
+/// arrived would spend its whole iteration budget taking steps of no consequence and
+/// then report `ConvergenceFailure` on a perfectly good fit.
+///
+/// So the search also stops when a step it accepted moved the log density by less than
+/// this fraction of its own magnitude: no further improvement is available, whatever
+/// the gradient's last few digits say. The two rules are complementary — the gradient
+/// test proves stationarity, this one proves exhaustion — and a family that needs to
+/// know *which* one fired checks the gradient itself afterwards, as
+/// [`crate::catalog::f5_btyd`] does.
+const IMPROVEMENT_TOLERANCE: f64 = 1e-12;
+
+/// How far a single Newton step may move a coordinate, relative to that coordinate's
+/// own magnitude.
+///
+/// A trust region, and the reason for it is that a backtracking line search is not by
+/// itself enough: it only ever *shrinks* a step that made things worse, and a step
+/// that lands somewhere higher is accepted however far away it is. Where the surface
+/// is nearly flat the Newton step is proportionally enormous, so an unguarded first
+/// iteration can leap across the parameter space into a *local* optimum, improve the
+/// density on arrival, and never come back.
+///
+/// That is not hypothetical. Measured on `payer_alive`: from the conventional
+/// `a = b = 1` start, the first step moved `ln a` by +14.6 — a factor of two million —
+/// onto the flat ridge where the dropout probability is effectively zero, and the
+/// search then sat there. The log posterior at that point was **248 lower** than at
+/// the true mode, which the same search reaches without difficulty when started
+/// nearby. The family had no way to tell that from a genuine boundary solution, so a
+/// perfectly ordinary customer base came back as `degenerate`.
+///
+/// Capping at twice a coordinate's own size costs a handful of extra iterations on a
+/// well-behaved surface and cannot cost anything on one already at its mode — the step
+/// is then zero. `pooled_gaussian` starts its search *at* the analytic mode, so this
+/// never binds there.
+///
+/// The regression test lives with the family that exposed it —
+/// `f5_btyd::tests::a_larger_base_does_not_become_harder_to_fit_than_a_smaller_one`.
+/// A synthetic one-dimensional fixture was tried and abandoned: on every two-optimum
+/// curve of that shape the line search alone recovers, and the failure needs the flat
+/// four-dimensional ridge of a real BG/NBD surface to appear at all. A fixture that
+/// passes with the guard removed would have been worse than none.
+const MAX_NEWTON_STEP: f64 = 2.0;
+
 impl Engine for LaplaceEngine {
     fn kind(&self) -> EngineKind {
         EngineKind::Laplace
@@ -110,7 +161,35 @@ impl Engine for LaplaceEngine {
 /// lower, and an unguarded iteration then oscillates or diverges. Halving the step
 /// until the density actually improves costs a few extra evaluations and removes the
 /// failure mode entirely.
-fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
+///
+/// Visible to the crate, not only to this engine, because a family whose likelihood
+/// has boundary solutions has to run this search itself at compile time and *inspect
+/// the answer* before an engine acts on it — see
+/// [`crate::catalog::f5_btyd`]. Two copies of a Newton loop would be two things to
+/// keep in step, and the one that mattered would be the one nobody looked at.
+pub(crate) fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
+    let (theta, converged) = find_mode_best_effort(target)?;
+    if converged {
+        Ok(theta)
+    } else {
+        Err(BayesError::ConvergenceFailure {
+            iterations: MAX_NEWTON,
+            tolerance: GRAD_TOLERANCE,
+        })
+    }
+}
+
+/// The same search, returning the best point reached and whether it settled.
+///
+/// [`find_mode`] discards the point when the budget runs out, which is right for an
+/// engine: a search that did not settle has nothing an engine should sample around.
+/// It is wrong for a family that must *classify* its own failure. `payer_alive`
+/// applies four tests to the point it gets — is it inside the admissible range, is it
+/// stationary, does its curvature factor, is the implied marginal an interval at all —
+/// and every one of those is more informative about what went wrong than "ran out of
+/// iterations". Handing back the point lets the family say which, and lets a slow but
+/// perfectly sound convergence on a large dataset be recognised as one.
+pub(crate) fn find_mode_best_effort(target: &dyn LogPosterior) -> BayesResult<(Vec<f64>, bool)> {
     let dim = target.dim();
     let mut theta = target.initial();
     if theta.len() != dim {
@@ -130,7 +209,7 @@ fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
             ));
         }
         if norm < GRAD_TOLERANCE {
-            return Ok(theta);
+            return Ok((theta, true));
         }
 
         let hessian = negative_hessian(target, &theta)?;
@@ -141,15 +220,35 @@ fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
             Err(_) => grad.clone(),
         };
 
+        // Trust region: shrink the whole step until no coordinate moves further than
+        // `MAX_NEWTON_STEP` times its own magnitude. Applied before the line search,
+        // which can only shrink a step that made things worse and would happily accept
+        // a leap into a distant local optimum that happened to be higher.
+        let overreach = (0..dim)
+            .map(|j| step[j].abs() / theta[j].abs().max(1.0))
+            .fold(0.0f64, f64::max);
+
         let before = target.logp(&theta);
-        let mut scale = 1.0;
+        let mut scale = if overreach > MAX_NEWTON_STEP {
+            MAX_NEWTON_STEP / overreach
+        } else {
+            1.0
+        };
         let mut accepted = false;
         for _ in 0..40 {
             let candidate: Vec<f64> = (0..dim).map(|j| theta[j] + scale * step[j]).collect();
             let after = target.logp(&candidate);
             if after.is_finite() && after >= before {
+                let gained = after - before;
                 theta = candidate;
                 accepted = true;
+                // Arrived: the best step available buys nothing. See
+                // `IMPROVEMENT_TOLERANCE` -- without this the search burns its whole
+                // budget on steps of no consequence and then calls a good fit a
+                // convergence failure.
+                if gained <= IMPROVEMENT_TOLERANCE * before.abs().max(1.0) {
+                    return Ok((theta, true));
+                }
                 break;
             }
             scale *= 0.5;
@@ -157,14 +256,11 @@ fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
         if !accepted {
             // No improving step exists in this direction: already at the mode to
             // within floating-point resolution.
-            return Ok(theta);
+            return Ok((theta, true));
         }
     }
 
-    Err(BayesError::ConvergenceFailure {
-        iterations: MAX_NEWTON,
-        tolerance: GRAD_TOLERANCE,
-    })
+    Ok((theta, false))
 }
 
 /// `-d2 logp / dtheta2`, by central differences of the analytic gradient.
@@ -173,7 +269,7 @@ fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
 /// millions and a log-scale parameter of order one both get a sensible perturbation.
 /// The result is symmetrised, because differencing produces a matrix that is only
 /// symmetric up to rounding and Cholesky assumes exactly symmetric input.
-fn negative_hessian(target: &dyn LogPosterior, theta: &[f64]) -> BayesResult<Mat<f64>> {
+pub(crate) fn negative_hessian(target: &dyn LogPosterior, theta: &[f64]) -> BayesResult<Mat<f64>> {
     let dim = target.dim();
     let mut h: Mat<f64> = Mat::zeros(dim, dim);
     let mut plus = vec![0.0; dim];

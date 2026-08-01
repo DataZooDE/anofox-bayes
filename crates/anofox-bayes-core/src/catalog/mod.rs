@@ -17,6 +17,7 @@
 //! Adding an engine touches no family. Adding a family touches no engine.
 
 pub mod f3_pooled_gaussian;
+pub mod f5_btyd;
 pub mod f7_conjugate;
 
 use crate::config::Config;
@@ -236,6 +237,7 @@ pub fn lookup(id: &str) -> BayesResult<&'static dyn ModelFamily> {
 pub fn all() -> &'static [&'static dyn ModelFamily] {
     const FAMILIES: &[&dyn ModelFamily] = &[
         &f3_pooled_gaussian::PooledGaussian,
+        &f5_btyd::PayerAlive,
         &f7_conjugate::ConjugateAnomaly,
     ];
     FAMILIES

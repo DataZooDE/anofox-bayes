@@ -72,8 +72,8 @@ catalog of model families and tune documented options; you cannot write your own
 likelihood. That restriction is what lets each family ship with fixed parameterisation
 decisions, a validated config schema and its own calibration suite.
 
-Today the catalog is two families — enough for anomaly detection and intervention
-measurement. See [the roadmap](#roadmap).
+Today the catalog is three families — enough for anomaly detection, intervention
+measurement and customer-churn scoring. See [the roadmap](#roadmap).
 
 ## Install
 
@@ -109,12 +109,14 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 |---|---|---|
 | `conjugate_anomaly` | A level or rate per group; anomaly detection | `mu`, `sigma` (Normal) or `lambda` (Poisson) |
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
+| `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by
-predictors → `pooled_gaussian`.**
+predictors → `pooled_gaussian`; a repeat-purchase history and a churn question →
+`payer_alive`.**
 
 Planned, and *not* present today: hierarchical negative-binomial (F1), censored
-survival (F2), payment delay (F4), payer-alive/BTYD (F5), elasticity (F6), and the
+survival (F2), payment delay (F4), elasticity (F6), and the
 NUTS engine. See [the roadmap](#roadmap).
 
 There is deliberately **no `predict` function** — posterior prediction is a join over
@@ -156,7 +158,7 @@ test suite, so they cannot drift from the implementation.
 
 | | |
 |---|---|
-| **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, exact + Laplace engines, diagnostics, calibration suites |
+| **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, `payer_alive`, exact + Laplace engines, diagnostics, calibration suites |
 | v0.2 | NUTS engine, hierarchical negative-binomial (F1), censored survival (F2) |
 | v0.3 | Payment delay, BTYD, elasticity families; scenario integration |
 

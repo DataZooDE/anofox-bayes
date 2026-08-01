@@ -25,7 +25,8 @@ tables persisted by a customer stay readable across extension upgrades.
 **Draws contract**
 
 - `__family__` — which catalog family produced the table, as its BRD F-number
-  (`3` = `pooled_gaussian`, `7` = `conjugate_anomaly`). The `value` column is `DOUBLE`,
+  (`3` = `pooled_gaussian`, `5` = `payer_alive`, `7` = `conjugate_anomaly`). The
+  `value` column is `DOUBLE`,
   so the name cannot travel; reusing the existing F-numbering rather than minting a
   second one keeps one identity per family. Append-only, like `FitStatus` and
   `EngineKind`.
@@ -47,13 +48,38 @@ tables persisted by a customer stay readable across extension upgrades.
 - **F3 `pooled_gaussian`** — conjugate Gaussian linear model with optional partial
   pooling by group; the inference layer for difference-in-differences and interrupted
   time series. Serves the intervention-evaluation agent.
+- **F5 `payer_alive`** — BG/NBD buy-till-you-die over per-customer
+  `(frequency, recency, age)` statistics, estimating four population parameters.
+  Serves the collections agent. Its `P(alive)` is closed form and **expressible in
+  SQL**, so a fitted model rescores any customer list with a join and no re-fit —
+  which is why the family is BG/NBD and not Pareto/NBD, whose `P(alive)` needs a
+  hypergeometric function no database has (roadmap §3.2, §5).
+
+  Boundary solutions are a documented hazard of this likelihood: where no repeat
+  buyer has been seen to go quiet, it has no interior maximum. The family therefore
+  finds its own mode at compile time and applies four checks to it — admissible
+  range, stationarity, positive-definite curvature, and a marginal narrow enough to
+  be an interval — reporting `degenerate` with `NULL` draws rather than an interval
+  derived from curvature that is not a posterior.
 
 **Engines**
 
 - `exact` — closed-form sampling for conjugate families; the default for both.
 - `laplace` — MAP plus curvature on an unconstrained scale, available on
-  `pooled_gaussian`. Checked against the exact posterior, which is the strongest
-  correctness gate in the suite: two independent derivations of one distribution.
+  `pooled_gaussian` and the only engine for `payer_alive`. On `pooled_gaussian` it is
+  checked against the exact posterior, which is the strongest correctness gate in the
+  suite: two independent derivations of one distribution.
+- The Newton search gained two globalisations, both found by building F5 and both
+  fixing behaviour that was wrong rather than merely absent:
+  - a **trust region** on the step. A backtracking line search only shrinks a step
+    that made things worse, so a step landing in a distant *local* optimum was
+    accepted. Measured: from `a = b = 1`, F5's first step moved `ln a` by +14.6 onto a
+    flat ridge whose density was 248 lower than the true mode.
+  - a **relative stopping rule** on the improvement in log density. The absolute
+    `1e-8` gradient tolerance is unreachable for a likelihood summed over thousands of
+    rows, where rounding error alone exceeds it, so a good fit exhausted its iteration
+    budget and reported a convergence failure. F5's stationarity check scales with the
+    number of customers for the same reason.
 
 **Validation**
 
