@@ -175,6 +175,21 @@ pub trait CompiledModel: std::fmt::Debug {
         }
     }
 
+    /// Which groups were refused, and with what verdict.
+    ///
+    /// `n_groups_unready` says how many; this says which, so an agent holding a
+    /// 5 000-lane fit can quarantine the three bad lanes rather than the whole table.
+    /// The model-level status stays the collapsed worst case — that doctrine is
+    /// deliberate and unchanged — and this is the detail it collapses.
+    ///
+    /// Defaults to empty rather than to "all of them". A family that fits one joint
+    /// design cannot honestly single out a group, and naming every group as unready
+    /// would be a list an agent could act on wrongly; `n_groups_unready` already tells
+    /// it the refusal implicates everything.
+    fn unready_groups(&self) -> Vec<(String, crate::types::FitStatus)> {
+        Vec::new()
+    }
+
     /// Closed-form sampling, when the family is conjugate.
     ///
     /// Returning `None` is how a family declines the exact engine; the engine then

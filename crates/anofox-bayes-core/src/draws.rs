@@ -44,6 +44,9 @@ pub const META_N_CHAINS: &str = "__n_chains__";
 pub const META_N_DRAWS: &str = "__n_draws__";
 pub const META_SCHEMA_VERSION: &str = "__schema_version__";
 pub const META_SAMPLE_FROM: &str = "__sample_from__";
+/// Per-group readiness. Unlike every other reserved metadata row this one is emitted
+/// once *per unready group* and carries that group's key in `group_id`.
+pub const META_GROUP_STATUS: &str = "__group_status__";
 
 /// Sentinel chain/draw index for model-level metadata rows.
 ///
@@ -154,6 +157,9 @@ pub struct Posterior {
     /// Per `(chain, draw)`, in the same order as `values`. Empty when no engine
     /// reported statistics.
     stats: Vec<SampleStats>,
+    /// Groups the family refused, and why, in the order the family reported them.
+    /// Empty for a fit with nothing to quarantine.
+    unready: Vec<(String, FitStatus)>,
 }
 
 impl Posterior {
@@ -170,6 +176,25 @@ impl Posterior {
         n_draws: usize,
         values: Vec<f64>,
         stats: Vec<SampleStats>,
+    ) -> BayesResult<Self> {
+        Self::with_unready(meta, params, n_chains, n_draws, values, stats, Vec::new())
+    }
+
+    /// As [`Posterior::new`], naming the groups the family refused.
+    ///
+    /// `Readiness::worst` collapses per-group verdicts into one and still should: a fit
+    /// covering 5 000 lanes of which three are unidentifiable is not 99.4 % trustworthy,
+    /// it is a fit an agent must look at. But "look at" needs somewhere to look, and
+    /// `__n_groups_unready__` only says how many. These rows say *which*, so an agent
+    /// holding a 5 000-lane table can quarantine three lanes instead of the fit.
+    pub fn with_unready(
+        meta: ModelMeta,
+        params: Vec<ParamName>,
+        n_chains: usize,
+        n_draws: usize,
+        values: Vec<f64>,
+        stats: Vec<SampleStats>,
+        unready: Vec<(String, FitStatus)>,
     ) -> BayesResult<Self> {
         let expected = n_chains * n_draws * params.len();
         if values.len() != expected {
@@ -214,7 +239,13 @@ impl Posterior {
             n_draws,
             values,
             stats,
+            unready,
         })
+    }
+
+    /// Rows that precede the draws: model metadata, then one row per unready group.
+    fn header_rows(&self) -> usize {
+        META_ROWS.len() + self.unready.len()
     }
 
     pub fn n_params(&self) -> usize {
@@ -270,7 +301,8 @@ impl Posterior {
 
     /// Total rows this posterior renders to in the long format.
     pub fn n_rows(&self) -> usize {
-        META_ROWS.len() + self.n_chains * self.n_draws * (self.n_params() + self.stats_per_draw())
+        self.header_rows()
+            + self.n_chains * self.n_draws * (self.n_params() + self.stats_per_draw())
     }
 
     /// The row at a linear index, in O(1).
@@ -293,12 +325,23 @@ impl Posterior {
                 value,
             });
         }
+        if index < self.header_rows() {
+            let (group_id, status) = &self.unready[index - META_ROWS.len()];
+            return Some(DrawRow {
+                model_id,
+                group_id,
+                chain: META_INDEX,
+                draw: META_INDEX,
+                param: META_GROUP_STATUS,
+                value: *status as i32 as f64,
+            });
+        }
 
         let per_draw = self.n_params() + self.stats_per_draw();
         if per_draw == 0 {
             return None;
         }
-        let offset = index - META_ROWS.len();
+        let offset = index - self.header_rows();
         let flat_draw = offset / per_draw;
         let slot = offset % per_draw;
         if flat_draw >= self.n_chains * self.n_draws {

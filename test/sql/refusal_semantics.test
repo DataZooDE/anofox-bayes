@@ -53,6 +53,42 @@ FROM anofox_bayes_fit((SELECT grp, v FROM solo), 'conjugate_anomaly',
 ----
 1.0	2.0
 
+# ...and which lane, which is what an agent actually needs. `__n_groups_unready__`
+# sends it looking; `__group_status__` says where. On a 5 000-lane fit that is the
+# difference between quarantining three lanes and quarantining the table.
+statement ok
+CREATE TABLE solo_draws AS
+SELECT * FROM anofox_bayes_fit((SELECT grp, v FROM solo), 'conjugate_anomaly',
+                               {'value': 'v', 'group': 'grp', 'draws': 1000});
+
+query II
+SELECT group_id, anofox_bayes_status_name(value)
+FROM solo_draws WHERE param = '__group_status__' ORDER BY group_id;
+----
+SOLO	insufficient_data
+
+# The count and the names are two ways of saying the same thing, so they must agree.
+query I
+SELECT (SELECT count(*) FROM solo_draws WHERE param = '__group_status__')
+     = (SELECT max(value) FROM solo_draws WHERE param = '__n_groups_unready__');
+----
+true
+
+# A refused lane is named AND still occupies its draw slots as NULL -- it does not
+# vanish from the table, so a join against it stays total.
+query II
+SELECT count(*), count(value)
+FROM solo_draws WHERE param = 'mu' AND group_id = 'SOLO' AND draw >= 0;
+----
+1000	0
+
+# The healthy lane is untouched by its neighbour's refusal.
+query I
+SELECT count(*) = 1000 AND count(value) = 1000
+FROM solo_draws WHERE param = 'mu' AND group_id = 'A' AND draw >= 0;
+----
+true
+
 #######################################
 # Degenerate input 2: zero variance
 #######################################

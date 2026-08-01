@@ -154,6 +154,34 @@ Two things it is not:
   each group independently, reports the exact count. Over-counting is the safe
   direction: it sends an agent to look at more than it must, never at less.
 
+### 3b. Per-group readiness — `chain = -1, draw = -1`, `group_id` names the group
+
+One `__group_status__` row per group the family **refused**, carrying that group's key
+in `group_id` and its `FitStatus` in `value`. This is the only reserved row that is not
+`__global__`, and the only one whose count varies with the data.
+
+```sql
+-- Which lanes must I quarantine, and why?
+SELECT group_id AS lane, anofox_bayes_status_name(value) AS verdict
+FROM draws WHERE param = '__group_status__';
+```
+
+Emitted only for refused groups. A healthy fit emits none, rather than a row per group
+saying "fine" — for a 5 000-lane fit that would double the metadata to say nothing.
+
+**Why this exists alongside `__status__`.** The model-level status is the collapsed
+worst case and stays that way: a fit covering 5 000 lanes of which three are
+unidentifiable is not 99.4 % trustworthy, it is a fit an agent must look at before
+acting on any of it. But "must look at" needs somewhere to look. `__n_groups_unready__`
+says how many; these rows say which, so an agent can quarantine three lanes instead of
+the whole table.
+
+**A family that fits one joint design emits none of these even when it refuses.**
+`pooled_gaussian` solves a single system, so a rank deficiency implicates every group
+and there is no honest subset to name; `__n_groups_unready__` reports the full count.
+Absence of these rows is therefore *not* evidence that every group is fine — read
+`__status__` for that.
+
 ## Reserved names
 
 The `__` prefix belongs to this contract. A model parameter may never begin with it —

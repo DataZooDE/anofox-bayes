@@ -799,6 +799,7 @@ exactly as the underlying quantile functions do. Filter to real draws first
 
 | Macro | Returns | Notes |
 |---|---|---|
+| `anofox_bayes_status_name(value)` | VARCHAR | Decodes one `FitStatus` value. Scalar, unlike `anofox_bayes_status_text`, which aggregates a whole table to find the model-level `__status__` row — use this one on the per-group `__group_status__` rows |
 | `anofox_bayes_credible_lower(value, level)` | DOUBLE | Lower end of an equal-tailed interval |
 | `anofox_bayes_credible_upper(value, level)` | DOUBLE | Upper end |
 | `anofox_bayes_credible_interval(value, level)` | STRUCT(lower, median, upper) | The interval as one column |

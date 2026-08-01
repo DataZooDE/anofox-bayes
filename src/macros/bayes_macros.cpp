@@ -122,6 +122,23 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
      "  WHEN 2 THEN 'insufficient_data'"
      "  WHEN 3 THEN 'failed'"
      "  ELSE 'unknown' END"},
+    // The same decoding as a *scalar*, for a status that is already one per row.
+    //
+    // `anofox_bayes_status_text` aggregates: it scans a whole draws table for the one
+    // `__status__` row, which is right for the model-level verdict and wrong for the
+    // per-group `__group_status__` rows, where every row already carries its own
+    // verdict and grouping by `group_id` to reach it is noise the caller should not
+    // have to write.
+    {DEFAULT_SCHEMA,
+     "anofox_bayes_status_name",
+     {"value", nullptr},
+     {{nullptr, nullptr}},
+     "CASE value"
+     "  WHEN 0 THEN 'converged'"
+     "  WHEN 1 THEN 'degenerate'"
+     "  WHEN 2 THEN 'insufficient_data'"
+     "  WHEN 3 THEN 'failed'"
+     "  ELSE 'unknown' END"},
     // True only for a fit an agent may act on without further qualification.
     {DEFAULT_SCHEMA,
      "anofox_bayes_is_actionable",

@@ -648,6 +648,7 @@ than exhausting memory. See [Scalability](SCALABILITY.md).
 | Metadata rows in your aggregates | Add `WHERE draw >= 0` |
 | `anofox_bayes_rhat` is `NULL` | Expected under `exact` and `laplace` — they draw independently, so it is undefined. Gate on ESS. It is computed under `engine: 'nuts'`. [Why](THEORY.md#6-diagnostics) |
 | A `nuts` fit is `degenerate` with divergences | The posterior has curvature the adapted step size cannot follow, so those draws are not from it. Raise `warmup`; the fit must not be acted on until it is clean. [Why](THEORY.md#7-refusal) |
+| A 5 000-group fit reports `insufficient_data` and you cannot tell which groups | Query `__group_status__` — one row per refused group, with its key in `group_id` |
 | A gate that never flags anything | `HAVING ess < 400` fails open on `NULL`; use `anofox_bayes_ess_gate` |
 | `invalid config at 'grup'` | A typo — the message names the slot and suggests the intended one |
 | `singular or rank-deficient design matrix` | Two predictors carry the same information (e.g. a constant column beside an intercept) |

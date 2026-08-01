@@ -692,6 +692,17 @@ impl CompiledModel for CompiledConjugate {
             .count()
     }
 
+    /// This family fits each group independently, so it knows exactly which ones it
+    /// refused and can name them.
+    fn unready_groups(&self) -> Vec<(String, crate::types::FitStatus)> {
+        self.posteriors
+            .iter()
+            .zip(self.params.chunks(self.likelihood.param_names().len()))
+            .filter(|(p, _)| !p.readiness.status.is_actionable())
+            .map(|(p, names)| (names[0].group_id.clone(), p.readiness.status))
+            .collect()
+    }
+
     fn as_exact(&self) -> Option<&dyn ExactPosterior> {
         Some(self)
     }

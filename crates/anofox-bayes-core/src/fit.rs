@@ -193,13 +193,14 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         sample_from,
     };
 
-    let posterior = Posterior::new(
+    let posterior = Posterior::with_unready(
         meta,
         model.param_names().to_vec(),
         opts.n_chains,
         opts.n_draws,
         sample.values,
         sample.stats,
+        model.unready_groups(),
     )?;
 
     Ok(grade(posterior, readiness, &Thresholds::default()))
@@ -1020,5 +1021,129 @@ mod tests {
 
         let f = fit("conjugate_anomaly", &cfg, &view).unwrap();
         assert_eq!(f.posterior.meta.sample_from, SampleFrom::Prior);
+    }
+    /// Roadmap gap 11: an agent must be able to find the bad lanes, not just count
+    /// them.
+    ///
+    /// `Readiness::worst` collapses per-group verdicts into one and still does — a fit
+    /// with three unidentifiable lanes out of 5 000 is not 99.4 % trustworthy. But a
+    /// collapsed verdict plus a count sends an agent looking through 5 000 groups for
+    /// three. These rows name them.
+    #[test]
+    fn the_refused_groups_are_named_and_not_merely_counted() {
+        let frame = Frame::new(9)
+            .numeric("cost", vec![1.0, 1.1, 0.9, 5.0, 5.2, 4.8, 42.0, 7.0, 7.0])
+            .key(
+                "lane",
+                vec!["A", "A", "A", "B", "B", "B", "SOLO", "FLAT", "FLAT"],
+            );
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(r#"{"value": "cost", "group": "lane", "draws": 100}"#).unwrap();
+        let f = fit("conjugate_anomaly", &cfg, &view).unwrap();
+
+        let named: Vec<(&str, f64)> = f
+            .posterior
+            .rows()
+            .filter(|r| r.param == crate::draws::META_GROUP_STATUS)
+            .map(|r| (r.group_id, r.value))
+            .collect();
+
+        let keys: Vec<&str> = named.iter().map(|(g, _)| *g).collect();
+        assert!(
+            keys.contains(&"SOLO"),
+            "a one-observation lane must be named: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"FLAT"),
+            "a zero-variance lane must be named: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"A"),
+            "a healthy lane must not be named: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"B"),
+            "a healthy lane must not be named: {keys:?}"
+        );
+
+        // The count and the names must agree -- two ways of saying the same thing that
+        // could drift apart is worse than one.
+        assert_eq!(named.len(), f.posterior.meta.n_groups_unready);
+
+        // Every named status is a refusal, never `converged`.
+        for (g, v) in &named {
+            assert_ne!(*v, 0.0, "group {g} was named but reports converged");
+        }
+
+        // ...and the model-level verdict is still the collapsed worst case.
+        assert_ne!(f.posterior.meta.status, FitStatus::Converged);
+    }
+
+    /// A clean fit names nothing, rather than emitting a row per group saying "fine".
+    #[test]
+    fn a_healthy_fit_names_no_groups() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(r#"{"value": "cost", "group": "lane", "draws": 100}"#).unwrap();
+        let f = fit("conjugate_anomaly", &cfg, &view).unwrap();
+        assert_eq!(
+            f.posterior
+                .rows()
+                .filter(|r| r.param == crate::draws::META_GROUP_STATUS)
+                .count(),
+            0
+        );
+    }
+
+    /// The rows must not disturb the draws they precede: `row_at` is O(1) random
+    /// access that subtracts the header length, so a variable number of header rows is
+    /// exactly where an off-by-one would land -- and it would silently misattribute
+    /// every parameter value.
+    #[test]
+    fn naming_refused_groups_does_not_shift_the_draw_rows() {
+        let frame = Frame::new(7)
+            .numeric("cost", vec![1.0, 1.1, 0.9, 5.0, 5.2, 4.8, 42.0])
+            .key("lane", vec!["A", "A", "A", "B", "B", "B", "SOLO"]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(r#"{"value": "cost", "group": "lane", "draws": 50}"#).unwrap();
+        let f = fit("conjugate_anomaly", &cfg, &view).unwrap();
+
+        // Streaming and random access must agree row for row. Compared bitwise
+        // because a refused group's draws are NaN, and NaN != NaN would make this pass
+        // or fail for reasons that have nothing to do with the indexing under test.
+        let streamed: Vec<_> = f.posterior.rows().collect();
+        assert_eq!(streamed.len(), f.posterior.n_rows());
+        for (i, want) in streamed.iter().enumerate() {
+            let got = f.posterior.row_at(i).unwrap();
+            assert_eq!(
+                (
+                    got.group_id,
+                    got.chain,
+                    got.draw,
+                    got.param,
+                    got.value.to_bits()
+                ),
+                (
+                    want.group_id,
+                    want.chain,
+                    want.draw,
+                    want.param,
+                    want.value.to_bits()
+                ),
+                "row {i}"
+            );
+        }
+
+        // Lane A's mu draws are finite and its own; SOLO's are NULL-shaped.
+        let mu_a: Vec<f64> = streamed
+            .iter()
+            .filter(|r| r.param == "mu" && r.group_id == "A" && r.draw >= 0)
+            .map(|r| r.value)
+            .collect();
+        assert_eq!(mu_a.len(), 50);
+        assert!(mu_a.iter().all(|v| v.is_finite() && (0.0..3.0).contains(v)));
     }
 }
