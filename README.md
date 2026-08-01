@@ -80,8 +80,9 @@ measurement. See [the roadmap](#roadmap).
 
 ## Install
 
-> **No binaries are published yet.** The release pipeline exists but has never run.
-> Build from source for now.
+> **No binaries are published yet.** The release pipeline and the S3 channel are
+> configured; publishing is blocked on one IAM trust-policy entry — see
+> [docs/RELEASING.md](docs/RELEASING.md). Build from source until then.
 
 ```bash
 git clone --recurse-submodules https://github.com/DataZooDE/anofox-bayes.git
@@ -145,6 +146,7 @@ thread counts.
 | [API Reference](docs/API_REFERENCE.md) | Every function, every config slot. |
 | [Draws Contract](docs/DRAWS_CONTRACT.md) | The output schema, versioned. |
 | [Scalability](docs/SCALABILITY.md) | Measured runtime and memory; known limits. |
+| [Releasing](docs/RELEASING.md) | How self-distribution to `get.erpl.io` works, and how to cut a release. |
 | [BRD](docs/BRD.md) · [HLD](docs/HLD.md) | Product and architecture rationale. |
 
 Runnable examples for every feature live in [`test/sql/`](test/sql/) — they are the
