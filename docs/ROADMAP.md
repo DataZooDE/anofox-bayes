@@ -12,31 +12,35 @@ today.
 
 This document is the plan for the other five, plus the defects in what already ships.
 
-## 1. The gaps, ranked
+## 1. The gaps
 
-Ranked by agents unblocked per engineer-day. *Blocker* means the agent cannot run at
-all; *degradation* means it runs with a caveat someone has to carry.
+Originally ranked by agents unblocked per engineer-day; the table now records **state**,
+since most of it is done. Ten of the fourteen are closed — three of those with a named
+remainder rather than cleanly — two are in progress, and two are unstarted with their
+estimates revised. Where an estimate turned out wrong it says so; the point of writing
+them down was to find out.
 
-| # | Gap | Agents | Blocker / degradation | Est. days | Depends on |
-|---:|---|---|---|---:|---|
-| 1 | `random()` is not seeded by the fit | 01–07 | Degradation for all seven, including both shipped agents | 0.5 + 3 | — |
-| 2 | ~~Bridge `anofox-statistics` MAP+Laplace fits into the draws contract~~ **seam done, F2 shipped** | 02 unblocked; 01, 04, 06 still degraded | The seam and censored AFT (F2) have landed; the remaining likelihoods are small additions, costed in §3.1 | 6–9 | — |
-| 3 | F5 payer-alive (BG/NBD) | 05 | Blocker | 8–12 | — |
-| 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 blocker; 01, 04, 06 degradation | Unblocks 02 outright; gives 01/04/06 an honest interim path | 6–9 | statistics exposing the vcov matrix |
-| 3 | F5 payer-alive (BG/NBD) | 05 | **Shipped.** Agent 05 unblocked | 8–12 | — |
-| 4 | Random slopes ~~+ learned pooling scale~~ | 06 blocker; 03 degradation | **Random slopes shipped** in `pooled_gaussian`; the learned scale is not this family's and moves to gap 5's | 12–18 | gap 6 for the learned scale |
-| 5 | Per-group variance | 04 | Blocker for the tail question, which is why agent 04 exists | 5–8 with gap 4 | gap 4 |
-| 6 | NUTS engine (`nuts-rs` adapter) | none directly | Dependency of gaps 4, 5, 7 | **done** | — |
-| 7 | F1 hierarchical negative binomial | 01 | Blocker natively; degraded path via gap 2 | 12–20 | gap 6 — **met** |
-| 8 | F4 payment delay, native | 04 | Degradation — `pooled_gaussian` on log-delay is already a lognormal model | 8–12 | gaps 4, 5 |
-| 9 | F6 hierarchical elasticity, native | 06 | Degradation once gap 4 lands — elasticity is a log-log linear model | 6–10 | gap 4 |
-| 10 | ~~`conjugate_anomaly` has no `as_differentiable`~~ **done** | none | Correctness gate, not a feature | 2–3 | — |
-| 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | Degradation, sharply worse at thousands of groups | 3–5 | — |
-| 12 | No prior-predictive check (BR-11) | 01–07 | Degradation; a pre-fit gate agents cannot run today | 4–6 | — |
-| 13 | ~~No `anofox-scenario` integration (BR-9)~~ **closed, as documentation** | 01–07 | The two extensions already compose; see §5 | 0.5 | — |
-| 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | Degradation, only past the measured ceilings | 8–14 | — |
-| 13 | No `anofox-scenario` integration (BR-9) | 01–07 | Degradation; branching a draws table is the agent's job | 5–8 | scenario's catalog API |
-| 14 | ~~Group parallelism~~ **done**; streaming sufficient statistics, lazy draw emission | 01, 07 | Degradation, only past the measured ceilings | 4–8 remaining | — |
+| # | Gap | Agents | State | Remaining |
+|---:|---|---|---|---|
+| 1 | `random()` is not seeded by the fit | 01–07 | **Done.** `anofox_bayes_uniform` / `anofox_bayes_std_normal`, pure functions of `(seed, key, draw)` | — |
+| 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 unblocked; 01, 04, 06 still degraded | **Seam done, F2 censored AFT shipped.** The covariance is reassembled from public primitives and cross-checked bit-exactly against the upstream standard errors | The other likelihoods: negbinomial + Gamma 4–7 d, mixed-effects 6–10 d (§3.1) |
+| 3 | F5 payer-alive (BG/NBD) | 05 | **Done.** SBC certifies Laplace; NUTS not needed | PyMC parity test |
+| 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | **Random slopes done** in `pooled_gaussian`, still conjugate, three engines agree | The learned scale is not conjugate and belongs to gap 5's family |
+| 5 | Per-group variance + learned pooling scale | 04, 06 | In progress — a new family, non-centred, on Laplace + NUTS | — |
+| 6 | NUTS engine (`nuts-rs` adapter) | none directly | **Done.** Pinned `=0.18.3`; byte-identical across thread counts | — |
+| 7 | F1 hierarchical negative binomial | 01 | In progress — bridged path assessed first, per the deferral | — |
+| 8 | F4 payment delay, native | 04 | Not started. `pooled_gaussian` on log-delay is already a lognormal model | 8–12 d, after gaps 4 and 5 |
+| 9 | F6 hierarchical elasticity, native | 06 | Not started. Largely covered by random slopes, which is what elasticity needs | 6–10 d, and re-estimate — gap 4 took most of it |
+| 10 | `conjugate_anomaly` has no `as_differentiable` | none | **Done.** All three engines now serve it, so a closed form has three independent derivations | — |
+| 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | **Done.** `__group_status__` names the refused groups; the collapsed verdict is deliberately unchanged | — |
+| 12 | No prior-predictive check (BR-11) | 01–07 | **Done.** `sample_from: 'prior'`, refused unless the prior is proper | — |
+| 13 | No `anofox-scenario` integration (BR-9) | 01–07 | **Closed as documentation.** The two extensions already compose; an API cannot bind (§5) | The suite does not run in CI — see below |
+| 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | **Group parallelism done**, 8× in-crate. Profiling showed the bottleneck was diagnostics, not the sampler | Streaming needs a C++ streaming FFI; lazy emission saves ~11 % and is blocked by whole-chain diagnostics |
+
+**The largest remaining scale cost is no longer the fit.** Of 2.76 s at 5 000 groups,
+roughly 1.2 s is the FFI row boundary and 1.26 s is DuckDB materialising the output
+table, against 0.23 s of inference. Dictionary vectors for the three string columns
+would attack the first; it is C++ work and is not yet scheduled.
 
 Two ranking notes worth stating rather than leaving implicit.
 
@@ -51,10 +55,10 @@ re-run a recommendation and check it" — is false for any agent that simulates 
 which is all of them. Half a day stops the bleeding; about three days fixes it
 properly. Nothing else here has that ratio.
 
-**Gap 6 unblocks no agent on its own and is still near the top.** Gaps 4, 5 and 7 —
-three agents between them — all bottom out in a hierarchical variance parameter whose
-posterior is not conjugate and for which Laplace is known to be poor. Sequencing NUTS
-late means sequencing three agents late.
+**Gap 6 unblocked no agent on its own and was still near the top**, because gaps 4, 5
+and 7 — three agents between them — all bottom out in a hierarchical variance parameter
+whose posterior is not conjugate and for which Laplace is known to be poor. Sequencing
+NUTS late would have meant sequencing three agents late. That reasoning held.
 
 **Gap 6 is done.** The `nuts` engine ships as a pinned `nuts-rs` adapter isolated in
 `crates/anofox-bayes-core/src/engines/nuts.rs`, certified against `pooled_gaussian`'s
