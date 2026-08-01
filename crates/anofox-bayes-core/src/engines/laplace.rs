@@ -31,7 +31,7 @@
 
 use faer::Mat;
 
-use crate::catalog::{CompiledModel, LogPosterior};
+use crate::catalog::{CompiledModel, GaussianApproximation, LogPosterior};
 use crate::draws::SampleStats;
 use crate::errors::{BayesError, BayesResult};
 use crate::linalg::{cholesky, sample_mvn, solve_with};
@@ -55,10 +55,19 @@ impl Engine for LaplaceEngine {
     }
 
     fn supports(&self, model: &dyn CompiledModel) -> bool {
-        model.as_differentiable().is_some()
+        model.as_gaussian().is_some() || model.as_differentiable().is_some()
     }
 
     fn sample(&self, model: &dyn CompiledModel, opts: &SampleOptions) -> BayesResult<Sample> {
+        // A model that already holds its own mode and curvature is served directly.
+        // Checked *first*, not as a fallback: a family that arrives fitted has an
+        // answer, and re-running a Newton search on a differentiable view of the same
+        // posterior would at best waste the work and at worst find a different point
+        // and publish it under the same `model_id`.
+        if let Some(g) = model.as_gaussian() {
+            return sample_gaussian(model, g, opts);
+        }
+
         let target = model.as_differentiable().ok_or_else(|| {
             BayesError::config(
                 "engine",
@@ -101,6 +110,85 @@ impl Engine for LaplaceEngine {
             stats: Vec::<SampleStats>::new(),
         })
     }
+}
+
+/// Draw from a Gaussian approximation the family already holds.
+///
+/// This is the last step of the Laplace recipe and nothing else: the mode and the
+/// curvature came from wherever the family got them — for a bridged fit, from
+/// `anofox-stats-core` — and all that remains is to sample and back-transform.
+///
+/// **The factor is taken of the full precision matrix.** `cholesky` is handed
+/// `block.precision` whole, so `sample_mvn` produces draws with the posterior's
+/// correlation structure intact. There is no code path in which a diagonal is
+/// extracted, and `the_draws_carry_the_posterior_correlation_and_not_only_its_variances`
+/// fails if one is ever introduced.
+///
+/// Parameters covered by no block stay `NaN`, which reaches SQL as NULL: that is how a
+/// group whose fit was refused travels, beside the groups that succeeded, without
+/// making the shape of the draws table depend on the outcome.
+fn sample_gaussian(
+    model: &dyn CompiledModel,
+    approx: &dyn GaussianApproximation,
+    opts: &SampleOptions,
+) -> BayesResult<Sample> {
+    let blocks = approx.blocks();
+    let n_params = model.param_names().len();
+
+    // Factor once, outside the draw loop: the factorisation is `O(p^3)` and the
+    // sampling `O(p^2)`, so refactoring per draw would dominate the cost of the fit.
+    let factors: Vec<faer::Mat<f64>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(b, block)| {
+            cholesky(&block.precision).map_err(|e| {
+                BayesError::NotPositiveDefinite(format!(
+                    "block {b} of the bridged posterior has a curvature that is not a \
+                     valid precision ({e}); the fit should have been refused before \
+                     reaching the engine"
+                ))
+            })
+        })
+        .collect::<BayesResult<_>>()?;
+
+    let widest = blocks.iter().map(|b| b.mode.len()).max().unwrap_or(0);
+    let widest_out = blocks.iter().map(|b| b.params.len()).max().unwrap_or(0);
+    let mut unconstrained = vec![0.0; widest];
+    let mut constrained = vec![0.0; widest_out];
+
+    let mut values = vec![f64::NAN; opts.n_chains * opts.n_draws * n_params];
+    for chain in 0..opts.n_chains {
+        let mut rng = BayesRng::for_chain(opts.seed, chain as u32);
+        for draw in 0..opts.n_draws {
+            let offset = (chain * opts.n_draws + draw) * n_params;
+            for (b, block) in blocks.iter().enumerate() {
+                let dim = block.mode.len();
+                sample_mvn(
+                    &factors[b],
+                    &block.mode,
+                    1.0,
+                    &mut rng,
+                    &mut unconstrained[..dim],
+                )?;
+                let out = &mut constrained[..block.params.len()];
+                approx.constrain(b, &unconstrained[..dim], out);
+                for (k, &slot) in block.params.iter().enumerate() {
+                    if slot >= n_params {
+                        return Err(BayesError::Internal(format!(
+                            "block {b} writes parameter slot {slot}, but the model reports \
+                             only {n_params} parameters"
+                        )));
+                    }
+                    values[offset + slot] = out[k];
+                }
+            }
+        }
+    }
+
+    Ok(Sample {
+        values,
+        stats: Vec::<SampleStats>::new(),
+    })
 }
 
 /// Newton's method on the analytic gradient, with a backtracking line search.
@@ -713,36 +801,75 @@ mod tests {
         }
     }
 
-    /// With `conjugate_anomaly` differentiable, no shipped family declines the Laplace
-    /// engine any more -- so the invariant worth asserting is the positive one: every
-    /// family in the closed catalog carries the two-engine cross-check. A family added
-    /// without a `LogPosterior` fails here and has to justify itself.
+    /// Every family is served by the Laplace engine, and every *conjugate* family is
+    /// additionally served by the exact one — which is what gives it the two-engine
+    /// cross-check, the strongest correctness gate in this crate.
+    ///
+    /// The list of families that decline `exact` is spelled out rather than derived,
+    /// because declining it costs a warranty. `censored_aft` is on that list because
+    /// its posterior genuinely has no closed form; a family added there without that
+    /// justification fails review, and a family added to the catalog and to neither
+    /// list fails here.
     #[test]
-    fn every_family_in_the_catalog_can_be_served_by_both_engines() {
-        let f = Frame::new(8)
-            .numeric("y", vec![1.0, 2.0, 3.5, 4.0, 5.5, 6.0, 7.5, 8.0])
-            .numeric("cost", vec![1.0, 2.0, 3.5, 4.0, 5.5, 6.0, 7.5, 8.0])
-            .numeric("x1", vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    fn every_family_is_served_by_laplace_and_every_conjugate_one_also_by_exact() {
+        let n = 40;
+        let (days, distance, delivered) = crate::bridge::testing::survival_fixture(
+            anofox_stats_core::models::AftDistribution::Weibull,
+            1.0,
+            0.25,
+            0.4,
+            n,
+            0.0,
+            Some(20.0),
+        );
+        let f = Frame::new(n)
+            .numeric("y", (0..n).map(|i| 1.0 + i as f64 * 0.5).collect())
+            .numeric(
+                "cost",
+                (0..n).map(|i| 1.0 + ((i % 7) as f64) * 0.3).collect(),
+            )
+            .numeric("x1", (0..n).map(|i| i as f64).collect())
+            .numeric("days", days)
+            .numeric("distance", distance)
+            .numeric("delivered", delivered);
         let refs = f.key_refs();
         let view = f.view(&refs);
 
-        for (family, cfg) in [
+        // Families whose posterior has no closed form, and why.
+        const NO_EXACT_POSTERIOR: &[&str] = &[
+            // A censored AFT likelihood is not conjugate to anything; the family is a
+            // bridge onto a MAP fit and is a Gaussian approximation by construction.
+            "censored_aft",
+        ];
+
+        let configs = [
             ("pooled_gaussian", r#"{"y": "y", "x": "x1"}"#),
             ("conjugate_anomaly", r#"{"value": "cost"}"#),
-        ] {
+            (
+                "censored_aft",
+                r#"{"time": "days", "event": "delivered", "x": "distance"}"#,
+            ),
+        ];
+        assert_eq!(
+            configs.len(),
+            crate::catalog::all().len(),
+            "a family was added to the catalog without being exercised here"
+        );
+
+        for (family, cfg) in configs {
             let model = crate::catalog::lookup(family)
                 .unwrap()
                 .compile(&Config::parse(cfg).unwrap(), &view)
                 .unwrap();
             assert!(
                 LaplaceEngine.supports(&*model),
-                "{family} must expose a differentiable log posterior"
+                "{family} must be servable by the Laplace engine"
             );
-            assert!(
+            assert_eq!(
                 crate::engines::ExactEngine.supports(&*model),
-                "{family} must expose a closed-form posterior"
+                !NO_EXACT_POSTERIOR.contains(&family),
+                "{family} disagrees with its declared conjugacy"
             );
         }
-        assert_eq!(crate::catalog::all().len(), 2, "a family was added");
     }
 }

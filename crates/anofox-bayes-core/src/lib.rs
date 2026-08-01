@@ -26,6 +26,7 @@
 //! sampling for free. Adding an engine touches no family; adding a family touches no
 //! engine. That is the whole design.
 
+pub mod bridge;
 pub mod catalog;
 pub mod config;
 pub mod data;

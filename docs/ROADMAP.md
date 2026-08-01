@@ -20,7 +20,7 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | # | Gap | Agents | Blocker / degradation | Est. days | Depends on |
 |---:|---|---|---|---:|---|
 | 1 | `random()` is not seeded by the fit | 01–07 | Degradation for all seven, including both shipped agents | 0.5 + 3 | — |
-| 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 blocker; 01, 04, 06 degradation | Unblocks 02 outright; gives 01/04/06 an honest interim path | 6–9 | statistics exposing the vcov matrix |
+| 2 | ~~Bridge `anofox-statistics` MAP+Laplace fits into the draws contract~~ **seam done, F2 shipped** | 02 unblocked; 01, 04, 06 still degraded | The seam and censored AFT (F2) have landed; the remaining likelihoods are small additions, costed in §3.1 | 6–9 | — |
 | 3 | F5 payer-alive (BG/NBD) | 05 | Blocker | 8–12 | — |
 | 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | Blocker for 06 — the interaction-column workaround left 10 of 12 intervals not covering | 12–18 | gap 6 for the learned scale |
 | 5 | Per-group variance | 04 | Blocker for the tail question, which is why agent 04 exists | 5–8 with gap 4 | gap 4 |
@@ -148,43 +148,129 @@ One seam, four agents. No new family here approaches that ratio.
 
 **Three costs, stated plainly.**
 
-*The covariance matrix is not reachable from SQL.* `anofox-stats-core`'s
-`glm_engine/laplace.rs:33` holds the full `pub vcov: Mat<f64>`, but the aggregates
-return only `std_errors DOUBLE[]` — the diagonal. Verified: `aft_aggregate.cpp` has
-zero occurrences of `vcov`. Sampling from the diagonal treats every coefficient as
-independent, dropping the intercept/slope correlation that dominates a predictive
-interval, and would produce intervals wrong in a way no diagnostic here would catch.
-**The bridge is not viable until statistics exposes the matrix.** That is a cross-repo
-change and the largest risk in the v0.2 plan.
+*The covariance matrix is not reachable from SQL.* **Settled, and the resolution was
+not quite either of the two options anticipated.**
 
-Two ways out: a `vcov_matrix DOUBLE[][]` field on the returned struct, or — cleaner —
-anofox-bayes takes a Cargo dependency on `anofox-stats-core` and calls the fit
-in-process, with no SQL round trip and no serialisation of a `p × p` matrix. The second
-is the only option that lets the bridge participate in `model_id`, since the data
-fingerprint must be computed over the rows the fit actually read.
+The in-process route was taken: anofox-bayes now has a Cargo git dependency on
+`anofox-stats-core`, pinned to an exact revision. That was necessary but not
+sufficient, because `fit_aft` **discards the covariance in-process too** — it computes
+a full `LaplaceInference` internally and then keeps only slices of its diagonal on
+`AftInference` (`std_errors`, `z_values`, `ci_*`). The matrix is no more reachable from
+the returned struct than it was from SQL.
 
-Worth noting: **anofox-bayes currently depends on neither `anofox-regression` nor
-`anofox-stats-core`** — everything in `crates/anofox-bayes-core/` is hand-rolled. HLD §3
-("reuse before rebuild") assumed otherwise. The bridge is the first place that
-assumption gets tested, and this decision is really a decision about whether HLD §3 was
-right.
+It is reachable from the *primitives*, all of which are public: `AftDistribution`
+exposes the log density, the log survival and their first two derivatives;
+`glm_engine::laplace::inference` is public and returns the full `vcov`;
+`PriorSpec::precision` gives the prior's contribution. So `bridge.rs` reassembles the
+observed information at the mode `fit_aft` returned and hands it to statistics' own
+inference routine. **The reassembly is cross-checked rather than trusted**: its
+diagonal must reproduce the reported `std_errors`, and does so to the last bit — which
+is also a standing guard against the pinned revision drifting.
 
-*A bridged fit carries a weaker warranty and must say so.* A Laplace posterior is a
-Gaussian approximation. The catalog promises every family is SBC-calibrated and
-PyMC-checked; a bridged fit has neither unless we build them. The bridge is **not** an
-escape from the `AGENTS.md` bar — each bridged likelihood still needs its SBC suite and
-parity test, and any that fails SBC is documented as such rather than quietly shipped.
-What the bridge saves is the likelihood, the gradient, the mode-finding and the
-censoring logic: roughly half the work of a family, not all of it. The 6–9 day estimate
-assumes the calibration work is still done.
+Measured, on a design with the covariate away from zero: `corr(intercept, slope) =
+−0.998`, and the predictive standard deviation of the linear predictor is **24.9×
+larger** from the diagonal alone than from the full matrix. Confirmed by mutation that
+this is invisible to everything else — see below.
 
-*Refusal semantics must be mapped, not inherited.* `converged BOOLEAN` and statistics'
-`NaN` conventions have to become `FitStatus` values meaning what the draws contract
-says. Statistics' "every row censored → not identified" must arrive as `degenerate`.
+*Still worth doing upstream:* adding `pub vcov: Mat<f64>` to `AftInference` (and to
+`GlmInferenceResult`) would delete the reassembly and its cross-check entirely. It is a
+one-field change and the natural companion to a prior slot on the AFT scale, which is
+the other thing the bridge wants from `anofox-statistics` — see the SBC note below.
 
-**What would change this:** if exposing the vcov matrix proves expensive across the
-repo boundary, a native F2 at 10–14 days becomes competitive — but it unblocks one
-agent instead of four.
+Worth noting: **anofox-bayes previously depended on neither `anofox-regression` nor
+`anofox-stats-core`** — everything in `crates/anofox-bayes-core/` was hand-rolled.
+HLD §3 ("reuse before rebuild") assumed otherwise, and this was the first test of it.
+The verdict is in §3.1's postscript below.
+
+*A bridged fit carries a weaker warranty and must say so.* **Done, with one gap
+recorded rather than closed.** `__engine__` reads `laplace` on every bridged fit and
+`as_exact` returns `None`, so asking for an exact posterior is an error rather than a
+silent substitution. The SBC suites are built and pass:
+
+| Suite | χ² (15 df, threshold 37.7) | Status |
+|---|---|---|
+| `exponential`, n = 200 | 13.0 / 12.8 | **Complete certificate** — every free parameter properly priored |
+| `weibull`, n = 200 | 14.0 / 14.2 | Coefficients only; **`sigma` uncertified** |
+| `exponential`, n = 25, heavily censored | 7.2 / 9.7 | Calibrated on a thin cohort too |
+
+The gap: `anofox-stats-core`'s AFT accepts Gaussian priors on the **coefficients only**,
+and SBC cannot draw a truth from an improper prior — so for the three distributions
+that estimate `sigma`, `sigma` itself is not certified. `exponential` fixes it at 1,
+which is what makes that suite complete and therefore a genuine certificate for the
+seam. Recorded in `docs/THEORY.md` §5. Closing it needs a prior slot on the scale
+upstream.
+
+The thin-cohort result is worth carrying forward for the opposite reason to the note in
+§2: it is *good*, where `conjugate_anomaly`'s Laplace is bad (29 % too narrow at n = 6).
+A regression coefficient's posterior is near-Gaussian at modest n; a variance
+parameter's is not. So the §2 warning about routing thin groups through Laplace applies
+to variance parameters, not to bridged coefficients.
+
+*Refusal semantics must be mapped, not inherited.* **Done, with a test per row.**
+Every-row-censored → `degenerate`; too few rows → `insufficient_data`; rank-deficient
+at the mode → `degenerate`; non-convergence → `failed`. A non-positive duration or a
+non-binary event indicator stays a **request error naming the column**, since it is a
+malformed request rather than weak evidence. An unmapped upstream variant reports
+itself rather than being graded.
+
+Note on `converged BOOLEAN`: in-process it does not exist. A non-converged AFT fit never
+returns — `newton` turns it into `ConvergenceFailure` — so the boolean the SQL aggregate
+publishes reaches this crate as an error. `Failed` is the right verdict: there is no
+mode, so there is no posterior, not merely a poor one.
+
+**The finding that generalises.** Replacing the posterior precision with its own
+diagonal — the change that would follow from consuming `std_errors` instead of
+reassembling the matrix — leaves **219 of 220 unit tests and all six SBC suites green**.
+SBC ranks parameters one at a time, so it tests marginals, and marginals are exactly
+what a diagonal preserves. Only a test written on a *function of several parameters at
+once* catches it. **Every family needs at least one assertion on a linear combination
+of its parameters**, not only on each parameter separately.
+
+### 3.1a What the remaining likelihoods cost
+
+The seam is `GaussianApproximation` / `GaussianBlock`: a family supplies a mode and a
+full precision matrix per independent block, and the Laplace engine does the rest. The
+matrix is carried by the seam rather than by each family, so a future bridge cannot
+reintroduce a diagonal by accident.
+
+| Likelihood | Upstream entry point | Extra work | Est. days |
+|---|---|---|---:|
+| Censored AFT (F2) | `fit_aft` | **done** | — |
+| Negative binomial GLM | `fit_negbinomial` | Reassemble the IRLS information (`X'WX + P`, weights from the family) rather than the AFT Hessian; the dispersion parameter is estimated outside the IRLS loop and is **not** in the curvature, so it is either conditioned on or the family reports it without a posterior. That question is the whole cost. | 3–5 |
+| Gamma GLM | `fit_gamma` | As above minus the dispersion question, which Gamma answers the same awkward way. Same design matrix machinery, so it lands with negbinomial or immediately after. | 1–2 |
+| Mixed-effects GLM (`fit_glmm`) | `fit_glmm` | The information includes the random-effect block, so "one block per group" no longer holds — the whole fit is one correlated block of size `p + n_groups`, and the Cholesky is `O((p+G)^3)`. Needs a sparse or blocked path before it is usable at the group counts agent 01 has. Also the case where a Laplace approximation to a variance component is known to be poor, so SBC is likely to fail and that failure is the useful output. | 6–10 |
+
+Two shared costs apply to each: an SBC suite (1–2 days) and a `test/sql/` scenario
+(1 day), which the estimates above exclude. And the same upstream limitation binds
+throughout — priors on coefficients only — so each bridged likelihood will certify its
+coefficients and leave its dispersion or variance parameter uncertified until
+`anofox-statistics` grows the slot.
+
+**What would change this:** nothing now. The bridge is built and F2 is shipped; a
+native F2 is no longer competitive at any price.
+
+### 3.1b Postscript: was HLD §3 right?
+
+"Reuse before rebuild" was **right, and for a more specific reason than it states.**
+
+What the bridge actually reused was the *mathematics that is expensive to get right and
+cheap to verify*: four censored likelihoods with their first and second derivatives, a
+damped Newton search, and the prior-to-penalty translation. Re-deriving those would have
+been most of a fortnight and every line of it would have needed its own finite-difference
+check.
+
+What it did **not** reuse, and could not, is anything shaped like an *interface*. The
+returned struct threw away the one object the bridge needed; the refusal vocabulary had
+to be re-mapped rather than adopted; the prior surface stops exactly where a Bayesian
+consumer needs it to continue. Roughly a third of the work was assembling a matrix from
+public primitives that already existed as a private local variable one crate over.
+
+So the rule that survived contact is narrower than HLD §3's wording: **reuse the
+mathematics, expect to re-derive the interface, and cross-check the seam against
+something the upstream crate publishes.** The `std_errors` agreement check is what makes
+this a dependency rather than a fork — it is a standing assertion that both crates still
+mean the same thing by the same likelihood, and it will fail loudly if the pinned
+revision is bumped to something that does not.
 
 ### 3.2 Is NUTS genuinely required for F5?
 

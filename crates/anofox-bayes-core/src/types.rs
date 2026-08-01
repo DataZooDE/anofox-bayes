@@ -96,6 +96,8 @@ impl FitStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum FamilyCode {
+    /// F2 — censored accelerated failure time, bridged onto `anofox-stats-core`.
+    CensoredAft = 2,
     /// F3 — pooled Gaussian linear model.
     PooledGaussian = 3,
     /// F7 — conjugate anomaly (Normal / Poisson closed forms).
@@ -107,6 +109,7 @@ impl FamilyCode {
     /// a catalog test enforces it.
     pub fn as_str(&self) -> &'static str {
         match self {
+            FamilyCode::CensoredAft => "censored_aft",
             FamilyCode::PooledGaussian => "pooled_gaussian",
             FamilyCode::ConjugateAnomaly => "conjugate_anomaly",
         }
@@ -115,6 +118,7 @@ impl FamilyCode {
     /// Decode a `__family__` value read back off a draws table.
     pub fn from_code(code: i32) -> Option<Self> {
         match code {
+            2 => Some(FamilyCode::CensoredAft),
             3 => Some(FamilyCode::PooledGaussian),
             7 => Some(FamilyCode::ConjugateAnomaly),
             _ => None,
@@ -232,9 +236,14 @@ mod tests {
     /// change what a table written last quarter says it contains.
     #[test]
     fn family_codes_are_stable_and_round_trip() {
+        assert_eq!(FamilyCode::CensoredAft as i32, 2);
         assert_eq!(FamilyCode::PooledGaussian as i32, 3);
         assert_eq!(FamilyCode::ConjugateAnomaly as i32, 7);
-        for code in [FamilyCode::PooledGaussian, FamilyCode::ConjugateAnomaly] {
+        for code in [
+            FamilyCode::CensoredAft,
+            FamilyCode::PooledGaussian,
+            FamilyCode::ConjugateAnomaly,
+        ] {
             assert_eq!(FamilyCode::from_code(code as i32), Some(code));
         }
         // The gaps are families the catalog does not ship, not aliases for one it

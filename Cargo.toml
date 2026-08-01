@@ -30,6 +30,12 @@ serde = "1.0"
 serde_json = "1.0"
 thiserror = "2.0"
 libc = "0.2"
+# The bridge onto anofox-statistics (roadmap gap 2 / HLD SS3 "reuse before rebuild").
+# Pinned to an exact revision, never a branch: this dependency supplies the censored
+# AFT likelihood and the curvature primitive that a bridged posterior is built from,
+# so a silent upstream change would silently change customers' posteriors. Bumping it
+# is a deliberate act that must re-run the SBC suite and consider ALGORITHM_VERSION.
+anofox-stats-core = { git = "https://github.com/DataZooDE/anofox-statistics.git", rev = "26f236e0970ba5f6bee5482fc940401cac45109b" }
 
 [profile.release]
 lto = true

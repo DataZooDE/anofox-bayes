@@ -12,6 +12,7 @@ name = "anofox_bayes_core"
 path = "src/lib.rs"
 
 [dependencies]
+anofox-stats-core.workspace = true
 faer.workspace = true
 statrs.workspace = true
 rand.workspace = true
