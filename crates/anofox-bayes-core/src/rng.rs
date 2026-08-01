@@ -44,6 +44,30 @@ impl BayesRng {
         }
     }
 
+    /// Derive the stream for one **group** of one chain of a fit.
+    ///
+    /// The reason this exists rather than `for_chain` being reused: a family that
+    /// fits its groups independently samples them in parallel, and a single shared
+    /// stream would tie a group's numbers to the *order* its task happened to run in.
+    /// Keying on the group's own identity instead makes the draws a function of the
+    /// data and the seed alone — same numbers on one thread and on thirty-two, same
+    /// numbers whichever order the rows arrived in, and same numbers whether the group
+    /// was fitted alone or alongside twenty thousand others.
+    ///
+    /// The key is length-prefixed before the chain index for the same reason
+    /// `derive_model_id` length-prefixes its fields: without it, group `"a"` on chain
+    /// 0x62 and group `"ab"` on chain 0 would hash the same bytes.
+    pub fn for_group(seed: u64, chain: u32, group: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&seed.to_le_bytes());
+        hasher.update(&(group.len() as u64).to_le_bytes());
+        hasher.update(group.as_bytes());
+        hasher.update(&chain.to_le_bytes());
+        Self {
+            inner: ChaCha20Rng::from_seed(*hasher.finalize().as_bytes()),
+        }
+    }
+
     /// A draw from `N(0, 1)`.
     pub fn standard_normal(&mut self) -> f64 {
         StandardNormal.sample(&mut self.inner)
@@ -125,6 +149,41 @@ mod tests {
         let xs: Vec<u64> = (0..64).map(|_| x.standard_normal().to_bits()).collect();
         let ys: Vec<u64> = (0..64).map(|_| y.standard_normal().to_bits()).collect();
         assert_ne!(xs, ys);
+    }
+
+    /// The same trap as `chains_are_independent_streams`, one level down: two groups
+    /// sharing a stream would make two SKUs' posteriors identical, and a portfolio
+    /// total built on them would have the wrong variance.
+    #[test]
+    fn groups_are_independent_streams() {
+        let bits = |seed, chain, group| {
+            let mut r = BayesRng::for_group(seed, chain, group);
+            (0..64)
+                .map(|_| r.standard_normal().to_bits())
+                .collect::<Vec<_>>()
+        };
+        // Reproducible...
+        assert_eq!(bits(7, 0, "SKU-1"), bits(7, 0, "SKU-1"));
+        // ...and every coordinate matters on its own.
+        assert_ne!(bits(7, 0, "SKU-1"), bits(7, 0, "SKU-2"));
+        assert_ne!(bits(7, 0, "SKU-1"), bits(7, 1, "SKU-1"));
+        assert_ne!(bits(7, 0, "SKU-1"), bits(8, 0, "SKU-1"));
+        // Neighbouring keys must not share structure the way `seed ^ chain` does.
+        assert_ne!(bits(7, 0, "SKU-0000001"), bits(7, 0, "SKU-0000002"));
+    }
+
+    /// Length-prefixing, checked rather than asserted in a comment: without it the
+    /// key and the chain index would run together and `("a", 0x62..)` could be made
+    /// to collide with `("ab", 0)`.
+    #[test]
+    fn a_group_key_cannot_bleed_into_the_chain_index() {
+        let bits = |chain, group| {
+            let mut r = BayesRng::for_group(0, chain, group);
+            (0..8)
+                .map(|_| r.standard_normal().to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(bits(0, "ab"), bits(0x62, "a"));
     }
 
     #[test]

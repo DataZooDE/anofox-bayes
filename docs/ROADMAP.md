@@ -32,7 +32,7 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | Degradation, sharply worse at thousands of groups | 3–5 | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | Degradation; a pre-fit gate agents cannot run today | 4–6 | — |
 | 13 | No `anofox-scenario` integration (BR-9) | 01–07 | Degradation; branching a draws table is the agent's job | 5–8 | scenario's catalog API |
-| 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | Degradation, only past the measured ceilings | 8–14 | — |
+| 14 | ~~Group parallelism~~ **done**; streaming sufficient statistics, lazy draw emission | 01, 07 | Degradation, only past the measured ceilings | 4–8 remaining | — |
 
 Two ranking notes worth stating rather than leaving implicit.
 
@@ -123,10 +123,17 @@ the order.
   so `pooled_gaussian` already substitutes and the v0.3 family covers per-segment
   spread. A native Gamma-delay family buys the Gamma branch and little else.
 - **Prior-predictive checks** (gap 12) and **`anofox-scenario` integration** (gap 13).
-- **Scale work** (gap 14): rayon across groups for `conjugate_anomaly`, streaming
-  sufficient statistics rather than buffering the input relation, lazy per-chunk draw
-  emission. All three are recorded in `SCALABILITY.md`. None is hit by the workloads
-  the shipped families target; the BR-1 acceptance case completes in ~4 s.
+- **Scale work** (gap 14): rayon across groups for `conjugate_anomaly` is **done** —
+  8x crate-side, 1.6x end to end, with the draws provably unchanged by thread count or
+  group order. Two items remain, both re-scoped against measurements in
+  `SCALABILITY.md`: streaming sufficient statistics rather than buffering the input
+  relation is **C++ work**, because the buffering lives in `BayesFitGlobalState` and
+  the core only ever sees a materialised relation; and lazy per-chunk draw emission
+  buys ~11 % of peak memory rather than the large win it sounds like, and is blocked
+  by diagnostics needing a parameter's whole chain before the fit can be graded. The
+  new largest share of a wide fit's wall time is the FFI row boundary, which is also
+  C++ work. None is hit by the workloads the shipped families target; the BR-1
+  acceptance case completes in ~2.8 s.
 
 ## 3. Decisions to take before building
 

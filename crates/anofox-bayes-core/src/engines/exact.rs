@@ -13,7 +13,6 @@
 use crate::catalog::CompiledModel;
 use crate::draws::SampleStats;
 use crate::errors::{BayesError, BayesResult};
-use crate::rng::BayesRng;
 use crate::types::EngineKind;
 
 use super::{Engine, Sample, SampleOptions};
@@ -52,20 +51,25 @@ impl Engine for ExactEngine {
         }
 
         let mut values = vec![0.0; opts.n_chains * opts.n_draws * n_params];
+        let block = opts.n_draws * n_params;
         for chain in 0..opts.n_chains {
-            // A fresh stream per chain, derived from (seed, chain). Chains of an
-            // exact sampler are already independent; separate streams keep them
-            // reproducible individually, so a single chain can be re-drawn without
-            // re-running the others.
-            let mut rng = BayesRng::for_chain(opts.seed, chain as u32);
-            for draw in 0..opts.n_draws {
-                let offset = (chain * opts.n_draws + draw) * n_params;
-                let slots = &mut values[offset..offset + n_params];
-                match opts.sample_from {
-                    crate::types::SampleFrom::Posterior => exact.sample_into(&mut rng, slots)?,
-                    crate::types::SampleFrom::Prior => exact.sample_prior_into(&mut rng, slots)?,
-                }
-            }
+            // A chain at a time, each from a stream derived from (seed, chain).
+            // Chains of an exact sampler are already independent; separate streams
+            // keep them reproducible individually, so a single chain can be re-drawn
+            // without re-running the others.
+            //
+            // How the chain is filled is the *family's* decision, not the engine's:
+            // a family whose groups are independent splits the work across them and
+            // keys each group's stream on its own identity. The engine cannot make
+            // that split, because it does not know which slots belong together.
+            let offset = chain * block;
+            exact.sample_chain_into(
+                opts.seed,
+                chain as u32,
+                opts.n_draws,
+                opts.sample_from,
+                &mut values[offset..offset + block],
+            )?;
         }
 
         // No sample statistics. Emitting `__divergent__ = 0` here would be a lie of
@@ -85,6 +89,7 @@ mod tests {
     use crate::config::Config;
     use crate::data::testing::Frame;
     use crate::draws::ParamName;
+    use crate::rng::BayesRng;
 
     /// A model whose posterior is a known standard normal, so the engine's plumbing
     /// can be checked without a family's mathematics in the way.

@@ -25,7 +25,7 @@ use crate::data::DataView;
 use crate::draws::ParamName;
 use crate::errors::{BayesError, BayesResult};
 use crate::rng::BayesRng;
-use crate::types::{EngineKind, FamilyCode, FitStatus};
+use crate::types::{EngineKind, FamilyCode, FitStatus, SampleFrom};
 
 /// A family's structural verdict on its data, reached before any sampling.
 ///
@@ -274,6 +274,48 @@ pub trait ExactPosterior {
             "sample_from",
             "this family cannot draw from its prior",
         ))
+    }
+
+    /// Fill one whole chain: `out` is `n_draws` blocks of `param_names().len()`
+    /// values, in the layout [`Posterior`](crate::draws::Posterior) expects.
+    ///
+    /// The default runs the chain sequentially from a single stream derived from
+    /// `(seed, chain)`, which is exactly what the engine did before this method
+    /// existed — a family that does not override it is unaffected.
+    ///
+    /// A family whose groups are independent overrides it to sample them in
+    /// parallel. The override is a family's responsibility rather than the engine's
+    /// because only the family knows which slots of `out` belong to which group, and
+    /// therefore which randomness may be split without changing the answer. Any
+    /// override owes the same guarantee the default gives for free: the numbers must
+    /// not depend on the thread count or on the order the groups are visited in.
+    fn sample_chain_into(
+        &self,
+        seed: u64,
+        chain: u32,
+        n_draws: usize,
+        sample_from: SampleFrom,
+        out: &mut [f64],
+    ) -> BayesResult<()> {
+        if n_draws == 0 || out.is_empty() {
+            return Ok(());
+        }
+        if !out.len().is_multiple_of(n_draws) {
+            return Err(BayesError::DimensionMismatch(format!(
+                "{} slots do not divide into {n_draws} draws",
+                out.len()
+            )));
+        }
+        let n_params = out.len() / n_draws;
+        let mut rng = BayesRng::for_chain(seed, chain);
+        for draw in 0..n_draws {
+            let slots = &mut out[draw * n_params..(draw + 1) * n_params];
+            match sample_from {
+                SampleFrom::Posterior => self.sample_into(&mut rng, slots)?,
+                SampleFrom::Prior => self.sample_prior_into(&mut rng, slots)?,
+            }
+        }
+        Ok(())
     }
 }
 

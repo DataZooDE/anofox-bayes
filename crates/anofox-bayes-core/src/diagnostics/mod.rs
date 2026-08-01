@@ -27,6 +27,7 @@ pub use ess::{ess_bulk, ess_tail};
 pub use rhat::rhat;
 
 use crate::draws::Posterior;
+use rayon::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
 
 /// Replace values by their normal scores: rank, then map through the inverse normal
@@ -193,7 +194,14 @@ pub fn chains_from_rows(values: &[f64], chains: &[i32], draws: &[i32]) -> Vec<Ve
 
 /// Compute diagnostics for every parameter of a posterior.
 pub fn diagnose(post: &Posterior) -> Vec<ParamDiagnostics> {
+    // Parallel over parameters, which is safe by construction and by far the largest
+    // share of a wide fit's wall time: R-hat and both ESS estimators read one
+    // parameter's chains and nothing else, so there is no shared state and no
+    // randomness. `collect` on an indexed parallel iterator preserves order, so the
+    // result is bit-identical to the sequential version whatever the thread count --
+    // pinned by `the_diagnostics_do_not_depend_on_the_thread_count`.
     (0..post.n_params())
+        .into_par_iter()
         .map(|p| {
             let chains: Vec<Vec<f64>> = (0..post.n_chains)
                 .map(|c| post.chain_values(c, p).collect())
@@ -248,6 +256,75 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// `diagnose` runs one rayon task per parameter. The results must come back in
+    /// parameter order and with identical numbers however many threads there are —
+    /// a diagnostics table whose rows were permuted by the scheduler would attach
+    /// each group's R-hat to the wrong group, which is worse than no diagnostics.
+    #[test]
+    fn the_diagnostics_do_not_depend_on_the_thread_count() {
+        use crate::draws::{ModelMeta, ParamName, Posterior};
+        use crate::types::{EngineKind, FamilyCode, FitStatus, SampleFrom};
+
+        let (n_chains, n_draws, n_params) = (2usize, 400usize, 60usize);
+        let params: Vec<ParamName> = (0..n_params)
+            .map(|p| ParamName::grouped(format!("G{p:03}"), "mu").unwrap())
+            .collect();
+        // Every parameter gets a visibly different chain, so a permuted result is
+        // detectable rather than hidden behind coincidentally equal numbers.
+        let chains: Vec<Vec<f64>> = (0..n_chains * n_params)
+            .map(|i| iid_chain(i as u64, n_draws, (i % n_params) as f64))
+            .collect();
+        let mut values = Vec::with_capacity(n_chains * n_draws * n_params);
+        for c in 0..n_chains {
+            let block = &chains[c * n_params..(c + 1) * n_params];
+            for d in 0..n_draws {
+                values.extend(block.iter().map(|chain| chain[d]));
+            }
+        }
+        let post = Posterior::new(
+            ModelMeta {
+                model_id: "t".into(),
+                family: FamilyCode::ConjugateAnomaly,
+                engine: EngineKind::Exact,
+                status: FitStatus::Converged,
+                seed: 1,
+                n_obs: 0,
+                n_groups: n_params,
+                n_groups_unready: 0,
+                sample_from: SampleFrom::Posterior,
+            },
+            params,
+            n_chains,
+            n_draws,
+            values,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| diagnose(&post))
+        };
+        let one = run(1);
+        assert_eq!(one.len(), n_params);
+        assert_eq!(
+            one[7].group_id, "G007",
+            "results must stay in parameter order"
+        );
+        for threads in [4, 16] {
+            let many = run(threads);
+            for (a, b) in one.iter().zip(&many) {
+                assert_eq!(a.group_id, b.group_id);
+                assert_eq!(a.ess_bulk.to_bits(), b.ess_bulk.to_bits());
+                assert_eq!(a.ess_tail.to_bits(), b.ess_tail.to_bits());
+                assert_eq!(a.rhat.map(f64::to_bits), b.rhat.map(f64::to_bits));
+            }
+        }
+    }
 
     #[test]
     fn a_parameter_with_no_rhat_can_still_fail_on_ess() {

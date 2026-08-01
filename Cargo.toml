@@ -10,9 +10,18 @@ authors = ["DataZoo GmbH <info@data-zoo.de>"]
 repository = "https://github.com/DataZooDE/anofox-bayes"
 
 [workspace.dependencies]
-# Linear algebra. Default features (which pull in rayon) are off: DuckDB owns
-# parallelism, and a nested thread pool inside a table function is a liability.
+# Linear algebra. Default features (which pull in rayon) are off deliberately: a
+# pooled fit is one joint system, and faer's internal parallelism would fight the
+# group-level parallelism below for the same cores without a matching speedup.
 faer = { version = "0.23", default-features = false, features = ["std", "linalg"] }
+# Group-level parallelism for `conjugate_anomaly`, which fits and samples each group
+# independently. Used *only* where the work is embarrassingly parallel and the result
+# is provably order-independent -- every group's draws come from a stream keyed by the
+# group's own identity, so the pool size never reaches the numbers. DuckDB runs this
+# operator on one thread (`MaxThreads() == 1`, because a posterior is a function of
+# every row), so the pool is not competing with DuckDB for a partitioned scan; it is
+# the only parallelism the fit has available.
+rayon = "1.10"
 # Distributions and special functions (log-gamma, quantiles, CDFs).
 statrs = "0.18"
 # Sampling. `rand_chacha` is the reproducibility guarantee: a counter-based

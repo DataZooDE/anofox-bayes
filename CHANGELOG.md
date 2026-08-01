@@ -7,6 +7,39 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Changed — `conjugate_anomaly` fits its groups in parallel
+
+Roadmap gap 14, first of three. `docs/SCALABILITY.md` carries the measurements.
+
+- **Group parallelism.** Sampling and diagnostics now run one rayon task per group and
+  per parameter. Crate-side wall time at 5 000 groups × 1 000 draws falls from 1 904 ms
+  to 229 ms (8x); the BRD BR-1 acceptance case falls from 4.4 s to 2.8 s end to end
+  (1.6x — the fit is now a minority of the query, and `SCALABILITY.md` says where the
+  rest goes). `pooled_gaussian` is untouched: a pooled fit is one joint system.
+- **Diagnostics were the bottleneck, not sampling** — 1 422 ms of the 1 904 ms above.
+  That was not what `SCALABILITY.md` predicted, and it is why the biggest single
+  improvement here is in `diagnostics::diagnose` rather than in the sampler.
+- **⚠ `conjugate_anomaly` draws have changed, and `ALGORITHM_VERSION` is now 3.** Each
+  group draws from a stream keyed on the group's **own identity**
+  (`BayesRng::for_group(seed, chain, key)`) rather than from a shared sequential
+  stream. That is what makes the parallelism safe, and it is a strictly better
+  property than the one it replaces: a group's draws no longer depend on its position
+  in the input relation, so re-ordering the rows, batching a wide group set, or
+  fitting a group alone all reproduce the same numbers. A fit re-run on this build
+  gets a *different* `model_id` from the same request on the previous build, rather
+  than silently serving old draws under a new identity.
+- **Row partitioning is ~6x faster** (`DataView::group_rows`, 113 ms → 18 ms at
+  520 000 rows): one hash lookup per row instead of two ordered `BTreeMap` probes.
+  First-seen group order — which fixes the parameter order and therefore the emission
+  order — is preserved exactly.
+- **Per-group *fitting* is deliberately still serial.** Running it on rayon was tried
+  and measured *slower*; the conjugate update is one pass over sufficient statistics
+  and the per-task allocation costs more than the arithmetic.
+- `validation/bench.py --threads` now varies both thread axes (`SET threads` and
+  `RAYON_NUM_THREADS`) and asserts the draws digest is identical across all four
+  configurations. `cargo run --release --example scale_profile` reports the crate-side
+  phase breakdown the numbers above come from.
+
 ### Added — `censored_aft` (F2), bridged onto anofox-statistics
 
 Roadmap gap 2, and the first time HLD §3's "reuse before rebuild" has actually been
