@@ -733,7 +733,10 @@ mod tests {
 
         let k = 3usize; // intercept + two slopes, all flat
         let cols = draw(&*model, 200_000, 41);
-        let var: Vec<f64> = cols[index_of(&*model, "sigma")].iter().map(|s| s * s).collect();
+        let var: Vec<f64> = cols[index_of(&*model, "sigma")]
+            .iter()
+            .map(|s| s * s)
+            .collect();
 
         // The degrees of freedom are what set the *shape*, so the scale-free
         // signature to check is the coefficient of variation: for InvGamma(a, b) the
@@ -767,7 +770,10 @@ mod tests {
     fn a_proper_coefficient_prior_costs_no_degrees_of_freedom() {
         let n = 24usize;
         let frame = Frame::new(n)
-            .numeric("y", (0..n).map(|i| 2.0 + ((i % 7) as f64 - 3.0) * 0.5).collect())
+            .numeric(
+                "y",
+                (0..n).map(|i| 2.0 + ((i % 7) as f64 - 3.0) * 0.5).collect(),
+            )
             .numeric("x1", (0..n).map(|i| i as f64 / 3.0).collect());
         let refs = frame.key_refs();
         let view = frame.view(&refs);
@@ -779,7 +785,10 @@ mod tests {
         )
         .unwrap();
         let cols = draw(&*model, 200_000, 43);
-        let var: Vec<f64> = cols[index_of(&*model, "sigma")].iter().map(|s| s * s).collect();
+        let var: Vec<f64> = cols[index_of(&*model, "sigma")]
+            .iter()
+            .map(|s| s * s)
+            .collect();
         let m = var.iter().sum::<f64>() / var.len() as f64;
         let sd = (var.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (var.len() - 1) as f64).sqrt();
 

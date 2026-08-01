@@ -42,7 +42,18 @@ tables persisted by a customer stay readable across extension upgrades.
 - Simulation-based calibration per family and per engine, with fixtures proving the
   harness rejects overconfident and biased posteriors before any real family runs.
 - PyMC golden-run parity suite (`validation/`, uv + pytest), run in CI.
-- 150 Rust unit tests, 164 sqllogictest assertions.
+- 153 Rust unit tests, 181 sqllogictest assertions, 32 PyMC parity tests.
+
+### Fixed
+
+- **F3's residual-scale posterior was over-confident.** The Normal-Inverse-Gamma
+  shape `a0 + n/2` is correct only when the coefficient prior is proper and
+  sigma-scaled; under the default flat prior the textbook shape is `a0 + (n - k)/2`
+  for `k` freely estimated coefficients. Every F3 credible interval was too narrow by
+  `sqrt((n - k)/n)` — ~2 % on typical designs, growing with `k/n`. Found by the PyMC
+  parity suite, which is the only harness that could have: SBC must draw its truth
+  from a proper prior, and so only ever exercised the case where the old formula was
+  right.
 
 ### Notes
 
