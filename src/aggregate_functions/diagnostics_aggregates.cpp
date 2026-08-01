@@ -152,10 +152,9 @@ AggregateFunction MakeDiagnostic(const char *name) {
 	// contract's own columns bind, and so do row_number() and generate_series()
 	// output, which are BIGINT and would otherwise need an explicit cast at every
 	// call site.
-	return AggregateFunction(name, {LogicalType::DOUBLE, LogicalType::BIGINT, LogicalType::BIGINT},
-	                         LogicalType::DOUBLE, AggregateFunction::StateSize<DiagnosticState>, DiagnosticInitialize,
-	                         DiagnosticUpdate, DiagnosticCombine, DiagnosticFinalize<KIND>, nullptr, nullptr,
-	                         DiagnosticDestroy);
+	return AggregateFunction(name, {LogicalType::DOUBLE, LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::DOUBLE,
+	                         AggregateFunction::StateSize<DiagnosticState>, DiagnosticInitialize, DiagnosticUpdate,
+	                         DiagnosticCombine, DiagnosticFinalize<KIND>, nullptr, nullptr, DiagnosticDestroy);
 }
 
 void RegisterOne(ExtensionLoader &loader, const AggregateFunction &func, const char *description) {

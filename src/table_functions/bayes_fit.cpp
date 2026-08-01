@@ -190,8 +190,7 @@ void RunFit(const BayesFitBindData &bind_data, BayesFitGlobalState &gstate) {
 			if (!anofox_bayes_ffi_data_add_numeric(data, Borrow(bind_data.numeric_names[c]),
 			                                       gstate.numeric_values[c].data(),
 			                                       reinterpret_cast<const bool *>(valid.data()), gstate.n_rows)) {
-				throw InternalException("anofox_bayes_fit: rejected numeric column '%s'",
-				                        bind_data.numeric_names[c]);
+				throw InternalException("anofox_bayes_fit: rejected numeric column '%s'", bind_data.numeric_names[c]);
 			}
 		}
 		for (idx_t c = 0; c < bind_data.key_names.size(); c++) {
@@ -287,9 +286,8 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 } // anonymous namespace
 
 void RegisterBayesFitFunction(ExtensionLoader &loader) {
-	TableFunction fit("anofox_bayes_fit",
-	                  {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::ANY},
-	                  nullptr, BayesFitBind, BayesFitInitGlobal);
+	TableFunction fit("anofox_bayes_fit", {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::ANY}, nullptr,
+	                  BayesFitBind, BayesFitInitGlobal);
 	fit.in_out_function = BayesFitInOut;
 	fit.in_out_function_final = BayesFitFinalize;
 

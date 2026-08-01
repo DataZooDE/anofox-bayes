@@ -16,8 +16,7 @@ namespace {
 
 void VersionFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	ConstantVector::GetData<string_t>(result)[0] =
-	    StringVector::AddString(result, anofox_bayes_ffi_version());
+	ConstantVector::GetData<string_t>(result)[0] = StringVector::AddString(result, anofox_bayes_ffi_version());
 }
 
 void DrawsSchemaVersionFunction(DataChunk &args, ExpressionState &state, Vector &result) {
