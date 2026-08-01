@@ -5,32 +5,49 @@
 //! about which engine will consume it — that separation is what lets a family gain a
 //! sampler, or an engine gain a family, without either being edited.
 //!
-//! | Engine | Posterior | Chains |
-//! |---|---|---|
-//! | [`ExactEngine`] | closed form, conjugate families only | 1 |
-//! | Laplace (0.1, next) | Gaussian approximation at the mode | 1 |
-//! | NUTS (0.2) | asymptotically exact, any family | many |
+//! | Engine | Posterior | Chains | Sample statistics |
+//! |---|---|---|---|
+//! | [`ExactEngine`] | closed form, conjugate families only | 1 | none |
+//! | [`LaplaceEngine`] | Gaussian approximation at the mode | 1 | none |
+//! | [`NutsEngine`] | asymptotically exact, any differentiable family | many | `__lp__`, `__divergent__`, `__energy__`, `__step_size__` |
 //!
 //! Engines that draw independently write `chain = 0` and emit no Hamiltonian sample
 //! statistics; R̂ is then undefined for their output, which is correct — there is no
-//! convergence to assess when every draw is already independent.
+//! convergence to assess when every draw is already independent. NUTS is the first
+//! engine here that produces a genuine Markov chain, so it is the first for which R̂
+//! and the divergence count mean anything at all.
 
 pub mod exact;
 pub mod laplace;
+pub mod nuts;
 
 pub use exact::ExactEngine;
 pub use laplace::LaplaceEngine;
+pub use nuts::NutsEngine;
 
 use crate::catalog::CompiledModel;
 use crate::draws::SampleStats;
-use crate::errors::{BayesError, BayesResult};
+use crate::errors::BayesResult;
 use crate::types::EngineKind;
+
+/// Adaptation draws a Markov sampler takes before the draws it keeps.
+///
+/// Stan's and PyMC's default, and `nuts-rs`'s own, and there is no reason to differ:
+/// it is long enough to fit a diagonal mass matrix and a step size on the models this
+/// catalog contains, and short enough that a per-group fit stays interactive. It is a
+/// config slot (`warmup`) rather than a constant because a badly conditioned posterior
+/// legitimately needs more, and because a caller who has to raise it has learned
+/// something about their model that they should be allowed to act on.
+pub const DEFAULT_WARMUP: usize = 1000;
 
 /// How much sampling to do.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SampleOptions {
     pub n_chains: usize,
     pub n_draws: usize,
+    /// Adaptation draws, discarded before the output. Ignored by engines that draw
+    /// independently — there is nothing to adapt when every draw is already exact.
+    pub n_warmup: usize,
     pub seed: u64,
 }
 
@@ -41,6 +58,7 @@ impl Default for SampleOptions {
             // 1000 draws give a bulk ESS comfortably above the 400 gate for an
             // independent sampler, without making a per-group fit expensive.
             n_draws: 1000,
+            n_warmup: DEFAULT_WARMUP,
             seed: crate::config::DEFAULT_SEED,
         }
     }
@@ -73,11 +91,7 @@ pub fn resolve(kind: EngineKind) -> BayesResult<Box<dyn Engine>> {
     match kind {
         EngineKind::Exact => Ok(Box::new(ExactEngine)),
         EngineKind::Laplace => Ok(Box::new(LaplaceEngine)),
-        EngineKind::Nuts => Err(BayesError::config(
-            "engine",
-            "the NUTS engine arrives in 0.2. Until then use 'exact' (closed-form, the \
-             default for both families) or 'laplace' (pooled_gaussian only)",
-        )),
+        EngineKind::Nuts => Ok(Box::new(NutsEngine)),
     }
 }
 
@@ -99,13 +113,20 @@ mod tests {
         );
     }
 
-    /// An engine that is not built yet must say so. Falling back to a different
-    /// engine would give the caller numbers with a different warranty than the ones
-    /// they asked for, and nothing downstream could tell.
     #[test]
-    fn an_unavailable_engine_is_an_error_rather_than_a_substitution() {
-        let err = resolve(EngineKind::Nuts).unwrap_err();
-        assert!(matches!(err, BayesError::Config { ref slot, .. } if slot == "engine"));
+    fn the_nuts_engine_is_available_and_reports_its_kind() {
+        assert_eq!(resolve(EngineKind::Nuts).unwrap().kind(), EngineKind::Nuts);
+    }
+
+    /// Every engine in the catalog resolves. The refusal path for an engine that
+    /// cannot serve a *family* still exists and is exercised by
+    /// `fit::tests::an_engine_that_cannot_serve_the_family_is_an_error`; what is gone
+    /// is the refusal for an engine that had not been written yet.
+    #[test]
+    fn every_engine_kind_resolves_to_an_engine_that_reports_the_same_kind() {
+        for kind in [EngineKind::Exact, EngineKind::Laplace, EngineKind::Nuts] {
+            assert_eq!(resolve(kind).unwrap().kind(), kind);
+        }
     }
 
     #[test]

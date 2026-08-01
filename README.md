@@ -113,9 +113,13 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by
 predictors → `pooled_gaussian`.**
 
+Three engines: `exact` (closed-form, the default), `laplace` (a Gaussian at the mode)
+and `nuts` (the No-U-Turn Sampler, via [`nuts-rs`](https://github.com/pymc-devs/nuts-rs)).
+Switching between them changes no caller SQL.
+
 Planned, and *not* present today: hierarchical negative-binomial (F1), censored
-survival (F2), payment delay (F4), payer-alive/BTYD (F5), elasticity (F6), and the
-NUTS engine. See [the roadmap](#roadmap).
+survival (F2), payment delay (F4), payer-alive/BTYD (F5) and elasticity (F6). See
+[the roadmap](#roadmap).
 
 There is deliberately **no `predict` function** — posterior prediction is a join over
 the draws table, which is both simpler and faster. See
@@ -156,8 +160,8 @@ test suite, so they cannot drift from the implementation.
 
 | | |
 |---|---|
-| **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, exact + Laplace engines, diagnostics, calibration suites |
-| v0.2 | NUTS engine, hierarchical negative-binomial (F1), censored survival (F2) |
+| **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, exact + Laplace + NUTS engines, diagnostics, calibration suites |
+| v0.2 | Hierarchical negative-binomial (F1), censored survival (F2) |
 | v0.3 | Payment delay, BTYD, elasticity families; scenario integration |
 
 Breaking changes are expected at v0.x. Use the

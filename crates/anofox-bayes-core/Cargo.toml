@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 faer.workspace = true
+nuts-rs.workspace = true
 statrs.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

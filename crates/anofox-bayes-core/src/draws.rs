@@ -228,6 +228,25 @@ impl Posterior {
         (0..self.n_draws).map(move |d| self.values[base + d * n_params])
     }
 
+    /// How many kept draws the sampler reported as divergent.
+    ///
+    /// `None` — not `Some(0)` — when no engine reported the statistic, for the same
+    /// reason the row is omitted rather than written as zero: "the sampler saw no
+    /// divergences" and "no sampler ran" are different claims, and only one of them
+    /// licenses a decision. [`crate::fit::fit`] reads this to grade the fit, so the
+    /// distinction is load-bearing rather than cosmetic.
+    pub fn n_divergent(&self) -> Option<usize> {
+        // The statistic shape is uniform across draws (`Posterior::new` enforces it),
+        // so the first draw decides whether the sampler measured divergences at all.
+        self.stats.first()?.divergent?;
+        Some(
+            self.stats
+                .iter()
+                .filter(|s| s.divergent.is_some_and(|d| d != 0.0))
+                .count(),
+        )
+    }
+
     /// Statistics rows emitted per draw. Uniform across draws by construction.
     fn stats_per_draw(&self) -> usize {
         match self.stats.first() {
@@ -644,6 +663,58 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| r.param == PARAM_LP).count(), 6);
         // Energy and step size were absent, so they contribute nothing.
         assert!(rows.iter().all(|r| r.param != PARAM_ENERGY));
+    }
+
+    /// The count a fit is graded on. An engine that reported nothing must return
+    /// `None`, so that "clean" and "unmeasured" cannot be confused by the grader.
+    #[test]
+    fn the_divergence_count_distinguishes_clean_from_unmeasured() {
+        let base = posterior();
+        assert_eq!(base.n_divergent(), None);
+
+        let with_stats = |divergent: &[f64]| {
+            let stats: Vec<SampleStats> = divergent
+                .iter()
+                .map(|d| SampleStats {
+                    lp: Some(-1.0),
+                    divergent: Some(*d),
+                    ..Default::default()
+                })
+                .collect();
+            Posterior::new(
+                base.meta.clone(),
+                base.params.clone(),
+                2,
+                3,
+                (0..12).map(|v| v as f64).collect(),
+                stats,
+            )
+            .unwrap()
+        };
+        assert_eq!(with_stats(&[0.0; 6]).n_divergent(), Some(0));
+        assert_eq!(
+            with_stats(&[0.0, 1.0, 0.0, 0.0, 1.0, 1.0]).n_divergent(),
+            Some(3)
+        );
+
+        // A sampler that reports `lp` but not `divergent` has not measured
+        // divergences, and must not be read as having found none.
+        let lp_only: Vec<SampleStats> = (0..6)
+            .map(|_| SampleStats {
+                lp: Some(-1.0),
+                ..Default::default()
+            })
+            .collect();
+        let p = Posterior::new(
+            base.meta.clone(),
+            base.params.clone(),
+            2,
+            3,
+            (0..12).map(|v| v as f64).collect(),
+            lp_only,
+        )
+        .unwrap();
+        assert_eq!(p.n_divergent(), None);
     }
 
     #[test]

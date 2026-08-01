@@ -69,6 +69,7 @@ const SLOTS: &[&str] = &[
     "prior",
     "draws",
     "chains",
+    "warmup",
     "max_draw_megabytes",
     "seed",
     "engine",

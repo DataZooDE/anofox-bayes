@@ -102,6 +102,96 @@ SELECT value = 0 FROM laplace_draws WHERE param = '__status__';
 true
 
 #######################################
+# The third engine: same interface, and the first one with sampler statistics
+#######################################
+
+statement ok
+CREATE TABLE nuts_draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x1, x2, y FROM obs), 'pooled_gaussian',
+    {'y': 'y', 'x': ['x1', 'x2'], 'draws': 2000, 'seed': 3, 'engine': 'nuts'});
+
+# Four chains by default -- unlike the other two engines, which default to one. A
+# single NUTS chain cannot support R-hat, and R-hat is the diagnostic that would
+# reveal a Markov chain that had not converged.
+query I
+SELECT value FROM nuts_draws WHERE param = '__n_chains__';
+----
+4.0
+
+# Same parameters, same names, same group ids: a downstream query written against the
+# exact engine reads a NUTS table unchanged.
+query I
+SELECT count(*) = 0 FROM (
+    SELECT DISTINCT group_id, param FROM exact_draws
+    EXCEPT
+    SELECT DISTINCT group_id, param FROM nuts_draws
+);
+----
+true
+
+# And the same posterior. `pooled_gaussian` is conjugate, so there is a right answer
+# here rather than a second approximation -- which is exactly why the NUTS adapter is
+# certified against this family before it is trusted on one without a closed form.
+query III
+SELECT e.param,
+       abs(e.m - n.m) < 0.01 * abs(e.m)  AS means_agree,
+       abs(e.s - n.s) < 0.05 * e.s       AS spreads_agree
+FROM (SELECT param, avg(value) m, stddev_samp(value) s FROM exact_draws WHERE draw >= 0 GROUP BY param) e
+JOIN (SELECT param, avg(value) m, stddev_samp(value) s FROM nuts_draws  WHERE draw >= 0 GROUP BY param) n
+  USING (param)
+ORDER BY e.param;
+----
+beta[x1]	true	true
+beta[x2]	true	true
+intercept	true	true
+sigma	true	true
+
+# 2 = nuts.
+query I
+SELECT value FROM nuts_draws WHERE param = '__engine__';
+----
+2.0
+
+# The sampler statistics the draws contract has always reserved, populated for the
+# first time. One row per kept draw, for each of the four.
+query II
+SELECT param, count(*) FROM nuts_draws
+WHERE param IN ('__lp__', '__divergent__', '__energy__', '__step_size__')
+GROUP BY param ORDER BY param;
+----
+__divergent__	8000
+__energy__	8000
+__lp__	8000
+__step_size__	8000
+
+# No divergences on a well-conditioned Gaussian posterior -- and here `sum = 0` means
+# "the sampler explored cleanly" rather than "no sampler ran", because the rows exist.
+query I
+SELECT sum(value) FROM nuts_draws WHERE param = '__divergent__';
+----
+0.0
+
+# R-hat stops being NULL. It is the first time in this extension that the statistic is
+# computed rather than declined, and it is what makes `chains` load-bearing.
+query I
+SELECT count(*) FROM (
+    SELECT param FROM nuts_draws
+    WHERE draw >= 0
+      AND param NOT IN ('__lp__', '__divergent__', '__energy__', '__step_size__')
+    GROUP BY param
+    HAVING anofox_bayes_rhat(value, chain, draw) IS NULL
+       OR  anofox_bayes_rhat(value, chain, draw) > 1.01
+);
+----
+0
+
+query I
+SELECT value = 0 FROM nuts_draws WHERE param = '__status__';
+----
+true
+
+#######################################
 # An engine that cannot serve a family says so
 #######################################
 
@@ -114,14 +204,14 @@ SELECT * FROM anofox_bayes_fit(
 ----
 cannot serve
 
-# NUTS arrives in 0.2, and asking for it today is an error rather than a quiet
-# downgrade to an approximation with a different warranty.
+# The conjugate anomaly family has no gradient either, so NUTS declines it for the
+# same reason and with the same message shape.
 statement error
 SELECT * FROM anofox_bayes_fit(
-    (SELECT x1, y FROM obs), 'pooled_gaussian',
-    {'y': 'y', 'x': 'x1', 'engine': 'nuts', 'draws': 100});
+    (SELECT y FROM obs), 'conjugate_anomaly',
+    {'value': 'y', 'engine': 'nuts', 'draws': 100});
 ----
-0.2
+cannot serve
 
 statement error
 SELECT * FROM anofox_bayes_fit(

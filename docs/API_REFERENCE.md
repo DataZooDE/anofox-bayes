@@ -108,16 +108,18 @@ Understood by every family. Each family still declares them, so they pass
 | Slot | Type | Default | Range | Meaning |
 |---|---|---|---|---|
 | `draws` | integer | `1000` | 4 … 1 000 000 | Posterior draws per chain. 1000 clears the conventional 400 ESS gate for an independent sampler; use 4000 for tail probabilities and service levels. |
-| `chains` | integer | `1` | 1 … 64 | Independent chains. See the note below before raising it. |
+| `chains` | integer | `1`, or `4` under `nuts` | 1 … 64 | Independent chains. See the note below. |
+| `warmup` | integer | `1000` | 1 … 1 000 000 | Adaptation draws for `nuts`, **discarded** — they never appear in the output. Ignored by `exact` and `laplace`, which have nothing to adapt. Raise it when a NUTS fit reports divergences or a low ESS. Part of `model_id`. |
 | `seed` | integer | `20260801` | ≥ 0 (exact integer) | Feeds a ChaCha counter-based stream, so draws are byte-identical across platforms for a given seed. A different seed is a different `model_id`. |
 | `engine` | string | family default | `exact`, `laplace`, `nuts` | See [§1.3](#13-engines). |
 | `max_draw_megabytes` | integer | `2048` | 1 … 1 048 576 | Ceiling on the in-memory draw buffer, checked *before* allocating. A larger request is refused with a message naming the shape. Raise only if the memory genuinely exists — see [Scalability](SCALABILITY.md). |
 
-**On `chains`.** It defaults to 1, and that is not a limitation to work around. R̂
-exists to detect a Markov chain that has not mixed, and both v0.1 engines draw
-*independently* — so a second chain buys an R̂ of 1.0 that means nothing. Raise it only
-if you want the cross-check for its own sake; the gate in v0.1 is ESS. It becomes
-load-bearing when the NUTS engine lands. Memory scales linearly with it.
+**On `chains`.** The default depends on the engine, and has to. Under `exact` and
+`laplace` it is 1: those engines draw *independently*, so there is no Markov chain that
+could fail to mix and a second chain buys an R̂ of 1.0 that means nothing. Raise it
+there only if you want the cross-check for its own sake; the gate is ESS. Under `nuts`
+it is 4, because R̂ is the diagnostic that would reveal a chain which had not converged
+and one chain cannot support it. Memory scales linearly with it.
 
 ### 1.3 Engines
 
@@ -125,7 +127,25 @@ load-bearing when the NUTS engine lands. Memory scales linearly with it.
 |---|---|
 | `exact` | **Available**, and the default for both families. Samples the closed-form conjugate posterior directly — no approximation, so where it applies it is both faster and more accurate. |
 | `laplace` | **Available on `pooled_gaussian`.** Fits a Gaussian at the posterior mode on an unconstrained scale. `conjugate_anomaly` exposes no gradient and rejects it: *"the laplace engine cannot serve family 'conjugate_anomaly'"*. |
-| `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2. Until then use 'exact' … or 'laplace' …"*. |
+| `nuts` | **Available on `pooled_gaussian`.** The No-U-Turn Sampler, via a pinned [`nuts-rs`](https://github.com/pymc-devs/nuts-rs) (pymc-devs, the sampler behind nutpie). Needed for posteriors with no closed form; far slower than the other two, and not the default anywhere it is not needed. `conjugate_anomaly` exposes no gradient and rejects it: *"the nuts engine cannot serve family 'conjugate_anomaly'"*. |
+
+**What is different about a `nuts` table.** Same columns, same parameter names, same
+diagnostics — but it is the only engine that produces a Markov chain, so three things
+appear that the others leave absent:
+
+- `chains` defaults to **4**, and `anofox_bayes_rhat` returns a number rather than `NULL`.
+- The reserved sample-statistic rows are populated: `__lp__`, `__divergent__`,
+  `__energy__` and `__step_size__`, one row per draw per chain. See
+  [the draws contract](DRAWS_CONTRACT.md).
+- `warmup` (default 1000) adaptation draws run before the kept ones and are discarded.
+
+**Divergences fail the fit.** `sum(__divergent__) > 0` makes `__status__` `degenerate`.
+There is no tolerance to raise: the draws around a divergent trajectory are not from
+the posterior. If it happens, raise `warmup` first.
+
+Determinism holds for `nuts` exactly as for the other engines: the same seed gives
+byte-identical draws, whatever the chain count and whatever DuckDB's thread layout,
+because chains are seeded from `(seed, chain)` and run sequentially.
 
 Switching engines changes no caller SQL: same function, same output columns, same
 diagnostics. It does change `model_id`, because two posteriors carrying different
@@ -358,7 +378,8 @@ mean the ridge estimate with that penalty.
 
 **Pooling.** `pool_scale` is *fixed by configuration, not estimated.* Estimating
 it means a hierarchical variance parameter whose posterior is not conjugate and
-needs the NUTS engine (0.2). Fixing it is the documented stepping stone, and small
+needs a sampler rather than a formula. The `nuts` engine now exists; the family that
+would use it this way does not yet. Fixing it is the documented stepping stone, and small
 groups are therefore shrunk toward the population intercept while large ones are
 not.
 
@@ -432,7 +453,7 @@ anofox_bayes_ess_tail(value, chain, draw)  -> DOUBLE
 > so a second chain buys an R̂ of 1.0 that means nothing. `NULL` rather than `1.0`
 > matters for the same reason — an agent gating on `rhat <= 1.01` must not be told
 > "converged" by a statistic that was never computed. **Gate on ESS**; R̂ becomes
-> load-bearing when the NUTS engine lands in 0.2.
+> load-bearing under the `nuts` engine, which defaults to four chains for this reason.
 
 Filter to real parameters before diagnosing — sample statistics and metadata rows
 are not posterior draws:
@@ -613,7 +634,6 @@ calling them is a syntax or binder error.
 | `anofox_scenario` catalog registration / branch-versioned counterfactuals | 0.2–0.3 | BRD BR-9 |
 | Async / job-style fit (`fit_async` + polling) | deferred | HLD §6; v0.1 accepts blocking table-function semantics |
 | `anofox_bayes_predict(draws, newdata, kind)` | **never** | DuckDB allows a table function at most one subquery parameter, so this signature cannot bind. Posterior prediction is a join today — see [the Guide](GUIDE.md#ask-a-what-if-without-re-fitting). A *different* predictive surface may appear in 0.3; this one will not. |
-| `nuts` engine | 0.2 | Config value is recognised and rejected with an explanatory error |
 | Families F1, F2, F4, F5, F6 | 0.2–0.3 | See [BRD §6](BRD.md) |
 
 
