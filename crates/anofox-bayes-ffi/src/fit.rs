@@ -377,6 +377,7 @@ pub unsafe extern "C" fn anofox_bayes_ffi_fit_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anofox_bayes_core::draws::META_ROWS;
 
     fn err_buf() -> BayesFfiError {
         BayesFfiError {
@@ -415,8 +416,10 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Success as i32);
 
             let total = anofox_bayes_ffi_fit_row_count(fit);
-            // 8 metadata rows + 1000 draws x 2 parameters.
-            assert_eq!(total, 8 + 1000 * 2);
+            // The metadata block + 1000 draws x 2 parameters. Taken from `META_ROWS`
+            // rather than written out: the block grows as new provenance rows are
+            // added, and that growth is explicitly not a contract break.
+            assert_eq!(total, META_ROWS.len() + 1000 * 2);
 
             // Read in chunks, as the C++ layer does.
             let cap = 512;
@@ -564,8 +567,11 @@ mod tests {
                 &mut err,
             );
             assert!(!fit.is_null(), "code {}", err.code);
-            // 2 lanes x (mu, sigma) x 500 draws, plus metadata.
-            assert_eq!(anofox_bayes_ffi_fit_row_count(fit), 8 + 500 * 4);
+            // 2 lanes x (mu, sigma) x 500 draws, plus the metadata block.
+            assert_eq!(
+                anofox_bayes_ffi_fit_row_count(fit),
+                META_ROWS.len() + 500 * 4
+            );
 
             anofox_bayes_ffi_fit_free(fit);
             anofox_bayes_ffi_data_free(data);

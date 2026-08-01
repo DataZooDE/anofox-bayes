@@ -330,6 +330,17 @@ SELECT anofox_bayes_status_text(param, value)   AS status,
 FROM draws;
 ```
 
+If the answer is `insufficient_data`, the next question is *how much* of the fit is
+the problem. The status is the worst verdict across every group — one unfittable lane
+downgrades all five thousand, deliberately — so the count is what tells you whether
+this is a handful of thin groups or the whole dataset:
+
+```sql
+SELECT max(value) FILTER (WHERE param = '__n_groups_unready__') AS unready,
+       max(value) FILTER (WHERE param = '__n_groups__')         AS groups
+FROM draws;
+```
+
 Second, are there enough effective draws per parameter?
 
 ```sql

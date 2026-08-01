@@ -143,13 +143,19 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
             engine_kind,
             seed,
         ),
-        family: family.id().to_string(),
+        family: family.code(),
         engine: engine_kind,
         // Provisional: replaced below once the draws have been graded.
         status: readiness.status,
         seed,
         n_obs: model.n_obs(),
         n_groups: model.n_groups(),
+        // Structural only, and deliberately so: this counts the groups the *family*
+        // refused from their sufficient statistics. Diagnostics are computed per
+        // parameter rather than per group and can downgrade the fit below without
+        // implicating any particular group, so folding them in would produce a count
+        // that does not correspond to anything an agent can go and look at.
+        n_groups_unready: model.n_groups_unready(),
     };
 
     let posterior = Posterior::new(
@@ -263,6 +269,95 @@ mod tests {
             .expect("status must be emitted");
         assert_eq!(status_row.chain, META_INDEX);
         assert_eq!(status_row.value, FitStatus::Converged as i32 as f64);
+    }
+
+    /// An auditor holding only the persisted table must be able to say which model
+    /// was fitted. The value column is DOUBLE, so the family travels as its catalog
+    /// F-number rather than its name.
+    #[test]
+    fn the_family_that_produced_the_table_travels_with_the_draws() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let code_of = |family: &str, cfg: &str| {
+            fit(family, &Config::parse(cfg).unwrap(), &view)
+                .unwrap()
+                .posterior
+                .rows()
+                .find(|r| r.param == "__family__")
+                .expect("the family must be emitted")
+                .value
+        };
+        assert_eq!(
+            code_of(
+                "conjugate_anomaly",
+                r#"{"value": "cost", "group": "lane", "draws": 500}"#
+            ),
+            7.0
+        );
+        assert_eq!(
+            code_of("pooled_gaussian", r#"{"y": "cost", "draws": 500}"#),
+            3.0
+        );
+    }
+
+    /// `Readiness::worst` collapses per-group verdicts on purpose -- a fit an agent
+    /// must inspect is not 99.4 % trustworthy. What the collapse destroys is the
+    /// *scale* of the inspection, and that is what this row restores: the status
+    /// still says `insufficient_data` for the whole fit, and the count says how many
+    /// of the groups are actually the problem.
+    #[test]
+    fn the_number_of_unready_groups_survives_the_collapse_into_one_status() {
+        let mut costs = Vec::new();
+        let mut lanes = Vec::new();
+        for lane in ["HAM-ROT", "BRE-ANT", "DUS-MIL"] {
+            for i in 0..20 {
+                costs.push(2.0 + ((i % 5) as f64 - 2.0) * 0.02);
+                lanes.push(lane);
+            }
+        }
+        // Two lanes with two invoices each: fittable, but below any sane threshold.
+        for lane in ["THIN-1", "THIN-2"] {
+            costs.extend([1.9, 2.1]);
+            lanes.extend([lane, lane]);
+        }
+        let frame = Frame::new(64).numeric("cost", costs).key("lane", lanes);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg =
+            Config::parse(r#"{"value": "cost", "group": "lane", "min_obs": 5, "draws": 2000}"#)
+                .unwrap();
+        let fit = fit("conjugate_anomaly", &cfg, &view).unwrap();
+
+        let row = |name: &str| {
+            fit.posterior
+                .rows()
+                .find(|r| r.param == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .value
+        };
+        assert_eq!(row("__n_groups__"), 5.0);
+        assert_eq!(row("__n_groups_unready__"), 2.0);
+        // The collapsed verdict is unchanged: three good lanes do not make the fit
+        // safe to act on.
+        assert_eq!(row("__status__"), FitStatus::InsufficientData as i32 as f64);
+    }
+
+    /// The count is only useful if a clean fit reports zero rather than nothing.
+    #[test]
+    fn a_healthy_fit_reports_no_unready_groups_rather_than_omitting_the_row() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(r#"{"value": "cost", "group": "lane", "draws": 2000}"#).unwrap();
+        let fit = fit("conjugate_anomaly", &cfg, &view).unwrap();
+        let row = fit
+            .posterior
+            .rows()
+            .find(|r| r.param == "__n_groups_unready__")
+            .expect("the count must be emitted even when it is zero");
+        assert_eq!(row.value, 0.0);
+        assert_eq!(fit.posterior.meta.status, FitStatus::Converged);
     }
 
     /// The realistic shape of the freight-audit question: which lane's cost level

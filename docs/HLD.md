@@ -64,7 +64,7 @@ flowchart TB
 | `anofox_bayes_fit(relation, family, config)` | table in-out | **0.1** | Fit; returns the draws contract `(model_id, group_id, chain, draw, param, value)` |
 | `anofox_bayes_rhat(value, chain, draw)` | aggregate | **0.1** | Split R̂ over draws, `GROUP BY param` |
 | `anofox_bayes_ess_bulk(...)`, `anofox_bayes_ess_tail(...)` | aggregates | **0.1** | Effective sample size, bulk and tail |
-| `anofox_bayes_credible_interval`, `anofox_bayes_prob_greater`, `anofox_bayes_service_level_quantile`, `anofox_bayes_status_text`, `anofox_bayes_is_actionable` | SQL macros | **0.1** | Decision helpers over a draws table |
+| `anofox_bayes_credible_interval`, `anofox_bayes_prob_greater`, `anofox_bayes_service_level_quantile`, `anofox_bayes_status_text`, `anofox_bayes_is_actionable`, `anofox_bayes_family_text` | SQL macros | **0.1** | Decision helpers over a draws table |
 | `anofox_bayes_version()`, `anofox_bayes_draws_schema_version()` | scalars | **0.1** | Build and contract versions |
 | `anofox_bayes_predict(draws, newdata, kind)` | table function | — | **Not implementable in this shape.** DuckDB permits a table function at most one subquery parameter, so a function taking both the draws and the new rows will not bind. Superseded by the join recipe below |
 | `anofox_bayes_draws(model_id)`, `anofox_bayes_status(model_id)` | table functions | — | **Dropped.** Superseded by the pure-function design below: draws *are* the return value, and status rides inside them |

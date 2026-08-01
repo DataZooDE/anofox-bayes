@@ -51,7 +51,7 @@ use crate::draws::ParamName;
 use crate::errors::{BayesError, BayesResult};
 use crate::linalg::{cholesky, sample_mvn, solve_with};
 use crate::rng::BayesRng;
-use crate::types::EngineKind;
+use crate::types::{EngineKind, FamilyCode};
 
 use super::{CompiledModel, ExactPosterior, ModelFamily, Readiness};
 use faer::Mat;
@@ -77,6 +77,10 @@ const SLOTS: &[&str] = &[
 impl ModelFamily for PooledGaussian {
     fn id(&self) -> &'static str {
         "pooled_gaussian"
+    }
+
+    fn code(&self) -> FamilyCode {
+        FamilyCode::PooledGaussian
     }
 
     fn description(&self) -> &'static str {
@@ -397,6 +401,12 @@ impl CompiledModel for CompiledPooledGaussian {
     fn readiness(&self) -> Readiness {
         self.readiness.clone()
     }
+    // `n_groups_unready` is deliberately left to the trait default. This family
+    // solves one design containing every group at once, so its only structural
+    // refusal -- a residual variance that is not estimable -- is a property of that
+    // whole design and implicates every group in it. There is no per-group verdict
+    // here to count, and inventing one would report a precision the model does not
+    // have.
     fn as_exact(&self) -> Option<&dyn ExactPosterior> {
         Some(self)
     }
@@ -759,6 +769,52 @@ mod tests {
         assert_eq!(model.readiness().status, FitStatus::Degenerate);
         let cols = draw(&*model, 20, 9);
         assert!(cols[0].iter().all(|v| v.is_nan()));
+    }
+
+    /// This family reaches one verdict over one design, so a refusal implicates every
+    /// group in it — there is no subset it could honestly single out. Counting them
+    /// all is both the truth and the safe direction: it sends an agent to look at
+    /// more than it must, never at less.
+    #[test]
+    fn a_refused_pooled_fit_counts_every_group_as_unready() {
+        let n = 12;
+        let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        // Exactly on the line, so no residual variance is left to estimate.
+        let y: Vec<f64> = x.iter().map(|v| 2.0 + 3.0 * v).collect();
+        let keys: Vec<&str> = (0..n).map(|i| ["NORTH", "SOUTH", "EAST"][i % 3]).collect();
+        let frame = Frame::new(n)
+            .numeric("y", y)
+            .numeric("x", x)
+            .key("region", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let model = compile(r#"{"y": "y", "x": "x", "group": "region"}"#, &view).unwrap();
+        assert_eq!(model.readiness().status, FitStatus::Degenerate);
+        assert_eq!(model.n_groups(), 3);
+        assert_eq!(model.n_groups_unready(), 3);
+    }
+
+    /// The count must be zero, not absent, on a fit that is fine.
+    #[test]
+    fn a_healthy_pooled_fit_counts_no_group_as_unready() {
+        let n = 30;
+        let x: Vec<f64> = (0..n).map(|i| (i % 7) as f64).collect();
+        let y: Vec<f64> = (0..n)
+            .map(|i| 1.0 + 0.5 * (i % 7) as f64 + ((i % 3) as f64 - 1.0) * 0.4)
+            .collect();
+        let keys: Vec<&str> = (0..n).map(|i| ["NORTH", "SOUTH"][i % 2]).collect();
+        let frame = Frame::new(n)
+            .numeric("y", y)
+            .numeric("x", x)
+            .key("region", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let model = compile(r#"{"y": "y", "x": "x", "group": "region"}"#, &view).unwrap();
+        assert_eq!(model.readiness().status, FitStatus::Converged);
+        assert_eq!(model.n_groups(), 2);
+        assert_eq!(model.n_groups_unready(), 0);
     }
 
     /// A per-customer grouping is the shape that kills this family: the design is
