@@ -7,6 +7,58 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Added — `varying_variance_gaussian`, a residual scale per group and a learned pooling scale
+
+Roadmap gap 5 and the learned-scale half of gap 4. Agent 04's tail question — "how much
+buffer does *this* segment need?" — had no path through this extension, because
+`pooled_gaussian` has one residual scale for the whole design and therefore gives two
+segments with the same mean the same predictive interval whatever the data says.
+
+- **A new family, not a mode of `pooled_gaussian`** (`ROADMAP.md` §3.3). Per-group
+  `sigma` and a learned `pool_scale` each destroy conjugacy; folding either into F3
+  would have made one family exact under some configurations and sampled under others,
+  with `__engine__` varying by config slot under a single name.
+- **The name was decided rather than defaulted.** `hierarchical_gaussian` was rejected
+  because `pooled_gaussian` is hierarchical too and the pair would give a caller nothing
+  to choose on; `heteroscedastic_gaussian` because the word has two accepted spellings
+  and a family id is a string a caller types. `FamilyCode` is **8** — outside the BRD's
+  F1–F7 grid, because this family is the substrate F4 and F6 will be built on rather
+  than either of them. Append-only, so nothing already persisted moves.
+- **Non-centred, and not optional.** `eta_g = tau * z_g`, `log sigma_g = mu_s + tau_s
+  w_g`. The centred form is Neal's funnel and no step size explores it. There is no
+  `centred` slot: the closed catalog's premise is that a caller cannot select a bad
+  parameterisation.
+- **`pool_scale` is now a parameter with a posterior.** Its own uncertainty widens every
+  group effect, and a panel whose groups sit on top of each other learns to pool hard
+  while one whose groups genuinely differ learns to leave them alone.
+- **NUTS is the default, and SBC per engine is why.** Under `nuts` all fourteen ranked
+  parameters are calibrated (χ² 6.3–24.6 against a 37.7 threshold at 1 024
+  replications). Under `laplace` **none** are: `pool_scale` 3 942, `sigma_spread` 4 403,
+  and the mode search does not converge at all on 3.1 % of replications. That is the
+  expected result, reported rather than tuned away; `laplace` stays reachable and stays
+  uncertified. `docs/THEORY.md` §5 carries the table.
+- **Two findings worth carrying to the next hierarchical family.** A flat prior on `tau`
+  is proper but its upper tail generates divergences (34 in 8 000 draws), and any
+  divergence is a refusal — so the default hyperprior is a half-Normal at the response's
+  own standard deviation, which is scale-free in the sense `THEORY.md` §3 demands. And
+  non-centring fixes the funnel but not the intercept-versus-group-effects ridge the
+  NUTS track reported for `pooled_gaussian`; that costs effective sample size, so budget
+  `draws` above the 1000 default.
+- **New seam: `LogPosterior::target_accept`**, defaulted to `nuts-rs`'s 0.8 so every
+  existing family is bit-for-bit unchanged. This family declares 0.95 — the same dial as
+  Stan's `adapt_delta`, raised for the same models — which takes divergences to zero on
+  the test fixtures. Family-declared, not reachable from SQL.
+- Tests: the log density checked against its closed form directly, including a test per
+  transform that isolates its log-Jacobian and asserts the mutation would be visible;
+  the analytic gradient against finite differences **away from the mode**; parameter
+  recovery of known per-group sigmas and a known level spread; the tail question
+  asserted against `pooled_gaussian` fitted to the same data as a control; and the
+  required assertion on a *function of several parameters at once* — a group's level
+  `intercept + group_effect`, whose joint posterior sd matches `sigma_g/sqrt(n_g)` while
+  adding the marginal variances overstates it twenty-three-fold.
+- `test/sql/f8_segment_spread.test` is the customer-facing scenario: a payment-delay
+  buffer per segment, with `pooled_gaussian` fitted alongside to show what it cannot say.
+
 ### Added — `pooled_gaussian` random slopes
 
 Roadmap gap 4, first half. `docs/ROADMAP.md` §3.3 scoped it and the scope held: random

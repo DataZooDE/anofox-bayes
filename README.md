@@ -72,8 +72,9 @@ catalog of model families and tune documented options; you cannot write your own
 likelihood. That restriction is what lets each family ship with fixed parameterisation
 decisions, a validated config schema and its own calibration suite.
 
-Today the catalog is three families — enough for anomaly detection, intervention
-measurement and customer-churn scoring. See [the roadmap](#roadmap).
+Today the catalog is five families — enough for anomaly detection, intervention
+measurement, censored durations, customer-churn scoring and per-segment service levels.
+See [the roadmap](#roadmap).
 
 ## Install
 
@@ -111,10 +112,12 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
 | `censored_aft` | Time until something happens, when some of it has not happened yet — delivery promises, time-to-pay | `intercept`, `beta[…]`, `sigma` (accelerated failure time) |
 | `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
+| `varying_variance_gaussian` | A *spread* per group: service levels, buffers, "which segments are unpredictable" | `intercept`, `beta[…]`, `pool_scale`, `sigma_pop`, `sigma_spread`, plus `group_effect` and `sigma` per group |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by
 predictors → `pooled_gaussian`; a duration where some cases have not finished →
-`censored_aft`; a repeat-purchase history and a churn question → `payer_alive`.**
+`censored_aft`; a repeat-purchase history and a churn question → `payer_alive`; a
+question about a group's *spread* rather than its level → `varying_variance_gaussian`.**
 
 `pooled_gaussian` also does **random slopes**: each group gets its own coefficient on a
 predictor, pooled toward the population value rather than estimated in isolation. That
@@ -124,9 +127,10 @@ Three engines: `exact` (closed-form, the default), `laplace` (a Gaussian at the 
 and `nuts` (the No-U-Turn Sampler, via [`nuts-rs`](https://github.com/pymc-devs/nuts-rs)).
 Switching between them changes no caller SQL.
 
-Planned, and *not* present today: hierarchical negative-binomial (F1), per-group
-variance with a learned pooling scale, payment delay (F4) and a native elasticity
-family (F6) — though random slopes above already cover most of what F6 is for. See
+Planned, and *not* present today: hierarchical negative-binomial (F1) and a native
+payment-delay model (F4). A native elasticity family is a **decided non-goal** — random
+slopes above are what elasticity is, and a second family id for the same mathematics
+would split `model_id`, the cache and the calibration evidence to save a `log()`. See
 [the roadmap](docs/ROADMAP.md).
 
 There is deliberately **no `predict` function** — posterior prediction is a join over

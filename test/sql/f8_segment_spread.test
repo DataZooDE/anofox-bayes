@@ -1,0 +1,277 @@
+# name: test/sql/f8_segment_spread.test
+# description: varying_variance_gaussian, exercised as the cash-runway agent's tail question
+# group: [sql]
+#
+# The question this file answers is the one `pooled_gaussian` cannot be asked.
+#
+# A treasury team wants a payment-delay buffer per customer segment: how many days
+# must we allow so that 95 % of a segment's invoices have landed? That is a statement
+# about a segment's **spread**, not about its average, and two segments can have the
+# same average delay while needing buffers that differ by a day and a half on a
+# thirty-day cycle.
+#
+# `pooled_gaussian` has one residual scale for the whole design, so it necessarily
+# gives those two segments the same buffer. That is structural, not a matter of
+# tuning, and it is why this family exists. The last section fits both and shows the
+# difference.
+
+require anofox_bayes
+
+#######################################
+# Setup: 240 invoices across six segments
+#######################################
+
+# Six segments, 40 invoices each. RETAIL_SMALL and RETAIL_LARGE are constructed to
+# share an average delay of 30.0 days and to differ only in how tightly their invoices
+# cluster around it -- RETAIL_SMALL scatters more than three times as widely. If the
+# model is doing its job, they must come out with the same level and very different
+# buffers.
+#
+# The scatter is deterministic rather than drawn from `random()`, so this test is a
+# pure function of its own text: 37 is coprime to 41, so `(i * 37) % 41` for i = 1..40
+# walks 1..40 in a fixed scrambled order.
+#
+# Subtract **20.5**, the mean of 1..40, not 20. Subtracting 20 leaves the residuals
+# summing to exactly 2.0 rather than 0, which shifts each segment's level by
+# `spread * 0.05` and pushes the two retail segments 0.035 days apart -- so the
+# equal-means premise this fixture rests on was quietly false, and the assertion below
+# is what caught it.
+statement ok
+CREATE TABLE invoices AS
+SELECT
+    seg.name                                                   AS segment,
+    i                                                          AS invoice_no,
+    seg.level + seg.spread * ((((i * 37) % 41) - 20.5) / 10.0)  AS delay_days
+FROM (VALUES
+        ('RETAIL_SMALL', 30.0, 1.00),
+        ('RETAIL_LARGE', 30.0, 0.30),
+        ('WHOLESALE',    32.0, 0.55),
+        ('PUBLIC',       38.0, 1.30),
+        ('EXPORT',       31.0, 0.80),
+        ('OEM',          29.0, 0.40)
+     ) AS seg(name, level, spread),
+     generate_series(1, 40) AS g(i);
+
+query I
+SELECT count(*) FROM invoices;
+----
+240
+
+# The two retail segments really do share a mean, to the last digit the generator can
+# produce. Anything the fit says about their difference is therefore about spread.
+query I
+SELECT abs(avg(CASE WHEN segment = 'RETAIL_SMALL' THEN delay_days END)
+         - avg(CASE WHEN segment = 'RETAIL_LARGE' THEN delay_days END)) < 1e-9
+FROM invoices;
+----
+true
+
+#######################################
+# Fit
+#######################################
+
+# No `pool_scale` slot: in this family the amount of pooling is a parameter with a
+# posterior, not a number the analyst supplies. The engine is NUTS, which is this
+# family's default and is not a choice the caller has to make.
+#
+# `draws` is 2000 rather than the 1000 default. A hierarchical posterior mixes more
+# slowly than a conjugate one -- the unpenalised intercept and the segment effects
+# trade off along a ridge -- and the diagnostics say so rather than pretending
+# otherwise. This is the budget at which they pass.
+statement ok
+CREATE TABLE spread_fit AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM invoices),
+    'varying_variance_gaussian',
+    {'y': 'delay_days',
+     'group': 'segment',
+     'draws': 2000,
+     'chains': 4,
+     'warmup': 1000,
+     'seed': 404}
+);
+
+# Actionable, and the table says which model and which engine produced it. `__family__`
+# is 8 -- outside the BRD's F1-F7 grid, because this family is the hierarchical
+# substrate the payment-delay and elasticity models will be built on rather than
+# either of them.
+query III
+SELECT anofox_bayes_status_text(param, value),
+       anofox_bayes_family_text(param, value),
+       max(CASE WHEN param = '__engine__' THEN value END)
+FROM spread_fit;
+----
+converged	varying_variance_gaussian	2.0
+
+# 11 metadata rows, plus 4 chains x 2000 draws x (16 parameters + 4 NUTS sample
+# statistics). The parameters are: one intercept, three hyperparameters
+# (pool_scale, sigma_pop, sigma_spread) and two per segment (group_effect, sigma).
+query I
+SELECT count(*) FROM spread_fit;
+----
+160011
+
+# Six distinct parameter names: `intercept`, the three hyperparameters, and the two
+# that are reported once per segment.
+query I
+SELECT count(DISTINCT param) FROM spread_fit
+WHERE draw >= 0 AND param NOT IN ('__lp__', '__divergent__', '__energy__', '__step_size__');
+----
+6
+
+# NUTS is the first engine that can diverge, and a divergence is a refusal rather than
+# a warning. Zero is the bar.
+query I
+SELECT sum(value) = 0 FROM spread_fit WHERE param = '__divergent__';
+----
+true
+
+#######################################
+# The answer: a buffer per segment
+#######################################
+
+# The posterior predictive for one more invoice in a segment is its level plus its own
+# noise:
+#
+#     delay* = intercept + group_effect[segment] + sigma[segment] * z
+#
+# with `z` a standard normal drawn per (draw, segment) from the fit's own seed, so the
+# query is reproducible without `setseed()`. The 95th percentile of that is the buffer.
+statement ok
+CREATE TABLE predictive AS
+WITH wide AS (
+    SELECT chain, draw,
+           max(CASE WHEN param = 'intercept' THEN value END) AS intercept
+    FROM spread_fit WHERE draw >= 0 GROUP BY chain, draw
+),
+parts AS (
+    SELECT d.chain, d.draw, d.group_id AS segment,
+           max(CASE WHEN d.param = 'group_effect' THEN d.value END) AS effect,
+           max(CASE WHEN d.param = 'sigma'        THEN d.value END) AS sigma
+    FROM spread_fit d
+    WHERE d.draw >= 0 AND d.group_id <> '__global__'
+    GROUP BY d.chain, d.draw, d.group_id
+)
+SELECT p.segment,
+       w.intercept + p.effect AS level,
+       p.sigma,
+       w.intercept + p.effect
+         + p.sigma * anofox_bayes_std_normal(404, p.segment, (p.chain * 2000 + p.draw)::BIGINT)
+         AS delay_star
+FROM parts p JOIN wide w USING (chain, draw);
+
+# The decision table an agent would put in front of a treasurer. Ordered by the buffer
+# each segment needs, which is *not* the order of their average delays.
+query I
+SELECT segment FROM predictive
+GROUP BY segment
+ORDER BY anofox_bayes_service_level_quantile(delay_star, 0.95) DESC;
+----
+PUBLIC
+WHOLESALE
+EXPORT
+RETAIL_SMALL
+RETAIL_LARGE
+OEM
+
+# **The tail question, stated as the two segments that make it.** RETAIL_SMALL and
+# RETAIL_LARGE have the same average delay to within a rounding error; their 95 %
+# buffers differ by about a day and a half, because one segment's invoices are more
+# than three times as scattered as the other's. Every euro of that difference is
+# working capital, and no fit of `pooled_gaussian` can produce it.
+query II
+SELECT abs(avg(CASE WHEN segment = 'RETAIL_SMALL' THEN level END)
+         - avg(CASE WHEN segment = 'RETAIL_LARGE' THEN level END)) < 0.15,
+       anofox_bayes_service_level_quantile(
+           CASE WHEN segment = 'RETAIL_SMALL' THEN delay_star END, 0.95)
+     - anofox_bayes_service_level_quantile(
+           CASE WHEN segment = 'RETAIL_LARGE' THEN delay_star END, 0.95) > 0.8
+FROM predictive;
+----
+true	true
+
+# The per-segment scale is a parameter with an interval of its own, so "this segment is
+# noisier" is a claim that can be checked rather than asserted. The two retail
+# segments' 95 % intervals for `sigma` do not overlap.
+query I
+SELECT max(CASE WHEN group_id = 'RETAIL_LARGE' THEN hi END)
+     < max(CASE WHEN group_id = 'RETAIL_SMALL' THEN lo END)
+FROM (
+    SELECT group_id,
+           anofox_bayes_credible_lower(value, 0.95) AS lo,
+           anofox_bayes_credible_upper(value, 0.95) AS hi
+    FROM spread_fit WHERE param = 'sigma' AND draw >= 0
+    GROUP BY group_id
+);
+----
+true
+
+#######################################
+# The pooling scale is learned, not set
+#######################################
+
+# `pool_scale` is how far segments' levels are spread around the population mean. Here
+# the six levels sit between 29 and 38, so a posterior concentrated near zero -- which
+# is what "these segments are all the same" would look like -- would be wrong.
+query I
+SELECT anofox_bayes_credible_lower(value, 0.95) > 1.0
+FROM spread_fit WHERE param = 'pool_scale' AND draw >= 0;
+----
+true
+
+# Every parameter clears its diagnostics gate. This is the query an agent's workflow
+# node runs before acting, and it is the same query for every family and engine.
+query I
+SELECT count(*) FROM (
+    SELECT param, group_id
+    FROM spread_fit WHERE draw >= 0
+      AND param NOT IN ('__lp__', '__divergent__', '__energy__', '__step_size__')
+    GROUP BY param, group_id
+    HAVING NOT anofox_bayes_ess_gate(value, chain, draw, 400)
+        OR NOT anofox_bayes_rhat_gate(value, chain, draw, 1.01)
+);
+----
+0
+
+#######################################
+# What `pooled_gaussian` says about the same data, and why it is not enough
+#######################################
+
+# The same invoices, fitted by the conjugate family. It estimates the two retail
+# segments' levels correctly -- that is not the problem -- but it has exactly one
+# `sigma` for all six segments, so every segment's buffer is the same width. A
+# treasurer reading it would hold the same reserve against RETAIL_LARGE as against
+# PUBLIC.
+statement ok
+CREATE TABLE pooled_fit AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM invoices),
+    'pooled_gaussian',
+    {'y': 'delay_days', 'group': 'segment', 'pool_scale': 10.0,
+     'draws': 4000, 'seed': 404}
+);
+
+# One `sigma`, at the population level, and no per-segment scale at all.
+query II
+SELECT count(*) FILTER (WHERE param = 'sigma' AND group_id = '__global__' AND draw >= 0) > 0,
+       count(*) FILTER (WHERE param = 'sigma' AND group_id <> '__global__' AND draw >= 0)
+FROM pooled_fit;
+----
+true	0
+
+# Its single residual scale is an average of six different spreads -- the right answer
+# to a question nobody asked. Read as a buffer it is simultaneously far too large for
+# the quietest segment and far too small for the noisiest, and its interval does not
+# even overlap either of theirs. Nothing in that fit reports the fact; there is no row
+# in it where the fact could be reported.
+query II
+SELECT (SELECT anofox_bayes_credible_lower(value, 0.95)
+        FROM pooled_fit WHERE param = 'sigma' AND draw >= 0)
+     > (SELECT anofox_bayes_credible_upper(value, 0.95)
+        FROM spread_fit WHERE param = 'sigma' AND group_id = 'OEM' AND draw >= 0),
+       (SELECT anofox_bayes_credible_upper(value, 0.95)
+        FROM pooled_fit WHERE param = 'sigma' AND draw >= 0)
+     < (SELECT anofox_bayes_credible_lower(value, 0.95)
+        FROM spread_fit WHERE param = 'sigma' AND group_id = 'PUBLIC' AND draw >= 0);
+----
+true	true
