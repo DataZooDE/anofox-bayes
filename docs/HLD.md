@@ -66,7 +66,7 @@ flowchart TB
 | `anofox_bayes_ess_bulk(...)`, `anofox_bayes_ess_tail(...)` | aggregates | **0.1** | Effective sample size, bulk and tail |
 | `anofox_bayes_credible_interval`, `anofox_bayes_prob_greater`, `anofox_bayes_service_level_quantile`, `anofox_bayes_status_text`, `anofox_bayes_is_actionable` | SQL macros | **0.1** | Decision helpers over a draws table |
 | `anofox_bayes_version()`, `anofox_bayes_draws_schema_version()` | scalars | **0.1** | Build and contract versions |
-| `anofox_bayes_predict(draws, newdata, kind)` | table function | 0.3 | Posterior- (or prior-) predictive samples for new rows |
+| `anofox_bayes_predict(draws, newdata, kind)` | table function | — | **Not implementable in this shape.** DuckDB permits a table function at most one subquery parameter, so a function taking both the draws and the new rows will not bind. Superseded by the join recipe below |
 | `anofox_bayes_draws(model_id)`, `anofox_bayes_status(model_id)` | table functions | — | **Dropped.** Superseded by the pure-function design below: draws *are* the return value, and status rides inside them |
 
 Three notes on how the shipped surface differs from the sketch this document started
@@ -79,6 +79,13 @@ from, each for a reason worth recording:
   aggregate no row-order guarantee, and R̂ and ESS are both functions of the
   *sequence*; fed shuffled rows they would report excellent numbers for a badly mixed
   fit.
+* **There is no `predict` table function.** For a linear model the posterior
+  predictive *is* a join — `y_hat[draw, row] = sum_j beta[j][draw] * x[j][row]` — over
+  the draws table and a long-format newdata table. Expressed as SQL it is
+  inspectable, parallelises on DuckDB's own execution rather than inside a
+  single-threaded table function, and costs no extension code. The recipe, including
+  adding observation noise for the predictive rather than the mean interval, is the
+  executable specification in `test/sql/posterior_predictive.test`.
 * **Names are not aliased short.** `rhat` and `ess_bulk` are plausible column names in
   a user's own schema, and shadowing one would be a poor trade for six saved
   characters.

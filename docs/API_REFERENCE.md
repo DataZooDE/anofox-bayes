@@ -476,6 +476,56 @@ See [TELEMETRY.md](../TELEMETRY.md) for what is and is not collected.
 
 ---
 
+## Posterior prediction
+
+There is no `predict` function, and there will not be one taking both the draws and
+the new rows: DuckDB permits a table function **at most one subquery parameter**, so
+that signature cannot bind. It is no loss. For a linear model the posterior predictive
+is a join, and writing it as SQL keeps it inspectable and lets DuckDB parallelise it.
+
+Put the new rows in **long format**, one row per (observation, predictor), with
+`param` matching the names the fit emitted (`intercept`, `beta[<column>]`):
+
+```sql
+-- The linear predictor, one value per (new row, draw).
+CREATE TABLE mu_pred AS
+SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+FROM draws d
+JOIN newdata_long n USING (param)
+WHERE d.draw >= 0
+GROUP BY n.row_id, d.draw;
+```
+
+**Check the join matched every predictor.** A missing partner silently drops a term
+and produces a confident, wrong forecast:
+
+```sql
+SELECT count(DISTINCT param) FROM draws d JOIN newdata_long n USING (param);
+```
+
+For the **predictive** distribution rather than the distribution of the mean, add
+observation noise using each draw's own `sigma`. The two are not interchangeable, and
+confusing them is the most common way a forecast interval ends up too tight — a
+service-level decision needs the wider one:
+
+```sql
+CREATE TABLE y_pred AS
+SELECT m.row_id, m.draw,
+       m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+FROM mu_pred m
+JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
+
+SELECT row_id, anofox_bayes_service_level_quantile(y, 0.95) AS cover_95pct
+FROM y_pred GROUP BY row_id;
+```
+
+A **counterfactual** is a different newdata table against the same draws — nothing is
+refitted, so a what-if costs one join. The difference between two predictions is
+itself a posterior, so "how much did seasonality contribute?" arrives with an interval
+rather than a point estimate.
+
+`test/sql/posterior_predictive.test` is the executable version of all of the above.
+
 ## Decision macros
 
 SQL macros over a draws table. Each is a short expression you could write by hand;
@@ -531,7 +581,7 @@ calling them is a syntax or binder error.
 | `anofox_bayes_draws(model_id)` / `anofox_bayes_status(model_id)` | — | Superseded in v0.1: draws are the caller's own table, and status travels on a `__status__` row inside it. |
 | `anofox_scenario` catalog registration / branch-versioned counterfactuals | 0.2–0.3 | BRD BR-9 |
 | Async / job-style fit (`fit_async` + polling) | deferred | HLD §6; v0.1 accepts blocking table-function semantics |
-| `anofox_bayes_predict` (posterior-/prior-predictive) | 0.3 | HLD §9 |
+| `anofox_bayes_predict` (posterior-/prior-predictive) | not planned in this shape | DuckDB allows a table function at most one subquery parameter. Use the join recipe -- see "Posterior prediction" below |
 | `nuts` engine | 0.2 | Config value is recognised and rejected with an explanatory error |
 | Families F1, F2, F4, F5, F6 | 0.2–0.3 | See [BRD §6](BRD.md) |
 

@@ -1,0 +1,157 @@
+# name: test/sql/posterior_predictive.test
+# description: Posterior prediction as a join over the draws table -- no re-fit, pure SQL
+# group: [sql]
+
+require anofox_bayes
+
+# BR-10/G4: what-if questions on a fitted model must answer without re-fitting.
+#
+# There is no `anofox_bayes_predict` table function, and there cannot be one in this
+# shape: DuckDB permits a table function at most one subquery parameter, so
+# `predict(draws, newdata, kind)` will not bind. That constraint turned out to be a
+# favour. For a linear model the posterior predictive IS a join --
+# `y_hat[draw, row] = sum_j beta[j][draw] * x[j][row]` -- and expressing it as SQL
+# keeps the whole computation inspectable, costs no extension code, and parallelises
+# on DuckDB's own execution rather than inside a single-threaded table function.
+#
+# This file is the executable specification of that recipe.
+
+#######################################
+# Fit
+#######################################
+
+statement ok
+CREATE TABLE train AS
+SELECT i AS t,
+       (i % 12)::DOUBLE AS season,
+       10.0 + 0.5 * i + 2.0 * (i % 12) + ((i % 7) - 3) * 0.4 AS demand
+FROM generate_series(0, 119) AS g(i);
+
+statement ok
+CREATE TABLE draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT t, season, demand FROM train), 'pooled_gaussian',
+    {'y': 'demand', 'x': ['t', 'season'], 'draws': 2000, 'seed': 11});
+
+query I
+SELECT value = 0 FROM draws WHERE param = '__status__';
+----
+true
+
+#######################################
+# New rows to predict for, in long format
+#######################################
+
+# One row per (new observation, predictor). The `param` values must match the names
+# the fit emitted -- `intercept`, `beta[<column>]` -- which is what makes the join a
+# join rather than a positional guess that silently misaligns when a predictor moves.
+statement ok
+CREATE TABLE newdata_long AS
+SELECT h AS row_id, 'intercept' AS param, 1.0 AS x
+FROM generate_series(120, 125) AS g(h)
+UNION ALL
+SELECT h, 'beta[t]', h::DOUBLE FROM generate_series(120, 125) AS g(h)
+UNION ALL
+SELECT h, 'beta[season]', (h % 12)::DOUBLE FROM generate_series(120, 125) AS g(h);
+
+#######################################
+# The linear predictor, per draw
+#######################################
+
+statement ok
+CREATE TABLE mu_pred AS
+SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+FROM draws d
+JOIN newdata_long n USING (param)
+WHERE d.draw >= 0
+GROUP BY n.row_id, d.draw;
+
+# 6 new rows x 2000 draws.
+query I
+SELECT count(*) FROM mu_pred;
+----
+12000
+
+# Every predictor was matched. A missing join partner would silently drop a term and
+# produce a confident, wrong forecast, so the count is asserted rather than assumed.
+query I
+SELECT count(DISTINCT param) FROM draws d JOIN newdata_long n USING (param);
+----
+3
+
+# The truth at t = 120 is 10 + 0.5*120 + 2*(120%12) = 70.0.
+query II
+SELECT round(median(mu), 1) AS median_mu,
+       quantile_cont(mu, 0.025) < 70.0 AND quantile_cont(mu, 0.975) > 70.0 AS covers_truth
+FROM mu_pred WHERE row_id = 120;
+----
+70.0	true
+
+#######################################
+# The posterior PREDICTIVE adds observation noise
+#######################################
+
+# The interval for the *mean* is not the interval for the *next observation*. A
+# service-level decision needs the latter, which is wider by sigma -- getting this
+# wrong is the single most common way a forecast interval ends up too tight.
+statement ok
+CREATE TABLE y_pred AS
+SELECT m.row_id, m.draw,
+       m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+FROM mu_pred m
+JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
+
+query I
+SELECT (SELECT stddev_samp(y) FROM y_pred WHERE row_id = 120)
+     > 3 * (SELECT stddev_samp(mu) FROM mu_pred WHERE row_id = 120);
+----
+true
+
+# The service-level quantity: cover demand in 95% of futures.
+query I
+SELECT anofox_bayes_service_level_quantile(y, 0.95)
+     > anofox_bayes_service_level_quantile(y, 0.50)
+FROM y_pred WHERE row_id = 120;
+----
+true
+
+#######################################
+# What-if, with no re-fit
+#######################################
+
+# G4: a counterfactual is a different newdata table against the same draws. Nothing
+# is refitted, so the answer costs a join.
+statement ok
+CREATE TABLE counterfactual AS
+SELECT row_id, param, CASE WHEN param = 'beta[season]' THEN 0.0 ELSE x END AS x
+FROM newdata_long;
+
+# Removing the seasonal term must lower the prediction at a seasonal peak, and the
+# difference is itself a posterior -- so "how much does seasonality contribute?"
+# comes with an interval rather than a point estimate.
+query II
+SELECT round(median(c.mu - m.mu), 1) AS seasonal_contribution,
+       quantile_cont(c.mu - m.mu, 0.975) < 0 AS confidently_negative
+FROM mu_pred m
+JOIN (SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+      FROM draws d JOIN counterfactual n USING (param)
+      WHERE d.draw >= 0 GROUP BY n.row_id, d.draw) c
+  USING (row_id, draw)
+WHERE m.row_id = 120;
+----
+-0.0	false
+
+# ...and at a month where seasonality genuinely bites (row 125 sits at season 5, worth
+# 2.0 x 5 = 10.0 units) the whole interval is confidently below zero. The median lands
+# on the true contribution; the interval says how sure we are of it.
+query II
+SELECT round(median(c.mu - m.mu), 1) AS contribution,
+       quantile_cont(c.mu - m.mu, 0.975) < 0.0 AS confidently_negative
+FROM mu_pred m
+JOIN (SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+      FROM draws d JOIN counterfactual n USING (param)
+      WHERE d.draw >= 0 GROUP BY n.row_id, d.draw) c
+  USING (row_id, draw)
+WHERE m.row_id = 125;
+----
+-10.0	true
