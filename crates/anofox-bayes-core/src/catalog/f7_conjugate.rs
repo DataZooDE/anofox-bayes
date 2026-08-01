@@ -39,7 +39,7 @@ use crate::errors::{BayesError, BayesResult};
 use crate::rng::BayesRng;
 use crate::types::{EngineKind, FamilyCode};
 
-use super::{CompiledModel, ExactPosterior, ModelFamily, Readiness};
+use super::{CompiledModel, ExactPosterior, LogPosterior, ModelFamily, Readiness};
 
 /// The family singleton registered in the catalog.
 #[derive(Debug)]
@@ -150,13 +150,13 @@ impl ModelFamily for ConjugateAnomaly {
             }
         }
 
-        Ok(Box::new(CompiledConjugate {
+        Ok(Box::new(CompiledConjugate::new(
             likelihood,
             posteriors,
             params,
-            n_obs: rows.len(),
+            rows.len(),
             fingerprint,
-        }))
+        )))
     }
 }
 
@@ -427,7 +427,30 @@ impl GroupPosterior {
         }
     }
 
+    /// Whether this group's posterior exists as a distribution at all.
+    ///
+    /// The single source of truth for that question: the exact sampler uses it to
+    /// decide whether to emit NaN, and the differentiable path uses it to decide
+    /// whether the group gets coordinates. Two separate answers would eventually
+    /// disagree, and the disagreement would be a group that draws numbers under one
+    /// engine and NULL under the other.
+    fn is_proper(&self) -> bool {
+        match self.kind {
+            PosteriorKind::Nig {
+                mu_n,
+                kappa_n,
+                alpha_n,
+                beta_n,
+            } => mu_n.is_finite() && kappa_n > 0.0 && alpha_n > 0.0 && beta_n > 0.0,
+            PosteriorKind::Gamma { a_n, b_n } => a_n > 0.0 && b_n > 0.0,
+        }
+    }
+
     fn sample_into(&self, rng: &mut BayesRng, out: &mut [f64]) -> BayesResult<()> {
+        if !self.is_proper() {
+            out.fill(f64::NAN);
+            return Ok(());
+        }
         match self.kind {
             PosteriorKind::Nig {
                 mu_n,
@@ -435,11 +458,6 @@ impl GroupPosterior {
                 alpha_n,
                 beta_n,
             } => {
-                if !(mu_n.is_finite() && kappa_n > 0.0 && alpha_n > 0.0 && beta_n > 0.0) {
-                    out[0] = f64::NAN;
-                    out[1] = f64::NAN;
-                    return Ok(());
-                }
                 // sigma^2 ~ InvGamma(alpha_n, beta_n) is 1 / Gamma(alpha_n, rate beta_n).
                 let precision = rng.gamma(alpha_n, beta_n)?;
                 let sigma_sq = 1.0 / precision;
@@ -448,10 +466,6 @@ impl GroupPosterior {
                 Ok(())
             }
             PosteriorKind::Gamma { a_n, b_n } => {
-                if !(a_n > 0.0 && b_n > 0.0) {
-                    out[0] = f64::NAN;
-                    return Ok(());
-                }
                 out[0] = rng.gamma(a_n, b_n)?;
                 Ok(())
             }
@@ -466,6 +480,58 @@ struct CompiledConjugate {
     params: Vec<ParamName>,
     n_obs: usize,
     fingerprint: String,
+    /// Where each group's coordinates start in the unconstrained vector, or `None` for
+    /// a group whose posterior does not exist.
+    ///
+    /// An unfittable group must not occupy a coordinate. Its log density would be
+    /// `NaN`, which propagates through the mode search and the Hessian and takes every
+    /// *other* group down with it — one single-observation lane would turn a 5 000-lane
+    /// fit into a Cholesky failure. Excluding it instead gives the same answer the
+    /// exact engine gives: NULL for that group, real numbers for the rest.
+    theta_offsets: Vec<Option<usize>>,
+    dim: usize,
+}
+
+impl CompiledConjugate {
+    fn new(
+        likelihood: Likelihood,
+        posteriors: Vec<GroupPosterior>,
+        params: Vec<ParamName>,
+        n_obs: usize,
+        fingerprint: String,
+    ) -> Self {
+        let width = likelihood.param_names().len();
+        let mut dim = 0usize;
+        let theta_offsets = posteriors
+            .iter()
+            .map(|p| {
+                if p.is_proper() {
+                    let at = dim;
+                    dim += width;
+                    Some(at)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self {
+            likelihood,
+            posteriors,
+            params,
+            n_obs,
+            fingerprint,
+            theta_offsets,
+            dim,
+        }
+    }
+
+    /// Iterate the groups that carry coordinates, paired with their offset.
+    fn coordinated(&self) -> impl Iterator<Item = (&GroupPosterior, usize)> {
+        self.posteriors
+            .iter()
+            .zip(&self.theta_offsets)
+            .filter_map(|(p, off)| off.map(|o| (p, o)))
+    }
 }
 
 impl CompiledModel for CompiledConjugate {
@@ -508,6 +574,149 @@ impl CompiledModel for CompiledConjugate {
 
     fn as_exact(&self) -> Option<&dyn ExactPosterior> {
         Some(self)
+    }
+
+    fn as_differentiable(&self) -> Option<&dyn LogPosterior> {
+        Some(self)
+    }
+}
+
+/// The same posterior, written as a differentiable log density on an unconstrained
+/// scale, so the gradient-based engines can consume it.
+///
+/// This family is conjugate, so nothing here is *needed* to fit it — the exact engine
+/// already samples the closed form. It exists because it makes the two engines two
+/// independent derivations of one distribution, which is the strongest correctness
+/// gate this repository has. Per `AGENTS.md`, that check already existed for
+/// `pooled_gaussian` and not for this family.
+///
+/// **Groups are independent**, so the joint log density is the sum of per-group terms
+/// and the Hessian is block diagonal. The Laplace engine nevertheless assembles it
+/// densely, at `O(dim^2)` memory and `O(dim^3)` arithmetic: this path is a correctness
+/// gate and a small-model convenience, not the way to fit ten thousand lanes. The
+/// exact engine remains the family's default for exactly that reason.
+///
+/// **Normal.** Coordinates `(mu, u)` with `sigma = e^u`. Substituting `sigma^2 = e^{2u}`
+/// into the Normal-Inverse-Gamma posterior and adding the log-Jacobian
+/// `log|d sigma^2 / du| = log 2 + 2u` collapses to
+///
+/// ```text
+///   log p(mu, u) = -(2 alpha_n + 1) u - e^{-2u} (beta_n + kappa_n (mu - mu_n)^2 / 2)
+/// ```
+///
+/// up to a constant. The `+2u` is the whole Jacobian: drop it and the coefficient of
+/// `u` becomes `-(2 alpha_n + 3)`, which is a *different, tighter* posterior for sigma
+/// that a gradient-versus-finite-difference test would happily certify, because both
+/// sides difference the same wrong density.
+///
+/// **Poisson.** Coordinate `v` with `lambda = e^v`. The Gamma density
+/// `(a_n - 1) log lambda - b_n lambda` plus the log-Jacobian `log|d lambda / dv| = v`
+/// gives
+///
+/// ```text
+///   log p(v) = a_n v - b_n e^v
+/// ```
+///
+/// whose mode is `lambda = a_n / b_n`, the posterior *mean* rather than the posterior
+/// mode of the Gamma — which is the visible signature that the Jacobian is present.
+impl LogPosterior for CompiledConjugate {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn logp(&self, theta: &[f64]) -> f64 {
+        let mut total = 0.0;
+        for (posterior, off) in self.coordinated() {
+            total += match posterior.kind {
+                PosteriorKind::Nig {
+                    mu_n,
+                    kappa_n,
+                    alpha_n,
+                    beta_n,
+                } => {
+                    let (mu, u) = (theta[off], theta[off + 1]);
+                    let d = mu - mu_n;
+                    -(2.0 * alpha_n + 1.0) * u - (-2.0 * u).exp() * (beta_n + kappa_n * d * d / 2.0)
+                }
+                PosteriorKind::Gamma { a_n, b_n } => {
+                    let v = theta[off];
+                    a_n * v - b_n * v.exp()
+                }
+            };
+        }
+        total
+    }
+
+    fn grad(&self, theta: &[f64], out: &mut [f64]) -> BayesResult<()> {
+        if theta.len() != self.dim || out.len() != self.dim {
+            return Err(BayesError::DimensionMismatch(format!(
+                "expected {} coordinates, got theta {} and out {}",
+                self.dim,
+                theta.len(),
+                out.len()
+            )));
+        }
+        for (posterior, off) in self.coordinated() {
+            match posterior.kind {
+                PosteriorKind::Nig {
+                    mu_n,
+                    kappa_n,
+                    alpha_n,
+                    beta_n,
+                } => {
+                    let (mu, u) = (theta[off], theta[off + 1]);
+                    let d = mu - mu_n;
+                    let inv_var = (-2.0 * u).exp();
+                    out[off] = -inv_var * kappa_n * d;
+                    out[off + 1] =
+                        -(2.0 * alpha_n + 1.0) + 2.0 * inv_var * (beta_n + kappa_n * d * d / 2.0);
+                }
+                PosteriorKind::Gamma { a_n, b_n } => {
+                    out[off] = a_n - b_n * theta[off].exp();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn initial(&self) -> Vec<f64> {
+        let mut theta = vec![0.0; self.dim];
+        for (posterior, off) in self.coordinated() {
+            match posterior.kind {
+                PosteriorKind::Nig {
+                    mu_n,
+                    alpha_n,
+                    beta_n,
+                    ..
+                } => {
+                    theta[off] = mu_n;
+                    // The joint mode of `u`, from setting the gradient above to zero.
+                    let sigma_sq = (2.0 * beta_n / (2.0 * alpha_n + 1.0)).max(f64::MIN_POSITIVE);
+                    theta[off + 1] = 0.5 * sigma_sq.ln();
+                }
+                PosteriorKind::Gamma { a_n, b_n } => theta[off] = (a_n / b_n).ln(),
+            }
+        }
+        theta
+    }
+
+    fn constrain(&self, theta: &[f64], out: &mut [f64]) {
+        let width = self.likelihood.param_names().len();
+        for (i, off) in self.theta_offsets.iter().enumerate() {
+            let slot = &mut out[i * width..(i + 1) * width];
+            match off {
+                // Same answer the exact engine gives for a group whose posterior does
+                // not exist: NaN, which the SQL layer renders as NULL.
+                None => slot.fill(f64::NAN),
+                Some(off) => match self.likelihood {
+                    Likelihood::Normal => {
+                        slot[0] = theta[*off];
+                        slot[1] = theta[*off + 1].exp();
+                    }
+                    Likelihood::Poisson => slot[0] = theta[*off].exp(),
+                },
+            }
+        }
     }
 }
 
@@ -960,6 +1169,226 @@ mod tests {
         let view = frame.view(&refs);
         let err = compile(r#"{"value": "cost", "prior": {"alpha": 1.0}}"#, &view).unwrap_err();
         assert!(matches!(err, BayesError::Config { ref slot, .. } if slot == "prior.alpha"));
+    }
+
+    //=== The differentiable path ==========================================//
+
+    /// The Normal-Inverse-Gamma hyperparameters under the reference prior
+    /// (`kappa0 = 0, alpha0 = -1/2, beta0 = 0`), assembled here from the textbook
+    /// formulae so the tests below do not inherit the family's own algebra.
+    fn nig_by_hand(ys: &[f64]) -> (f64, f64, f64, f64) {
+        let n = ys.len() as f64;
+        let ybar = ys.iter().sum::<f64>() / n;
+        let ss: f64 = ys.iter().map(|y| (y - ybar).powi(2)).sum();
+        // (mu_n, kappa_n, alpha_n, beta_n)
+        (ybar, n, -0.5 + n / 2.0, ss / 2.0)
+    }
+
+    /// Central-difference the log density along every coordinate and compare with the
+    /// analytic gradient, at points deliberately displaced from the mode.
+    fn check_gradient(target: &dyn crate::catalog::LogPosterior, theta: &[f64], at_the_mode: bool) {
+        let dim = target.dim();
+        let mut analytic = vec![0.0; dim];
+        target.grad(theta, &mut analytic).unwrap();
+
+        // A gradient test evaluated at the mode is vacuous: both sides are zero, and a
+        // sign error or a dropped term is invisible. Assert that the point chosen is
+        // genuinely somewhere the gradient has something to say.
+        let norm = analytic.iter().map(|g| g * g).sum::<f64>().sqrt();
+        if !at_the_mode {
+            assert!(
+                norm > 1e-3,
+                "this point is at the mode (gradient norm {norm}), so the check is vacuous"
+            );
+        }
+
+        for j in 0..dim {
+            let step = 1e-6 * theta[j].abs().max(1.0);
+            let mut up = theta.to_vec();
+            let mut down = theta.to_vec();
+            up[j] += step;
+            down[j] -= step;
+            let numeric = (target.logp(&up) - target.logp(&down)) / (2.0 * step);
+            let tol = 1e-4 * numeric.abs().max(1.0);
+            assert!(
+                (analytic[j] - numeric).abs() < tol,
+                "coordinate {j}: analytic {} vs numeric {numeric}",
+                analytic[j]
+            );
+        }
+    }
+
+    /// A hand-derived gradient that is subtly wrong still finds *a* mode and still
+    /// produces plausible-looking draws; nothing downstream would notice. Finite
+    /// differences notice.
+    #[test]
+    fn the_normal_analytic_gradient_matches_finite_differences_away_from_the_mode() {
+        let ys: Vec<f64> = (0..40)
+            .map(|i| 12.0 + (i as f64 * 0.7).sin() * 1.5)
+            .collect();
+        let frame = Frame::new(ys.len()).numeric("cost", ys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(r#"{"value": "cost"}"#, &view).unwrap();
+
+        let target = model
+            .as_differentiable()
+            .expect("conjugate_anomaly must expose a differentiable log posterior");
+        assert_eq!(target.dim(), 2, "one group, coordinates (mu, log sigma)");
+
+        for offset in [0.0, 0.6, -1.1] {
+            let theta: Vec<f64> = target
+                .initial()
+                .iter()
+                .enumerate()
+                .map(|(j, v)| v + offset * (1.0 + j as f64 * 0.4))
+                .collect();
+            check_gradient(target, &theta, offset == 0.0);
+        }
+    }
+
+    #[test]
+    fn the_poisson_analytic_gradient_matches_finite_differences_away_from_the_mode() {
+        let counts: Vec<f64> = (0..40).map(|i| ((i % 9) + 1) as f64).collect();
+        let exposure: Vec<f64> = (0..40).map(|i| 5.0 + (i % 4) as f64).collect();
+        let frame = Frame::new(40)
+            .numeric("claims", counts)
+            .numeric("consignments", exposure);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(
+            r#"{"value": "claims", "likelihood": "poisson", "exposure": "consignments"}"#,
+            &view,
+        )
+        .unwrap();
+
+        let target = model
+            .as_differentiable()
+            .expect("conjugate_anomaly must expose a differentiable log posterior");
+        assert_eq!(target.dim(), 1, "one group, coordinate log lambda");
+
+        for offset in [0.0, 0.8, -1.4] {
+            let theta: Vec<f64> = target.initial().iter().map(|v| v + offset).collect();
+            check_gradient(target, &theta, offset == 0.0);
+        }
+    }
+
+    /// **The test that catches a missing Jacobian.** A gradient-versus-finite-difference
+    /// check cannot: it differences the same `logp`, so a dropped `+2u` term cancels on
+    /// both sides and the check still passes. Here the reference density is written
+    /// independently — the textbook Normal-Inverse-Gamma posterior evaluated at
+    /// `sigma^2 = e^{2u}`, plus the log of `d sigma^2 / du = 2 e^{2u}` — so omitting the
+    /// Jacobian shifts every difference by exactly `2 (u_a - u_b)`.
+    #[test]
+    fn the_normal_log_density_matches_the_closed_form_posterior_up_to_a_constant() {
+        let ys: Vec<f64> = (0..25)
+            .map(|i| 4.0 + (i as f64 * 1.3).cos() * 0.8)
+            .collect();
+        let (mu_n, kappa_n, alpha_n, beta_n) = nig_by_hand(&ys);
+
+        let frame = Frame::new(ys.len()).numeric("cost", ys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(r#"{"value": "cost"}"#, &view).unwrap();
+        let target = model.as_differentiable().unwrap();
+
+        // log p(mu, sigma^2) + log |d sigma^2 / du|, written from the textbook form.
+        let reference = |mu: f64, u: f64| {
+            let s2 = (2.0 * u).exp();
+            // sigma^2 ~ InvGamma(alpha_n, beta_n)
+            let inv_gamma = -(alpha_n + 1.0) * s2.ln() - beta_n / s2;
+            // mu | sigma^2 ~ N(mu_n, sigma^2 / kappa_n)
+            let normal = -0.5 * (s2 / kappa_n).ln() - kappa_n * (mu - mu_n).powi(2) / (2.0 * s2);
+            // sigma^2 = e^{2u}, so the Jacobian is 2 e^{2u}.
+            inv_gamma + normal + 2.0f64.ln() + 2.0 * u
+        };
+
+        let u0 = target.initial()[1];
+        let points = [
+            [mu_n, u0],
+            [mu_n + 0.35, u0],
+            [mu_n - 0.6, u0 + 0.8],
+            [mu_n + 1.2, u0 - 0.55],
+        ];
+        for a in &points {
+            for b in &points {
+                let got = target.logp(a) - target.logp(b);
+                let want = reference(a[0], a[1]) - reference(b[0], b[1]);
+                assert!(
+                    (got - want).abs() < 1e-9 * want.abs().max(1.0),
+                    "logp difference {got} vs closed form {want} between {a:?} and {b:?}"
+                );
+                // ...and the check has teeth: without the Jacobian the same difference
+                // would be off by 2 (u_a - u_b), which this tolerance would reject.
+                let jacobian_gap = 2.0 * (a[1] - b[1]);
+                assert!(
+                    jacobian_gap == 0.0 || jacobian_gap.abs() > 1e-9 * want.abs().max(1.0),
+                    "a dropped Jacobian would be invisible between {a:?} and {b:?}"
+                );
+            }
+        }
+    }
+
+    /// The Poisson half of the same check. `lambda = e^v` contributes a log-Jacobian of
+    /// `v`, which is what turns the `a_n - 1` exponent of the Gamma density into `a_n`.
+    /// Dropping it biases every posterior for `lambda` downward by one shape unit --
+    /// negligible on a busy lane, and badly wrong on a thin one, which is precisely the
+    /// group an anomaly model exists to look at.
+    #[test]
+    fn the_poisson_log_density_matches_the_closed_form_posterior_up_to_a_constant() {
+        let counts: Vec<f64> = (0..18).map(|i| ((i % 6) + 2) as f64).collect();
+        let a_n = 0.5 + counts.iter().sum::<f64>();
+        let b_n = counts.len() as f64;
+
+        let frame = Frame::new(counts.len()).numeric("claims", counts);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(r#"{"value": "claims", "likelihood": "poisson"}"#, &view).unwrap();
+        let target = model.as_differentiable().unwrap();
+
+        // Gamma(a_n, rate b_n) evaluated at lambda = e^v, plus log |d lambda / dv| = v.
+        let reference = |v: f64| {
+            let lambda = v.exp();
+            (a_n - 1.0) * lambda.ln() - b_n * lambda + v
+        };
+
+        let v0 = target.initial()[0];
+        for a in [v0, v0 + 0.5, v0 - 1.2, v0 + 2.0] {
+            for b in [v0, v0 + 0.5, v0 - 1.2, v0 + 2.0] {
+                let got = target.logp(&[a]) - target.logp(&[b]);
+                let want = reference(a) - reference(b);
+                assert!(
+                    (got - want).abs() < 1e-9 * want.abs().max(1.0),
+                    "logp difference {got} vs closed form {want} between {a} and {b}"
+                );
+            }
+        }
+    }
+
+    /// The unconstrained coordinates must map back to the parameters the draws table
+    /// reports, in the order `param_names` promises -- and a group whose posterior does
+    /// not exist must come back NULL-shaped rather than occupying a coordinate the mode
+    /// search would then wander along.
+    #[test]
+    fn the_differentiable_path_skips_unfittable_groups_and_reports_them_as_null() {
+        let frame = Frame::new(6)
+            .numeric("cost", vec![1.0, 1.2, 0.9, 1.1, 5.0, 42.0])
+            .key("lane", vec!["A", "A", "A", "A", "SOLO", "OTHER"]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(r#"{"value": "cost", "group": "lane"}"#, &view).unwrap();
+
+        let target = model.as_differentiable().unwrap();
+        // Three groups, two of them single-observation and therefore unfittable, so
+        // only lane A contributes coordinates.
+        assert_eq!(model.n_groups(), 3);
+        assert_eq!(target.dim(), 2);
+
+        let mut out = vec![0.0; model.param_names().len()];
+        target.constrain(&target.initial(), &mut out);
+        assert_eq!(out.len(), 6);
+        assert!(out[0].is_finite() && out[1] > 0.0, "lane A: {out:?}");
+        assert!(out[2..].iter().all(|v| v.is_nan()), "{out:?}");
     }
 
     //=== Determinism ======================================================//

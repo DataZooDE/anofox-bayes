@@ -28,7 +28,7 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 7 | F1 hierarchical negative binomial | 01 | Blocker natively; degraded path via gap 2 | 12–20 | gap 6 |
 | 8 | F4 payment delay, native | 04 | Degradation — `pooled_gaussian` on log-delay is already a lognormal model | 8–12 | gaps 4, 5 |
 | 9 | F6 hierarchical elasticity, native | 06 | Degradation once gap 4 lands — elasticity is a log-log linear model | 6–10 | gap 4 |
-| 10 | `conjugate_anomaly` has no `as_differentiable` | none | Correctness gate, not a feature | 2–3 | — |
+| 10 | ~~`conjugate_anomaly` has no `as_differentiable`~~ **done** | none | Correctness gate, not a feature | 2–3 | — |
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | Degradation, sharply worse at thousands of groups | 3–5 | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | Degradation; a pre-fit gate agents cannot run today | 4–6 | — |
 | 13 | No `anofox-scenario` integration (BR-9) | 01–07 | Degradation; branching a draws table is the agent's job | 5–8 | scenario's catalog API |
@@ -76,6 +76,25 @@ four likelihood families through it.
 turns the Laplace engine into an independent check on a family whose posterior we know
 in closed form. Per `AGENTS.md`, two independent derivations of one distribution is the
 strongest correctness gate available, and it exists for F3 and not for F7.
+
+**Done.** Two findings came out of it, both worth carrying forward.
+
+*The gate is weaker than it looks against shape errors.* A missing log-Jacobian shifts
+`alpha_n` by one, which is an `O(1/n)` perturbation — the same order as the Laplace
+approximation error the comparison is measuring. At n = 400 it moves `sigma` by 0.25 %,
+inside any tolerance loose enough not to flake. Verified by mutation: dropping the
+Jacobian leaves the engine-agreement test green. What catches it is a separate test
+that differences `logp` between two points and compares against the closed-form density
+ratio. **Any future family's engine-agreement test needs that companion**, or the
+Jacobian is untested.
+
+*Laplace is poor on this family for exactly the groups it exists to look at.* Because
+`conjugate_anomaly` fits each group independently, the relevant sample size is the
+group's own. The spread of `mu` is too narrow by `1 - sqrt((n-3)/n)` — 0.4 % at n = 400,
+**29 % at n = 6** — and `sigma` is worse (44 % on the spread at n = 6). Measured against
+the closed form to four digits, so it is a known cost rather than a suspicion. `exact`
+stays the default, and if the bridge in gap 2 ever routes a thin-group model through a
+Laplace posterior, this is the number to remember.
 
 ### v0.3 — The hierarchies that have to be Bayesian
 

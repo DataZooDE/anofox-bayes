@@ -76,7 +76,8 @@ pub fn resolve(kind: EngineKind) -> BayesResult<Box<dyn Engine>> {
         EngineKind::Nuts => Err(BayesError::config(
             "engine",
             "the NUTS engine arrives in 0.2. Until then use 'exact' (closed-form, the \
-             default for both families) or 'laplace' (pooled_gaussian only)",
+             default for both families) or 'laplace' (a Gaussian approximation at the \
+             mode, available for both)",
         )),
     }
 }
