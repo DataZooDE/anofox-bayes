@@ -26,7 +26,10 @@
 //! sampling for free. Adding an engine touches no family; adding a family touches no
 //! engine. That is the whole design.
 
+pub mod diagnostics;
+pub mod draws;
 pub mod errors;
+pub mod rng;
 pub mod types;
 
 pub use errors::{BayesError, BayesResult};

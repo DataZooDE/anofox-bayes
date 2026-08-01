@@ -12,7 +12,7 @@
 //! * Fallible calls return `bool` and write a code into an out-parameter; `true`
 //!   means the out-parameters are populated.
 
-use anofox_bayes_core::{DRAWS_SCHEMA_VERSION, VERSION};
+use anofox_bayes_core::DRAWS_SCHEMA_VERSION;
 use std::os::raw::c_char;
 
 /// Version of the extension's Rust core, NUL-terminated and statically allocated.
@@ -40,6 +40,7 @@ pub extern "C" fn anofox_bayes_ffi_draws_schema_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anofox_bayes_core::VERSION;
     use std::ffi::CStr;
 
     #[test]

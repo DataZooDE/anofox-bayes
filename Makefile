@@ -8,7 +8,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Rust targets (for local development)
-.PHONY: rust_release rust_debug test_rust test_sbc format format-fix clean_all
+.PHONY: rust_release rust_debug test_rust test_sbc format_rust format_rust_fix clean_all
 
 rust_release:
 	cargo build --release
@@ -26,10 +26,13 @@ test_rust:
 test_sbc:
 	cargo test --workspace --release -- --ignored --nocapture
 
-format:
+# Named `format_rust` rather than `format`: extension-ci-tools already defines
+# `format`/`format-fix` for the C++ side, and overriding them silently drops the
+# clang-format pass.
+format_rust:
 	cargo fmt --all -- --check
 
-format-fix:
+format_rust_fix:
 	cargo fmt --all
 
 # Clean everything including Rust

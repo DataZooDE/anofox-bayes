@@ -166,7 +166,11 @@ mod tests {
         let mean = draws.iter().sum::<f64>() / n as f64;
         let var = draws.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
         assert!((mean - df).abs() < 0.05, "mean {mean} vs {df}");
-        assert!((var - 2.0 * df).abs() < 0.35, "variance {var} vs {}", 2.0 * df);
+        assert!(
+            (var - 2.0 * df).abs() < 0.35,
+            "variance {var} vs {}",
+            2.0 * df
+        );
     }
 
     #[test]
