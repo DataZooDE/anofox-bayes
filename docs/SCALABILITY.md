@@ -1,5 +1,8 @@
 # Runtime profile and scalability
 
+> Practical usage is in the [User Guide](GUIDE.md); this page is the measured
+> runtime profile and its limits.
+
 Measured, not estimated. Every number here comes from `validation/bench.py` on one
 machine (8 threads, Linux x86_64, `conjugate_anomaly` with a Normal likelihood and one
 group column); reproduce with the command at the bottom.

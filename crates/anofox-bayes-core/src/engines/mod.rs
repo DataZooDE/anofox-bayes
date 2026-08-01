@@ -75,7 +75,8 @@ pub fn resolve(kind: EngineKind) -> BayesResult<Box<dyn Engine>> {
         EngineKind::Laplace => Ok(Box::new(LaplaceEngine)),
         EngineKind::Nuts => Err(BayesError::config(
             "engine",
-            "the NUTS engine arrives in 0.2; conjugate families are served exactly",
+            "the NUTS engine arrives in 0.2. Until then use 'exact' (closed-form, the \
+             default for both families) or 'laplace' (pooled_gaussian only)",
         )),
     }
 }

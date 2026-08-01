@@ -1,5 +1,9 @@
 # API Reference — anofox-bayes v0.1
 
+> **New here?** Start with the [User Guide](GUIDE.md) for tasks and recipes, or
+> [Theory](THEORY.md) for what the numbers mean. This page is the exhaustive
+> reference — every function, every config slot.
+
 The complete SQL surface. Everything documented here exists and runs in v0.1;
 anything not listed here does not exist. Roadmap items are collected in
 [§6 Not implemented](#6-not-implemented) so they cannot be mistaken for API.
@@ -103,21 +107,37 @@ Understood by every family. Each family still declares them, so they pass
 
 | Slot | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `draws` | integer | `1000` | 4 … 1 000 000 | Posterior draws per chain. 4000 gives an ESS comfortably above the conventional 400 gate for an independent sampler. |
-| `seed` | integer | `20260801` | ≥ 0 | Feeds a ChaCha counter-based stream, so draws are byte-identical across platforms for a given seed. A different seed is a different `model_id`. |
-| `engine` | string | family default | `exact` | See [§1.3](#13-engines). |
+| `draws` | integer | `1000` | 4 … 1 000 000 | Posterior draws per chain. 1000 clears the conventional 400 ESS gate for an independent sampler; use 4000 for tail probabilities and service levels. |
+| `chains` | integer | `1` | 1 … 64 | Independent chains. See the note below before raising it. |
+| `seed` | integer | `20260801` | ≥ 0 (exact integer) | Feeds a ChaCha counter-based stream, so draws are byte-identical across platforms for a given seed. A different seed is a different `model_id`. |
+| `engine` | string | family default | `exact`, `laplace`, `nuts` | See [§1.3](#13-engines). |
+| `max_draw_megabytes` | integer | `2048` | 1 … 1 048 576 | Ceiling on the in-memory draw buffer, checked *before* allocating. A larger request is refused with a message naming the shape. Raise only if the memory genuinely exists — see [Scalability](SCALABILITY.md). |
 
-`chains` is **not** a slot. Every v0.1 engine draws independently, so a second
-chain would add cost without adding information; the fit always reports
-`__n_chains__ = 1`.
+**On `chains`.** It defaults to 1, and that is not a limitation to work around. R̂
+exists to detect a Markov chain that has not mixed, and both v0.1 engines draw
+*independently* — so a second chain buys an R̂ of 1.0 that means nothing. Raise it only
+if you want the cross-check for its own sake; the gate in v0.1 is ESS. It becomes
+load-bearing when the NUTS engine lands. Memory scales linearly with it.
 
 ### 1.3 Engines
 
 | Value | Status |
 |---|---|
-| `exact` | Available; the default for both shipped families. Samples the closed-form conjugate posterior directly. |
-| `laplace` | **Not available.** Errors with *"the Laplace engine is not available in this build yet; conjugate families are served exactly"*. |
-| `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2; conjugate families are served exactly"*. |
+| `exact` | **Available**, and the default for both families. Samples the closed-form conjugate posterior directly — no approximation, so where it applies it is both faster and more accurate. |
+| `laplace` | **Available on `pooled_gaussian`.** Fits a Gaussian at the posterior mode on an unconstrained scale. `conjugate_anomaly` exposes no gradient and rejects it: *"the laplace engine cannot serve family 'conjugate_anomaly'"*. |
+| `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2. Until then use 'exact' … or 'laplace' …"*. |
+
+Switching engines changes no caller SQL: same function, same output columns, same
+diagnostics. It does change `model_id`, because two posteriors carrying different
+warranties must not share an identity.
+
+**When is the Laplace approximation good enough?** Measured rather than asserted. On
+`pooled_gaussian` both engines agree on every coefficient to well under a percent at
+n = 400. Where they differ is the tails at small n — the exact marginal is a Student-t
+and Laplace returns its Gaussian limit, so it slightly *understates* a 99 % interval —
+and in the scale parameter, whose discrepancy falls from ~5 % at n = 20 to ~0.1 % at
+n = 2000. Both engines have their own calibration suite. See
+[Theory §5](THEORY.md#5-engines).
 
 `__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts.
 
@@ -543,6 +563,8 @@ exactly as the underlying quantile functions do. Filter to real draws first
 | `anofox_bayes_prob_greater(value, threshold)` | DOUBLE | `P(param > threshold)` |
 | `anofox_bayes_prob_less(value, threshold)` | DOUBLE | `P(param < threshold)` |
 | `anofox_bayes_service_level_quantile(value, level)` | DOUBLE | The quantity covering demand in `level` of futures |
+| `anofox_bayes_ess_gate(value, chain, draw, min_ess)` | BOOLEAN | Whether a parameter clears its ESS gate. **NULL-safe: an undefined ESS is a failure.** Use this rather than comparing ESS by hand — `HAVING ess_bulk < 400` fails *open*, because `NULL < 400` is `NULL` and the parameter most in need of flagging slips through |
+| `anofox_bayes_rhat_gate(value, chain, draw, max_rhat)` | BOOLEAN | Whether R̂ clears its gate. Coalesces to **true**, not false: an absent R̂ is legitimate under an independent sampler, where there is no chain that could have failed to mix |
 | `anofox_bayes_status_text(param, value)` | VARCHAR | `converged` / `degenerate` / `insufficient_data` / `failed` |
 | `anofox_bayes_is_actionable(param, value)` | BOOLEAN | True only for `converged` |
 

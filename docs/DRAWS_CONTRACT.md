@@ -1,5 +1,9 @@
 # The draws contract
 
+> This is the output schema, for consumers that need every detail. To *use* the
+> output, the [User Guide](GUIDE.md) is shorter; for what the numbers mean, see
+> [Theory §2](THEORY.md#2-what-a-draws-table-actually-is).
+
 **Schema version 1.** Reported by `anofox_bayes_draws_schema_version()` and written
 into every draws table as the `__schema_version__` row.
 
@@ -96,7 +100,8 @@ apart is the whole purpose of the refusal path.
 ## `model_id` is a pure function of the request
 
 ```
-model_id = BLAKE3(family, canonical_config, data_fingerprint, seed)[:16]
+model_id = BLAKE3(family, canonical_config, data_fingerprint,
+                  resolved_engine, algorithm_version, seed)[:16]
 ```
 
 Fields are length-prefixed before hashing, so `("ab", "c")` and `("a", "bc")` cannot
@@ -104,6 +109,16 @@ collide. The config is rendered key-sorted, so two callers who write the same op
 in a different order get the same model. The data fingerprint covers only the columns
 the model actually reads, restricted to the rows it actually uses — so adding an
 unrelated column to the input relation does not invalidate anything.
+
+Two of the inputs are not part of the caller's request, and both are deliberate:
+
+* **The *resolved* engine, not the configured one.** A caller who omits `engine` gets
+  the family's default. If that default later changes, the same config would produce a
+  posterior with a different warranty under what would otherwise be the same id.
+* **`algorithm_version`**, bumped whenever a change makes identical inputs produce
+  different draws. A corrected posterior is exactly that case: inputs unchanged, output
+  deliberately different. Without it a cache would serve the old, wrong answer for the
+  new, correct request — which has already happened once during development.
 
 Consequences worth relying on:
 
@@ -122,6 +137,25 @@ order-independent by construction.
 
 ## Compatibility
 
-`__schema_version__` moves only for a breaking change to column meaning or reserved-name
-semantics. Adding a new reserved metadata row is not breaking; changing what an
-existing one means is.
+`__schema_version__` moves only for a **breaking** change. The rules, so that a
+consumer written today keeps working:
+
+**Consumers must ignore reserved rows they do not recognise.** New `__`-prefixed
+metadata and sampler-statistic rows will be added — the NUTS engine brings several —
+and their arrival is *not* breaking. Filter on the names you know rather than
+assuming a fixed set.
+
+| Change | Breaking? |
+|---|---|
+| A new `__`-prefixed metadata row | no |
+| A new sampler statistic (`__energy__`, …) | no |
+| A new model parameter for an existing family | no |
+| Row **order** within a draw | no — treat it as unspecified |
+| The meaning of an existing reserved row | **yes** |
+| A column's type or meaning | **yes** |
+| `FitStatus` / `EngineKind` numbering | **yes**, and it is append-only for that reason |
+
+Sampler statistics are uniform across draws within a fit — a fit reports the same
+*set* of statistics for every draw, even where the values differ — so the number of
+rows per draw is constant and can be relied on within one table. It is not constant
+*between* tables written by different engines or versions.
