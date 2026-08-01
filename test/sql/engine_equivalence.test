@@ -1,0 +1,132 @@
+# name: test/sql/engine_equivalence.test
+# description: BR-4 -- two engines, one interface. Switching engine changes no caller SQL.
+# group: [sql]
+
+require anofox_bayes
+
+statement ok
+CREATE TABLE obs AS
+SELECT i AS x1,
+       ((i % 7) - 3)::DOUBLE AS x2,
+       4.0 + 1.5 * i - 0.75 * ((i % 7) - 3) + ((i % 11) - 5) * 0.3 AS y
+FROM generate_series(0, 399) AS t(i);
+
+#######################################
+# The same query, twice, differing only in one config slot
+#######################################
+
+statement ok
+CREATE TABLE exact_draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x1, x2, y FROM obs), 'pooled_gaussian',
+    {'y': 'y', 'x': ['x1', 'x2'], 'draws': 4000, 'seed': 3, 'engine': 'exact'});
+
+statement ok
+CREATE TABLE laplace_draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x1, x2, y FROM obs), 'pooled_gaussian',
+    {'y': 'y', 'x': ['x1', 'x2'], 'draws': 4000, 'seed': 3, 'engine': 'laplace'});
+
+# Identical shape: same columns, same row count, same parameter names. A downstream
+# query cannot tell which engine ran without asking.
+query I
+SELECT (SELECT count(*) FROM exact_draws) = (SELECT count(*) FROM laplace_draws);
+----
+true
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT DISTINCT group_id, param FROM exact_draws
+    EXCEPT
+    SELECT DISTINCT group_id, param FROM laplace_draws
+);
+----
+true
+
+#######################################
+# ...and the same posterior, to Monte Carlo error
+#######################################
+
+# The strong claim: a closed-form conjugate sampler and a Gaussian fit to the log
+# density are two independent derivations of one distribution. With 400 observations
+# they agree on every coefficient to well under a percent.
+query III
+SELECT e.param,
+       abs(e.m - l.m) < 0.01 * abs(e.m)  AS means_agree,
+       abs(e.s - l.s) < 0.03 * e.s       AS spreads_agree
+FROM (SELECT param, avg(value) m, stddev_samp(value) s FROM exact_draws   WHERE draw >= 0 GROUP BY param) e
+JOIN (SELECT param, avg(value) m, stddev_samp(value) s FROM laplace_draws WHERE draw >= 0 GROUP BY param) l
+  USING (param)
+ORDER BY e.param;
+----
+beta[x1]	true	true
+beta[x2]	true	true
+intercept	true	true
+sigma	true	true
+
+#######################################
+# The engine is recorded, so the difference is auditable
+#######################################
+
+# 0 = exact, 1 = laplace. A consumer that needs to know which warranty the numbers
+# carry can find out; it just does not have to.
+query II
+SELECT (SELECT value FROM exact_draws   WHERE param = '__engine__'),
+       (SELECT value FROM laplace_draws WHERE param = '__engine__');
+----
+0.0	1.0
+
+# Different engines are different models, so the ids differ even though the data and
+# the seed do not. Two posteriors with different warranties must not share an id.
+query I
+SELECT (SELECT DISTINCT model_id FROM exact_draws)
+    != (SELECT DISTINCT model_id FROM laplace_draws);
+----
+true
+
+#######################################
+# Both engines clear the same gate
+#######################################
+
+query I
+SELECT count(*) FROM (
+    SELECT param FROM laplace_draws WHERE draw >= 0 GROUP BY param
+    HAVING anofox_bayes_ess_bulk(value, chain, draw) < 400
+        OR anofox_bayes_ess_tail(value, chain, draw) < 400
+);
+----
+0
+
+query I
+SELECT value = 0 FROM laplace_draws WHERE param = '__status__';
+----
+true
+
+#######################################
+# An engine that cannot serve a family says so
+#######################################
+
+# The conjugate anomaly family has no differentiable log posterior, so Laplace
+# declines rather than silently substituting something else.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT y FROM obs), 'conjugate_anomaly',
+    {'value': 'y', 'engine': 'laplace', 'draws': 100});
+----
+cannot serve
+
+# NUTS arrives in 0.2, and asking for it today is an error rather than a quiet
+# downgrade to an approximation with a different warranty.
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x1, y FROM obs), 'pooled_gaussian',
+    {'y': 'y', 'x': 'x1', 'engine': 'nuts', 'draws': 100});
+----
+0.2
+
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x1, y FROM obs), 'pooled_gaussian',
+    {'y': 'y', 'x': 'x1', 'engine': 'hmc', 'draws': 100});
+----
+unknown engine

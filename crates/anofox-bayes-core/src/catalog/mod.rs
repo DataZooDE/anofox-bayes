@@ -136,12 +136,54 @@ pub trait CompiledModel: std::fmt::Debug {
     fn as_exact(&self) -> Option<&dyn ExactPosterior> {
         None
     }
+
+    /// Gradient-based access, for the Laplace and NUTS engines.
+    fn as_differentiable(&self) -> Option<&dyn LogPosterior> {
+        None
+    }
 }
 
 /// A model whose posterior is available in closed form.
 pub trait ExactPosterior {
     /// Draw one sample into `out`, which has one slot per parameter name.
     fn sample_into(&self, rng: &mut BayesRng, out: &mut [f64]) -> BayesResult<()>;
+}
+
+/// A model whose log posterior and its gradient are available on an unconstrained
+/// scale.
+///
+/// This is what the gradient-based engines consume: the Laplace engine needs it to
+/// find the mode and the curvature there, and the NUTS adapter (0.2) will need
+/// nothing else. Working on an unconstrained scale is what makes a positive parameter
+/// like `sigma` tractable — a Gaussian approximation to a quantity that must stay
+/// positive is wrong near zero, while a Gaussian approximation to its logarithm is
+/// not.
+///
+/// Gradients are **analytic and hand-derived**, per family, and every implementation
+/// is unit-tested against finite differences. There is no autodiff dependency: the
+/// catalog is closed, so the derivatives are written once and checked once, and the
+/// check is cheaper and more auditable than a general mechanism would be.
+pub trait LogPosterior {
+    /// Number of unconstrained coordinates.
+    fn dim(&self) -> usize;
+
+    /// Log posterior density at `theta`, up to an additive constant, including the
+    /// log-Jacobian of the constraining transform.
+    fn logp(&self, theta: &[f64]) -> f64;
+
+    /// Gradient of [`LogPosterior::logp`] at `theta`, written into `out`.
+    fn grad(&self, theta: &[f64], out: &mut [f64]) -> BayesResult<()>;
+
+    /// A starting point for the mode search. Families return something already close,
+    /// since they generally know their own answer.
+    fn initial(&self) -> Vec<f64>;
+
+    /// Map unconstrained coordinates to the parameters the draws table reports.
+    ///
+    /// `out` has one slot per [`CompiledModel::param_names`] entry, which need not
+    /// match [`LogPosterior::dim`] — a family may report a parameter it does not
+    /// sample over.
+    fn constrain(&self, theta: &[f64], out: &mut [f64]);
 }
 
 /// Look up a family by its SQL identifier.

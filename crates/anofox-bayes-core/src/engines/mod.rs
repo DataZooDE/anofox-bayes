@@ -16,8 +16,10 @@
 //! convergence to assess when every draw is already independent.
 
 pub mod exact;
+pub mod laplace;
 
 pub use exact::ExactEngine;
+pub use laplace::LaplaceEngine;
 
 use crate::catalog::CompiledModel;
 use crate::draws::SampleStats;
@@ -70,11 +72,7 @@ pub trait Engine: std::fmt::Debug {
 pub fn resolve(kind: EngineKind) -> BayesResult<Box<dyn Engine>> {
     match kind {
         EngineKind::Exact => Ok(Box::new(ExactEngine)),
-        EngineKind::Laplace => Err(BayesError::config(
-            "engine",
-            "the Laplace engine is not available in this build yet; \
-             conjugate families are served exactly",
-        )),
+        EngineKind::Laplace => Ok(Box::new(LaplaceEngine)),
         EngineKind::Nuts => Err(BayesError::config(
             "engine",
             "the NUTS engine arrives in 0.2; conjugate families are served exactly",
@@ -92,15 +90,21 @@ mod tests {
         assert_eq!(engine.kind(), EngineKind::Exact);
     }
 
+    #[test]
+    fn the_laplace_engine_is_available_and_reports_its_kind() {
+        assert_eq!(
+            resolve(EngineKind::Laplace).unwrap().kind(),
+            EngineKind::Laplace
+        );
+    }
+
     /// An engine that is not built yet must say so. Falling back to a different
     /// engine would give the caller numbers with a different warranty than the ones
     /// they asked for, and nothing downstream could tell.
     #[test]
     fn an_unavailable_engine_is_an_error_rather_than_a_substitution() {
-        for kind in [EngineKind::Laplace, EngineKind::Nuts] {
-            let err = resolve(kind).unwrap_err();
-            assert!(matches!(err, BayesError::Config { ref slot, .. } if slot == "engine"));
-        }
+        let err = resolve(EngineKind::Nuts).unwrap_err();
+        assert!(matches!(err, BayesError::Config { ref slot, .. } if slot == "engine"));
     }
 
     #[test]

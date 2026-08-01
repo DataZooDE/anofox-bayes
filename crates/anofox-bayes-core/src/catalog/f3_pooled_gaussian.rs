@@ -318,6 +318,105 @@ impl CompiledModel for CompiledPooledGaussian {
     fn as_exact(&self) -> Option<&dyn ExactPosterior> {
         Some(self)
     }
+    fn as_differentiable(&self) -> Option<&dyn super::LogPosterior> {
+        Some(self)
+    }
+}
+
+/// The same posterior, written as a differentiable log density on an unconstrained
+/// scale, so the gradient-based engines can consume it.
+///
+/// Coordinates are `(beta, u)` with `sigma = exp(u)`. Substituting `sigma^2 = e^{2u}`
+/// into the Normal-Inverse-Gamma posterior and adding the log-Jacobian `log 2 + 2u`
+/// of that transform collapses to
+///
+/// ```text
+///   log p(beta, u) = c*u - e^{-2u} * (s_n + Q/2) + const,
+///   c = -(2 a_n + p),   Q = (beta - b_n)' A (beta - b_n)
+/// ```
+///
+/// which is exact, not an approximation — the Laplace engine's error is entirely in
+/// the Gaussian fit to this surface, not in the surface itself. That separation is
+/// what makes "does Laplace agree with the exact posterior" a meaningful question.
+impl super::LogPosterior for CompiledPooledGaussian {
+    fn dim(&self) -> usize {
+        // One coordinate per coefficient, plus log sigma.
+        self.b_n.len() + 1
+    }
+
+    fn logp(&self, theta: &[f64]) -> f64 {
+        let p = self.b_n.len();
+        let u = theta[p];
+        let quad = self.quadratic_form(&theta[..p]);
+        let c = -(2.0 * self.a_n + p as f64);
+        c * u - (-2.0 * u).exp() * (self.s_n + quad / 2.0)
+    }
+
+    fn grad(&self, theta: &[f64], out: &mut [f64]) -> BayesResult<()> {
+        let p = self.b_n.len();
+        if theta.len() != p + 1 || out.len() != p + 1 {
+            return Err(BayesError::DimensionMismatch(format!(
+                "expected {} coordinates, got theta {} and out {}",
+                p + 1,
+                theta.len(),
+                out.len()
+            )));
+        }
+        let u = theta[p];
+        let inv_var = (-2.0 * u).exp();
+
+        // d/dbeta = -e^{-2u} A (beta - b_n)
+        let diff: Vec<f64> = (0..p).map(|j| theta[j] - self.b_n[j]).collect();
+        let a_diff = self.precision_times(&diff);
+        for j in 0..p {
+            out[j] = -inv_var * a_diff[j];
+        }
+
+        // d/du = c + 2 e^{-2u} (s_n + Q/2)
+        let quad: f64 = (0..p).map(|j| diff[j] * a_diff[j]).sum();
+        let c = -(2.0 * self.a_n + p as f64);
+        out[p] = c + 2.0 * inv_var * (self.s_n + quad / 2.0);
+        Ok(())
+    }
+
+    fn initial(&self) -> Vec<f64> {
+        let mut theta = self.b_n.clone();
+        // The joint mode of `u`, obtained by setting the gradient above to zero:
+        // sigma^2 = 2 s_n / (2 a_n + p).
+        let p = self.b_n.len() as f64;
+        let sigma_sq = (2.0 * self.s_n / (2.0 * self.a_n + p)).max(f64::MIN_POSITIVE);
+        theta.push(0.5 * sigma_sq.ln());
+        theta
+    }
+
+    fn constrain(&self, theta: &[f64], out: &mut [f64]) {
+        let p = self.b_n.len();
+        out[..p].copy_from_slice(&theta[..p]);
+        out[p] = theta[p].exp();
+    }
+}
+
+impl CompiledPooledGaussian {
+    /// `A x`, where `A = L L'` is the posterior precision.
+    fn precision_times(&self, x: &[f64]) -> Vec<f64> {
+        let n = x.len();
+        // L' x first, then L (that product).
+        let mut t = vec![0.0; n];
+        for i in 0..n {
+            t[i] = (i..n).map(|k| self.chol[(k, i)] * x[k]).sum();
+        }
+        let mut out = vec![0.0; n];
+        for i in 0..n {
+            out[i] = (0..=i).map(|k| self.chol[(i, k)] * t[k]).sum();
+        }
+        out
+    }
+
+    fn quadratic_form(&self, beta: &[f64]) -> f64 {
+        let diff: Vec<f64> = (0..beta.len()).map(|j| beta[j] - self.b_n[j]).collect();
+        let a_diff = self.precision_times(&diff);
+        (0..beta.len()).map(|j| diff[j] * a_diff[j]).sum()
+    }
 }
 
 impl ExactPosterior for CompiledPooledGaussian {
