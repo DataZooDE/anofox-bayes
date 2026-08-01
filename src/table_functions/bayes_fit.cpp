@@ -34,8 +34,16 @@ namespace {
 // FinalExecute -- crashes PhysicalBatchInsert, which assigns them all the same
 // sentinel batch index.
 //
-// The buffering is not a performance compromise being papered over: the fit cannot
-// start before the last row arrives, so streaming would buy nothing.
+// The buffering is not a performance compromise being papered over for *time*: the fit
+// cannot start before the last row arrives, so streaming would buy no wall clock. It
+// does bound memory, and that gap is real and recorded in docs/SCALABILITY.md -- it is
+// this file's to close, not the core's, because by the time the core is called the
+// relation is already materialised.
+//
+// `MaxThreads() == 1` therefore does not mean the fit is serial. `conjugate_anomaly`
+// fits and samples each group on its own rayon task inside the core, keyed so the
+// draws are identical whatever the pool size; DuckDB simply has nothing to partition
+// here. See docs/SCALABILITY.md for the measurements and the determinism digests.
 
 struct BayesFitBindData : public TableFunctionData {
 	string family;

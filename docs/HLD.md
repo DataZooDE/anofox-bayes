@@ -175,14 +175,22 @@ _anofox_bayes_diagnostics(model_id, param, rhat, ess_bulk, ess_tail,
 - Long fits inside a query: v0.1 accepts blocking table-function semantics with cancellation support; if field experience demands it, add a job-style API (`fit_async` + status polling) in v0.2 — decision explicitly deferred (BRD OQ-4).
 - Group-parallelism: independent per-group fits (F7, per-segment F4/F6) parallelize trivially over DuckDB's execution; hierarchical fits are single jobs with internal chain parallelism.
 
-> **Measured, v0.1 (`docs/SCALABILITY.md`).** The group-parallelism above is *not*
-> implemented: `MaxThreads()` returns 1 and wall time is flat from 1 to 16 threads.
-> The BR-1 acceptance case (5 000 SKUs x 104 weeks) still completes in ~4 s and
-> ~800 MB, so this is a headroom question rather than a blocker. Three gaps are
-> recorded there: no group parallelism, the input relation is fully buffered rather
-> than reduced to per-group sufficient statistics, and the posterior is materialised
-> whole before the first row is emitted. An oversized request is now refused by a
-> checked `max_draw_megabytes` budget instead of aborting the process.
+> **Measured (`docs/SCALABILITY.md`).** The group-parallelism above is implemented,
+> but *not* over DuckDB's execution as this section assumed. `MaxThreads()` returns 1
+> — a posterior is a function of every row, so the operator buffers its input and
+> DuckDB has nothing to partition — and the parallelism is a rayon pool inside the
+> fit instead: one task per group when sampling, one per parameter when diagnosing.
+> Crate-side wall time at 5 000 groups fell 8x; the BR-1 acceptance case (5 000 SKUs
+> x 104 weeks) fell from ~4.4 s to ~2.8 s, the difference being that the fit is no
+> longer the expensive part of the query. Determinism survives because each group
+> draws from a stream keyed on its own identity rather than on its position.
+>
+> Two of the three recorded gaps remain open and both are now scoped against
+> measurements rather than intuition: the input relation is still fully buffered, and
+> the buffering is imposed by the C++ operator rather than by the core; and the
+> posterior is still materialised whole, which is worth ~11 % of peak memory rather
+> than the large win it sounds like. An oversized request is refused by a checked
+> `max_draw_megabytes` budget instead of aborting the process.
 
 ## 7. Packaging, Licensing, Versioning
 

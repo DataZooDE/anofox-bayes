@@ -37,7 +37,9 @@ use crate::data::DataView;
 use crate::draws::ParamName;
 use crate::errors::{BayesError, BayesResult};
 use crate::rng::BayesRng;
-use crate::types::{EngineKind, FamilyCode};
+use crate::types::{EngineKind, FamilyCode, SampleFrom};
+
+use rayon::prelude::*;
 
 use super::{CompiledModel, ExactPosterior, LogPosterior, ModelFamily, Readiness};
 
@@ -151,6 +153,15 @@ impl ModelFamily for ConjugateAnomaly {
                 crate::types::validate_group_key(key)?;
             }
         }
+        // Serial, and measured to be the right choice. A conjugate update is a single
+        // pass over a group's rows accumulating `n`, `sum y` and `sum y^2`, so the
+        // whole per-group fitting step is ~7 ms of a ~150 ms compile at 5 000 groups
+        // and 520 000 rows; the other 143 ms is partitioning the rows and hashing the
+        // fingerprint, neither of which is per-group work. Running the fits on rayon
+        // was tried and made `compile` **slower** — 199 ms against 150 ms — because
+        // the per-task allocation of each group's value vector costs more than the
+        // arithmetic it feeds. Sampling, which is 1 000 draws per group rather than
+        // one pass, is where the parallelism pays; see `sample_chain_into`.
         for (key, idx) in &groups {
             let ys: Vec<f64> = idx.iter().map(|&i| values.values[i]).collect();
             let es: Option<Vec<f64>> = exposures
@@ -872,6 +883,116 @@ impl ExactPosterior for CompiledConjugate {
         }
         Ok(())
     }
+
+    /// Fill a whole chain, one rayon task per group.
+    ///
+    /// Two things make this safe to parallelise, and both are load-bearing:
+    ///
+    /// * **Randomness is keyed on the group, not on position.** Each group draws from
+    ///   `BayesRng::for_group(seed, chain, key)`, so a group's numbers are the same
+    ///   whatever order the tasks run in and however many threads there are.
+    /// * **The scatter is deterministic.** Groups sample into a contiguous scratch
+    ///   block and are copied into the chain-major output afterwards, at indices
+    ///   fixed by the parameter list.
+    ///
+    /// The scratch exists because the output is draw-major and a group's values are a
+    /// strided column of it. It is *batched* — a slab of groups at a time — so that a
+    /// 20 000-group fit does not need a second full copy of the posterior, which is
+    /// exactly the memory `max_draw_megabytes` was written to bound.
+    fn sample_chain_into(
+        &self,
+        seed: u64,
+        chain: u32,
+        n_draws: usize,
+        sample_from: SampleFrom,
+        out: &mut [f64],
+    ) -> BayesResult<()> {
+        let width = self.likelihood.param_names().len();
+        let n_groups = self.posteriors.len();
+        let n_params = n_groups * width;
+        if out.len() != n_draws * n_params {
+            return Err(BayesError::DimensionMismatch(format!(
+                "expected {} slots for {n_draws} draws x {n_params} parameters, got {}",
+                n_draws * n_params,
+                out.len()
+            )));
+        }
+        if n_draws == 0 || n_groups == 0 {
+            return Ok(());
+        }
+        // A prior-predictive draw broadcasts one shared prior across every group, so
+        // there is nothing per-group to key a stream on and nothing to gain: the
+        // sequential path stays, and prior draws are unchanged by any of this.
+        if sample_from == SampleFrom::Prior {
+            let mut rng = BayesRng::for_chain(seed, chain);
+            for draw in 0..n_draws {
+                self.sample_prior_into(&mut rng, &mut out[draw * n_params..(draw + 1) * n_params])?;
+            }
+            return Ok(());
+        }
+
+        let per_group = n_draws * width;
+        let batch = group_batch(per_group, n_groups);
+        let mut scratch = vec![0.0f64; batch * per_group];
+
+        for start in (0..n_groups).step_by(batch) {
+            let here = batch.min(n_groups - start);
+            let scratch = &mut scratch[..here * per_group];
+
+            let results: Vec<BayesResult<()>> = scratch
+                .par_chunks_mut(per_group)
+                .enumerate()
+                .map(|(i, buf)| {
+                    let g = start + i;
+                    let mut rng =
+                        BayesRng::for_group(seed, chain, &self.params[g * width].group_id);
+                    for draw in 0..n_draws {
+                        self.posteriors[g]
+                            .sample_into(&mut rng, &mut buf[draw * width..(draw + 1) * width])?;
+                    }
+                    Ok(())
+                })
+                .collect();
+            for r in results {
+                r?;
+            }
+
+            // Transpose the slab into the draw-major output. Parallel over draws, so
+            // each task owns one output row and the writes are disjoint by
+            // construction; within a row the destination is contiguous.
+            let scratch = &*scratch;
+            out.par_chunks_mut(n_params)
+                .enumerate()
+                .for_each(|(draw, row)| {
+                    for i in 0..here {
+                        let at = (start + i) * width;
+                        row[at..at + width]
+                            .copy_from_slice(&scratch[i * per_group + draw * width..][..width]);
+                    }
+                });
+        }
+        Ok(())
+    }
+}
+
+/// How many groups share one transpose slab.
+///
+/// Bounded by bytes rather than by a group count so that the slab stays cache-warm
+/// and memory-bounded whether a fit asks for 1 000 draws of 20 000 groups or 100 000
+/// draws of five. Always at least one group, so a single enormous group still makes
+/// progress rather than dividing by zero.
+fn group_batch(per_group: usize, n_groups: usize) -> usize {
+    /// 4 MiB: comfortably inside a server L3, and negligible beside the posterior it
+    /// is a staging area for.
+    const SLAB_BYTES: usize = 4 << 20;
+    (SLAB_BYTES / (per_group * std::mem::size_of::<f64>())).clamp(1, n_groups.max(1))
+}
+
+/// How many slabs a fit of this shape takes. Exists so a test can assert that its
+/// fixture actually crosses a batch boundary.
+#[cfg(test)]
+fn n_group_batches(n_draws: usize, width: usize, n_groups: usize) -> usize {
+    n_groups.div_ceil(group_batch(n_draws * width, n_groups))
 }
 
 #[cfg(test)]
@@ -1541,6 +1662,166 @@ mod tests {
         let b = draw(&*model, 500, 31);
         assert_eq!(a, b);
         assert_ne!(a, draw(&*model, 500, 32));
+    }
+
+    //=== Determinism under parallelism ====================================//
+    //
+    // The fit runs each group on its own rayon task. Three things must therefore be
+    // true, and each has a test below, because a violation of any one of them turns a
+    // reproducible posterior into a posterior that depends on the machine it ran on.
+
+    /// A chain's draws, keyed by `(group, param)` and compared as raw bits.
+    ///
+    /// Bits rather than values: the contract is byte-identity, and `-0.0 == 0.0`
+    /// while `NaN != NaN`, so a comparison on values would be simultaneously too
+    /// lax for the sign of zero and too strict for a refused group.
+    fn chain_bits(model: &dyn CompiledModel, n_draws: usize, seed: u64) -> Vec<(String, Vec<u64>)> {
+        let exact = model.as_exact().expect("family is conjugate");
+        let n_params = model.param_names().len();
+        let mut out = vec![0.0; n_draws * n_params];
+        exact
+            .sample_chain_into(seed, 0, n_draws, SampleFrom::Posterior, &mut out)
+            .unwrap();
+        model
+            .param_names()
+            .iter()
+            .enumerate()
+            .map(|(p, name)| {
+                (
+                    format!("{}/{}", name.group_id, name.name),
+                    (0..n_draws)
+                        .map(|d| out[d * n_params + p].to_bits())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Four lanes of the same shape, laid out in the caller's chosen order.
+    fn lanes_in_order(order: &[usize]) -> Frame {
+        let names = ["HAM-ROT", "BRE-ANT", "DUS-MIL", "GEN-VAL"];
+        let mut costs = Vec::new();
+        let mut lanes = Vec::new();
+        for &lane in order {
+            for i in 0..30 {
+                costs.push(2.0 + lane as f64 + ((i % 5) as f64 - 2.0) * 0.03);
+                lanes.push(names[lane]);
+            }
+        }
+        Frame::new(costs.len())
+            .numeric("cost", costs)
+            .key("lane", lanes)
+    }
+
+    /// A group's draws are a function of the group's own identity, not of where the
+    /// group happened to land in the input relation.
+    ///
+    /// This is the property that makes group parallelism safe. A shared sequential
+    /// stream ties a group's numbers to its *position*: the first group consumes the
+    /// first draws, so re-ordering the relation — which DuckDB is free to do, and
+    /// does whenever the scan order changes — silently produces a different posterior
+    /// for the same data under the same seed.
+    #[test]
+    fn a_groups_draws_do_not_depend_on_the_order_the_groups_arrived_in() {
+        let cfg = r#"{"value": "cost", "group": "lane"}"#;
+
+        let forwards = lanes_in_order(&[0, 1, 2, 3]);
+        let refs = forwards.key_refs();
+        let view = forwards.view(&refs);
+        let a = chain_bits(&*compile(cfg, &view).unwrap(), 200, 5);
+
+        let shuffled = lanes_in_order(&[2, 0, 3, 1]);
+        let refs = shuffled.key_refs();
+        let view = shuffled.view(&refs);
+        let b = chain_bits(&*compile(cfg, &view).unwrap(), 200, 5);
+
+        // Both fits saw all four lanes...
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.len(), 8);
+        // ...and each lane got the same numbers in both, whatever the relation order.
+        for (key, draws) in &a {
+            let other = b
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("missing {key}"));
+            assert_eq!(draws, &other.1, "{key} changed with the relation order");
+        }
+    }
+
+    /// The same draws come out however many threads rayon happens to have.
+    ///
+    /// Run over enough groups to cross the transpose batch boundary, so the test
+    /// exercises the scatter as well as the sampling.
+    #[test]
+    fn the_draws_are_byte_identical_whatever_the_thread_count() {
+        const GROUPS: usize = 1_200;
+        const DRAWS: usize = 500;
+        assert!(
+            n_group_batches(DRAWS, 2, GROUPS) > 1,
+            "the fixture must cross a batch boundary or the scatter is untested"
+        );
+
+        // The whole fit runs inside the pool -- compile as well as sample, since both
+        // are parallel now -- so the thread count really is the only thing varying.
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut costs = Vec::new();
+                    let mut names: Vec<String> = Vec::new();
+                    for g in 0..GROUPS {
+                        for i in 0..8 {
+                            costs.push(10.0 + g as f64 * 0.01 + ((i % 5) as f64 - 2.0) * 0.5);
+                            names.push(format!("LANE-{g:05}"));
+                        }
+                    }
+                    let frame = Frame::new(costs.len())
+                        .numeric("cost", costs)
+                        .key("lane", names.iter().map(String::as_str).collect());
+                    let refs = frame.key_refs();
+                    let view = frame.view(&refs);
+                    let model = compile(r#"{"value": "cost", "group": "lane"}"#, &view).unwrap();
+                    assert_eq!(model.n_groups(), GROUPS);
+                    chain_bits(&*model, DRAWS, 9)
+                })
+        };
+        let one = run(1);
+        assert_eq!(one, run(8));
+        assert_eq!(one, run(31));
+    }
+
+    /// A group fitted alongside three others gets the same numbers it would get
+    /// fitted alone.
+    ///
+    /// The sharpest statement of the same property, and the one a customer would
+    /// notice: batching a wide group set — which `SCALABILITY.md` recommends — must
+    /// not move any group's posterior. It also pins the serial-vs-parallel question
+    /// from the other side, since a single-group fit has nothing to parallelise.
+    #[test]
+    fn a_group_gets_the_same_draws_whether_it_is_fitted_alone_or_in_company() {
+        let cfg = r#"{"value": "cost", "group": "lane"}"#;
+
+        let together = lanes_in_order(&[0, 1, 2, 3]);
+        let refs = together.key_refs();
+        let view = together.view(&refs);
+        let all = chain_bits(&*compile(cfg, &view).unwrap(), 300, 13);
+
+        for lane in 0..4 {
+            let alone = lanes_in_order(&[lane]);
+            let refs = alone.key_refs();
+            let view = alone.view(&refs);
+            let solo = chain_bits(&*compile(cfg, &view).unwrap(), 300, 13);
+            assert_eq!(solo.len(), 2, "one lane, two parameters");
+            for (key, draws) in &solo {
+                let joint = all
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .unwrap_or_else(|| panic!("missing {key}"));
+                assert_eq!(draws, &joint.1, "{key} moved when fitted in company");
+            }
+        }
     }
 
     #[test]

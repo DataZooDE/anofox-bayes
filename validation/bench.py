@@ -4,8 +4,13 @@
 The numbers in docs/SCALABILITY.md come from here. Run it after `make release`;
 `--threads` additionally checks that the draws are byte-identical across thread
 counts, which is the property that makes a fit auditable.
+
+There are *two* thread counts, and both are checked. `SET threads` sizes DuckDB's
+pool; `RAYON_NUM_THREADS` sizes the pool `conjugate_anomaly` fits its groups on.
+The second is the one that actually varies the fit's wall time, and therefore the
+one whose determinism is worth proving.
 """
-import subprocess, sys, time, resource, pathlib
+import os, subprocess, sys, time, resource, pathlib
 
 DUCK = pathlib.Path(__file__).resolve().parent.parent / "build/release/duckdb"
 
@@ -27,11 +32,19 @@ CREATE TABLE o AS SELECT * FROM anofox_bayes_fit((SELECT grp, v FROM d),'conjuga
 {tail}"""
 
 
-def measure(groups, periods, draws, threads):
+def env_with(rayon):
+    env = dict(os.environ)
+    env.pop("RAYON_NUM_THREADS", None)
+    if rayon is not None:
+        env["RAYON_NUM_THREADS"] = str(rayon)
+    return env
+
+
+def measure(groups, periods, draws, threads, rayon=None):
     t0 = time.time()
     before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     r = subprocess.run([str(DUCK), "-c", fit_sql(groups, periods, draws, threads)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=env_with(rayon))
     after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     ok = r.returncode == 0
     print(f"{groups:>7} {periods:>7} {draws:>7} {threads:>7}  {time.time()-t0:>7.2f}s  "
@@ -49,21 +62,44 @@ def scaling():
             break
 
 
+def best_of(n, groups, periods, draws, threads, rayon):
+    """Fastest of `n` runs. The minimum, not the mean: the noise on a shared machine
+    is one-sided, so the fastest run is the closest estimate of the cost of the work
+    rather than of the cost of the work plus whatever else was scheduled."""
+    walls = []
+    for _ in range(n):
+        t0 = time.time()
+        subprocess.run([str(DUCK), "-c", fit_sql(groups, periods, draws, threads)],
+                       capture_output=True, env=env_with(rayon))
+        walls.append(time.time() - t0)
+    return min(walls)
+
+
+def digest_of(groups, periods, draws, threads, rayon):
+    r = subprocess.run([str(DUCK), "-c", fit_sql(groups, periods, draws, threads, digest=True)],
+                       capture_output=True, text=True, env=env_with(rayon))
+    hits = [l.strip("│ ") for l in r.stdout.splitlines() if len(l.strip("│ ")) == 32]
+    return hits[0] if hits else "ERROR"
+
+
 def threading():
+    print("DuckDB threads (`SET threads`), rayon left at its default:")
     print(f"{'threads':>8} {'wall':>8}")
     for t in [1, 2, 4, 8, 16]:
-        t0 = time.time()
-        subprocess.run([str(DUCK), "-c", fit_sql(2000, 104, 1000, t)], capture_output=True)
-        print(f"{t:>8} {time.time()-t0:>7.2f}s")
+        print(f"{t:>8} {best_of(3, 2000, 104, 1000, t, None):>7.2f}s")
 
-    print("\ndeterminism across thread counts (md5 of the whole draws table):")
+    print("\nfit threads (`RAYON_NUM_THREADS`), DuckDB fixed at 8:")
+    print(f"{'threads':>8} {'wall':>8}")
+    for r in [1, 2, 4, 8, 16, None]:
+        label = "default" if r is None else r
+        print(f"{label:>8} {best_of(3, 2000, 104, 1000, 8, r):>7.2f}s")
+
+    print("\ndeterminism across both thread counts (md5 of the whole draws table):")
     digests = {}
-    for t in [1, 8]:
-        r = subprocess.run([str(DUCK), "-c", fit_sql(2000, 104, 1000, t, digest=True)],
-                           capture_output=True, text=True)
-        hits = [l.strip("│ ") for l in r.stdout.splitlines() if len(l.strip("│ ")) == 32]
-        digests[t] = hits[0] if hits else "ERROR"
-        print(f"  threads={t}: {digests[t]}")
+    for label, threads, rayon in [("duckdb=1", 1, None), ("duckdb=8", 8, None),
+                                  ("rayon=1", 8, 1), ("rayon=16", 8, 16)]:
+        digests[label] = digest_of(2000, 104, 1000, threads, rayon)
+        print(f"  {label:>9}: {digests[label]}")
     same = len(set(digests.values())) == 1
     print("  IDENTICAL" if same else "  *** DIFFERENT -- NOT DETERMINISTIC ***")
     return same

@@ -427,7 +427,8 @@ pub struct DrawRow<'a> {
 /// |---|---|
 /// | 1 | initial |
 /// | 2 | F3 residual scale corrected to `a0 + (n - k)/2` |
-pub const ALGORITHM_VERSION: u32 = 2;
+/// | 3 | F7 draws a stream per group rather than one shared sequential stream |
+pub const ALGORITHM_VERSION: u32 = 3;
 
 /// Derive the deterministic `model_id` for a fit.
 ///
