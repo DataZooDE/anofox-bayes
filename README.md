@@ -337,6 +337,17 @@ binding constraint: independent draws are worth roughly their own count for a
 posterior mean but materially less for the 5 % and 95 % quantiles, and a service-level
 or audit decision reads a quantile.
 
+## Runtime profile
+
+Fitting 5 000 groups x 104 periods (520 000 rows) takes ~4 s and ~800 MB. The fit is
+**single-threaded** in v0.1 and holds the whole posterior in memory; an oversized
+request is refused with a message naming the shape rather than exhausting memory.
+Draws are byte-identical across thread counts.
+
+Measured numbers, the memory model, practical batching guidance and the known gaps
+are in **[docs/SCALABILITY.md](docs/SCALABILITY.md)** — read it before pointing a fit
+at production-scale data.
+
 ## Also planned, and not present today
 
 Marked out explicitly so nobody writes SQL against them: the posterior- and

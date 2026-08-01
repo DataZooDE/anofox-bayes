@@ -175,6 +175,15 @@ _anofox_bayes_diagnostics(model_id, param, rhat, ess_bulk, ess_tail,
 - Long fits inside a query: v0.1 accepts blocking table-function semantics with cancellation support; if field experience demands it, add a job-style API (`fit_async` + status polling) in v0.2 — decision explicitly deferred (BRD OQ-4).
 - Group-parallelism: independent per-group fits (F7, per-segment F4/F6) parallelize trivially over DuckDB's execution; hierarchical fits are single jobs with internal chain parallelism.
 
+> **Measured, v0.1 (`docs/SCALABILITY.md`).** The group-parallelism above is *not*
+> implemented: `MaxThreads()` returns 1 and wall time is flat from 1 to 16 threads.
+> The BR-1 acceptance case (5 000 SKUs x 104 weeks) still completes in ~4 s and
+> ~800 MB, so this is a headroom question rather than a blocker. Three gaps are
+> recorded there: no group parallelism, the input relation is fully buffered rather
+> than reduced to per-group sufficient statistics, and the posterior is materialised
+> whole before the first row is emitted. An oversized request is now refused by a
+> checked `max_draw_megabytes` budget instead of aborting the process.
+
 ## 7. Packaging, Licensing, Versioning
 
 - Separate repo `DataZooDE/anofox-bayes`; **not** part of the community anofox-statistics extension (strategic/licensing separation per BRD G5). Licensed BSL 1.1 (Change License MPL 2.0).
