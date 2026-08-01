@@ -18,6 +18,7 @@ background.
   - […measure the effect of something I changed?](#measure-the-effect-of-something-i-changed)
   - […get a service-level quantity?](#get-a-service-level-quantity)
   - […ask a what-if without re-fitting?](#ask-a-what-if-without-re-fitting)
+  - […keep several named what-ifs side by side?](#keep-several-named-what-ifs-side-by-side)
   - […check my fit is trustworthy?](#check-my-fit-is-trustworthy)
   - […handle a refusal?](#handle-a-refusal)
   - […work with counts instead of measurements?](#work-with-counts-instead-of-measurements)
@@ -317,6 +318,94 @@ enough to act on.
 A worked end-to-end version, including a counterfactual, is in
 `test/sql/posterior_predictive.test`; the properties themselves are pinned in
 `test/sql/keyed_random.test`.
+
+### …keep several named what-ifs side by side?
+
+Once there are three or four what-ifs and someone has to sign off on one of them, the
+`CREATE TABLE counterfactual AS …` above stops being enough: there is no record of
+what each branch changed, nothing stops a branch drifting, and nothing marks the
+version that was approved.
+
+That is a data-versioning problem, not a Bayesian one, and
+[`anofox-scenario`](https://github.com/DataZooDE/anofox-scenario) already solves it —
+it gives any DuckDB table Git-like branches, storing only the rows you actually
+changed. There is nothing to install on the `anofox-bayes` side and no API to learn:
+this extension publishes one artefact (a table of draws) and that extension branches
+one thing (a table), so the two compose through the catalog.
+
+Three rules make the combination work.
+
+**1. Branch the assumptions, never the draws.** A counterfactual changes what you
+plan to *do*, not what the data *said*. The posterior is evidence; editing it is
+fabricating evidence. So the table you branch is the plan — prices, capacities,
+promotion flags — and the draws stay exactly as fitted, which is also why N branches
+cost N joins and no refits.
+
+**2. Write the predictive step as views over the plan.** `anofox-scenario` rebinds
+*unqualified* table references inside a view to the scenario's own tables, so a whole
+predictive chain re-evaluates against a branch for free:
+
+```sql
+CREATE TABLE plan (week INTEGER PRIMARY KEY, price DOUBLE, promo INTEGER);
+
+-- every reference below is unqualified: that is what makes it re-bindable
+CREATE VIEW plan_long AS
+SELECT week AS row_id, 'intercept' AS param, 1.0 AS x FROM plan
+UNION ALL SELECT week, 'beta[price]', price FROM plan
+UNION ALL SELECT week, 'beta[promo]', promo::DOUBLE FROM plan;
+
+CREATE VIEW mu_pred AS
+SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+FROM draws d JOIN plan_long n USING (param)
+WHERE d.draw >= 0 GROUP BY n.row_id, d.draw;
+
+CREATE VIEW units_pred AS
+SELECT m.row_id, m.draw,
+       m.mu + s.value * anofox_bayes_std_normal(4242, m.row_id::VARCHAR, m.draw) AS units
+FROM mu_pred m
+JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
+```
+
+```sql
+LOAD anofox_scenario;
+
+CALL scenario_create('discount', 'list price 20.00 -> 18.00');
+ATTACH 'discount' AS sc_discount (TYPE scenario);
+UPDATE sc_discount.plan SET price = 18.0;      -- the base plan is not written to
+```
+
+`sc_discount.units_pred` now runs the same chain against the branch's plan. Two
+consequences worth checking once: the branch needs a `PRIMARY KEY` (or
+`key_columns :=`) on the plan table before it can be `UPDATE`d, and
+`SELECT * FROM scenario_diff('discount', 'plan')` is the changelog of what the branch
+assumed — the audit trail the hand-rolled version does not have.
+
+**3. Key the noise on the row, never on anything a branch changes.** This is the rule
+that decides whether the comparison is usable. Because `anofox_bayes_std_normal` is a
+pure function of `(seed, key, draw)`, every branch that keys on the *row id* sees the
+same simulated shock, and the shock cancels out of the difference:
+
+```sql
+SELECT median(c.profit - b.profit)              AS effect,
+       quantile_cont(c.profit - b.profit, 0.025) AS lo,
+       quantile_cont(c.profit - b.profit, 0.975) AS hi
+FROM profit b JOIN sc_discount.profit c USING (draw);   -- paired on the draw
+```
+
+Key it on the price, or let each side draw its own noise, and the difference picks up
+the variance of two independent simulated futures instead. Measured in
+`test/sql/scenario_counterfactual.test` on exactly one such comparison, the estimate
+is unchanged and the verdict is not:
+
+| Comparison | Effect | 95% interval | Verdict |
+|---|---:|---|---|
+| Paired — same `(seed, row_id, draw)` on both sides | +149 | +81 … +218 | act |
+| Unpaired — each side its own noise key | +149 | −21 … +318 | cannot distinguish from zero |
+
+Same model, same branch, same answer, and only one of them is a decision. That file
+is the full worked example: one fit, three branches (including a branch off a branch),
+the ranking read off the posterior difference, and the winning branch frozen as the
+record of what was approved.
 
 ### …check my fit is trustworthy?
 
