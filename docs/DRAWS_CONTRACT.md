@@ -102,6 +102,8 @@ SELECT value = 0 AS safe_to_act_on FROM draws WHERE param = '__status__';
 
 | code | family | BRD |
 |---:|---|---|
+| 1 | `hier_negbin` | F1 |
+| 2 | `censored_aft` | F2 |
 | 3 | `pooled_gaussian` | F3 |
 | 5 | `payer_alive` | F5 |
 | 7 | `conjugate_anomaly` | F7 |

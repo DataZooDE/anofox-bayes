@@ -109,6 +109,7 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 |---|---|---|
 | `conjugate_anomaly` | A level or rate per group; anomaly detection | `mu`, `sigma` (Normal) or `lambda` (Poisson) |
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
+| `hier_negbin` | How much of this part will be wanted? Safety stock and reorder points across a catalogue where most items are thin | `intercept`, `tau`, `phi` (population); `u`, `rate` per group |
 | `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by

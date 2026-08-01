@@ -344,8 +344,9 @@ mod families {
     use anofox_stats_core::models::AftDistribution;
 
     use crate::catalog::{
-        f2_censored_aft::CensoredAft, f3_pooled_gaussian::PooledGaussian, f5_btyd::PayerAlive,
-        f7_conjugate::ConjugateAnomaly, ModelFamily,
+        f1_hier_negbin::HierNegbin, f2_censored_aft::CensoredAft,
+        f3_pooled_gaussian::PooledGaussian, f5_btyd::PayerAlive, f7_conjugate::ConjugateAnomaly,
+        ModelFamily,
     };
     use crate::config::Config;
     use crate::data::testing::Frame;
@@ -1105,5 +1106,168 @@ mod families {
         };
         let hists = run_sbc(&model, REPLICATIONS, BINS, 105).unwrap();
         assert_calibrated(&hists, "f5/laplace");
+    }
+
+    /// F1, the hierarchical count GLM, under NUTS.
+    ///
+    /// **What is certified, and what the extra entry is doing here.** The three free
+    /// population parameters — the level, the pooling scale and the dispersion — carry
+    /// proper priors, so all three can be ranked and the suite is unqualified. The
+    /// per-group offsets are *not* ranked: their prior is `N(0, 1)` by construction of
+    /// the non-centred parameterisation, so ranking them would certify a standard
+    /// normal rather than the model.
+    ///
+    /// The fourth entry, `marginal_sd`, is the assertion on a **function of several
+    /// parameters at once**, and it is here because the bridge's postmortem proved
+    /// that SBC cannot see a joint error otherwise: ranking marginals leaves a wrong
+    /// covariance entirely undetected. The marginal standard deviation of a single
+    /// period's demand for a randomly chosen SKU,
+    ///
+    /// ```text
+    ///   M  = exp(b0 + tau^2/2)                       E[rate]
+    ///   S  = exp(2 b0 + 2 tau^2)                     E[rate^2]
+    ///   sd = sqrt(M + S (1 + 1/phi) - M^2)
+    /// ```
+    ///
+    /// reads all three at once, and is precisely the number a reorder point is set
+    /// from. A posterior that got each parameter's marginal right and their joint
+    /// wrong would pass the first three histograms and fail this one.
+    struct F1HierNegbin {
+        n_groups: usize,
+        n_periods: usize,
+        /// `N(mean, sd)` on the intercept.
+        intercept: (f64, f64),
+        /// Half-normal scale on `tau`.
+        tau_scale: f64,
+        /// Lognormal `(log_mean, log_sd)` on `phi`.
+        phi: (f64, f64),
+        /// Keep every `thin`-th draw; see [`F3Slopes::thin`].
+        thin: usize,
+    }
+
+    /// The joint quantity described on [`F1HierNegbin`].
+    fn marginal_sd(intercept: f64, tau: f64, phi: f64) -> f64 {
+        let m = (intercept + 0.5 * tau * tau).exp();
+        let s = (2.0 * intercept + 2.0 * tau * tau).exp();
+        (m + s * (1.0 + 1.0 / phi) - m * m).max(0.0).sqrt()
+    }
+
+    impl SbcModel for F1HierNegbin {
+        fn param_names(&self) -> Vec<String> {
+            vec![
+                "intercept".into(),
+                "tau".into(),
+                "phi".into(),
+                "marginal_sd".into(),
+            ]
+        }
+
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            let intercept = self.intercept.0 + self.intercept.1 * rng.standard_normal();
+            // A half-normal is the absolute value of a normal, which is what the
+            // family's `prior.tau.scale` slot declares.
+            let tau = (self.tau_scale * rng.standard_normal()).abs();
+            let phi = (self.phi.0 + self.phi.1 * rng.standard_normal()).exp();
+            Ok(vec![intercept, tau, phi, marginal_sd(intercept, tau, phi)])
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            let panel = crate::catalog::f1_hier_negbin::testing::simulate(
+                rng,
+                self.n_groups,
+                self.n_periods,
+                truth[0],
+                truth[1],
+                Some(truth[2]),
+            )?;
+            let frame = panel.frame();
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let cfg = format!(
+                r#"{{"y": "units", "group": "sku", "min_groups": 2,
+                     "prior": {{"intercept": {{"mean": {}, "sd": {}}},
+                                "tau": {{"scale": {}}},
+                                "phi": {{"log_mean": {}, "log_sd": {}}}}}}}"#,
+                self.intercept.0, self.intercept.1, self.tau_scale, self.phi.0, self.phi.1
+            );
+            let model = HierNegbin.compile(&Config::parse(&cfg).unwrap(), &view)?;
+            let sample = NutsEngine.sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 1,
+                    n_draws: n_draws * self.thin,
+                    n_warmup: crate::engines::DEFAULT_WARMUP,
+                    seed: rng.uniform().to_bits(),
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )?;
+            let p = model.param_names().len();
+            let kept: Vec<&[f64]> = sample
+                .values
+                .chunks(p)
+                .skip(self.thin - 1)
+                .step_by(self.thin)
+                .collect();
+            // Column order is `intercept, tau, phi, then two per group`.
+            Ok(vec![
+                kept.iter().map(|c| c[0]).collect(),
+                kept.iter().map(|c| c[1]).collect(),
+                kept.iter().map(|c| c[2]).collect(),
+                kept.iter().map(|c| marginal_sd(c[0], c[1], c[2])).collect(),
+            ])
+        }
+    }
+
+    fn f1_under_nuts() -> F1HierNegbin {
+        F1HierNegbin {
+            // Thin on purpose: 24 SKUs of four periods is the regime agent 01 is in,
+            // and certifying where the data is thinnest is what makes the certificate
+            // worth having.
+            n_groups: 24,
+            n_periods: 4,
+            intercept: (1.2, 0.5),
+            tau_scale: 0.6,
+            phi: (1.0, 0.5),
+            thin: 5,
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn f1_is_calibrated_under_the_nuts_engine() {
+        let hists = run_sbc(&f1_under_nuts(), REPLICATIONS, BINS, 106).unwrap();
+        assert_calibrated(&hists, "f1/nuts");
+    }
+
+    /// **The suite above, proved to be a gate**, including on the joint quantity.
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn a_deliberately_overconfident_f1_posterior_is_rejected() {
+        let model = Narrowed {
+            inner: f1_under_nuts(),
+            factor: 0.6,
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 107).unwrap();
+        for h in &hists {
+            println!(
+                "f1/nuts/narrowed/{}: chi2 {:.1}, slope {:+.3}, counts {:?}",
+                h.param,
+                h.chi_squared(),
+                h.slope(),
+                h.counts
+            );
+            assert!(
+                !h.passes(CRITICAL_15_DF),
+                "{}: a posterior 40% too narrow passed the calibration gate \
+                 (chi-squared {:.1}); the gate is not a gate",
+                h.param,
+                h.chi_squared()
+            );
+        }
     }
 }

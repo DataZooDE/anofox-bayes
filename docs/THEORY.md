@@ -145,6 +145,126 @@ model. Two likelihoods:
 > Poisson: `y ~ Poisson(lambda·exposure)` with `lambda ~ Gamma(a0, rate b0)`, posterior
 > `Gamma(a0 + Σy, rate = b0 + Σexposure)`.
 
+### `hier_negbin` — how much of this part will be wanted?
+
+*Use it for:* demand on a catalogue of thousands of items, most of which have almost
+no history. Safety stock, reorder points, service levels.
+
+The difficulty is not forecasting the busy items. It is that a C-parts catalogue is
+mostly items with four or five observations, and there are two wrong ways to handle
+them. Fit each item on its own and a part that happened to be issued twice last month
+looks like a part that moves twice a month. Fit them all together and a bearing that
+moves twenty a week gets the same rate as a seal that moves three.
+
+**Partial pooling** is the third way. Each part gets its own rate, and each rate is
+pulled toward what the catalogue does by an amount the data decides: hardly at all for
+a part with forty weeks of history, most of the way for one with five. Measured on the
+scenario in `test/sql/f1_hier_negbin.test`, the five-week parts move an average of
+7.4 % away from their own sample mean and the forty-week parts 2.1 %.
+
+**Overdispersion.** Spare-parts demand is burstier than a Poisson process: one order
+for twelve, then nothing for a month. A Poisson model reads that as a steady rate and
+reports an interval far too tight, which is a reorder point that stocks out. The
+negative binomial adds a dispersion parameter `phi` that absorbs the burstiness —
+`Var(y) = mu + mu²/phi`, so a large `phi` *is* the Poisson limit and the model can
+report that no extra burstiness was found. `likelihood: 'poisson'` is available for
+data that genuinely is Poisson, and is measurably worse where it is not: on
+overdispersed data a 95 % reorder point set from the Poisson model achieved 87.4 %,
+against 95.4 % from the negative binomial.
+
+**The reorder point.** The posterior predictive for next period's demand is a mixture
+of negative binomials, one per posterior draw, and its probability mass function is
+closed form — so a service level is a sum over a draws table in plain SQL, with no
+re-fit and no simulation. `test/sql/f1_hier_negbin.test` is that query.
+
+> **In detail.** For observation `i` in group `j`, with optional exposure `E` and
+> optional population-level covariates `x`:
+>
+> ```text
+>   y_ij ~ NegBin(mu_ij, phi),   Var = mu + mu^2/phi
+>   log mu_ij = intercept + x_ij'beta + tau * z_j + log E_ij
+>   z_j ~ N(0, 1)
+> ```
+>
+> The group effect is written `tau * z_j` with `z_j ~ N(0, 1)` — the **non-centred**
+> parameterisation — and this is fixed by the family rather than offered as a choice.
+> Writing it the other way round, with `u_j ~ N(0, tau^2)` as a coordinate, makes the
+> prior's width depend on a parameter the sampler is also moving, and the resulting
+> funnel is the classic reason a hierarchical model fails to mix. Measured on the same
+> data, same sampler, same seed: **`tau` reaches an effective sample size of 634 with
+> R̂ = 1.004 non-centred, against 196 and R̂ = 1.016 centred** — the centred version
+> fails this extension's own convergence gate and the non-centred one passes.
+>
+> Parameters are reported as `intercept`, `tau`, `phi` at the population level and, per
+> group, `u` (the group's offset, `tau * z_j`) and `rate` (`exp(intercept + u)`, the
+> group's expected count per unit of exposure).
+>
+> **Priors.** The coefficients are flat by default, as everywhere else here. `tau`
+> defaults to a **uniform prior on `tau` itself** rather than the scale-free `1/tau`:
+> `1/tau` gives an improper posterior for a variance component, while uniform is proper
+> for three or more groups (Gelman 2006) and is the standard reference choice. `phi`
+> defaults to a **uniform prior on the overdispersion `1/phi`**, which is flat exactly
+> where the Poisson limit is — so the default cannot push a fit toward finding
+> burstiness that is not there. Both are declared on the natural scale while the
+> sampler works on `log tau` and `log phi`, so the density carries `+ log tau` and
+> `- log phi` **log-Jacobian** terms. Those terms are not decoration and are not
+> visible to any engine-agreement test — both engines would explore the same wrong
+> surface — so they are pinned directly against the closed form.
+>
+> **Engine: NUTS only.** There is no closed form, and unlike every other family here
+> the Laplace approximation is not merely worse, it is inadmissible. A Laplace
+> posterior is a Gaussian at the joint mode, and a non-centred hierarchy has no usable
+> one: when every `z_j` is zero the likelihood does not depend on `tau` at all, so the
+> density has a ridge along `{z = 0, tau -> infinity}` that the `+ log tau` Jacobian
+> makes rise without bound. The ridge carries no posterior *mass* — the region where
+> the likelihood is any good shrinks like `tau^-G` — which is why a sampler is
+> untroubled by it and a mode search walks straight up it. Measured: under the default
+> prior the mode search does not converge; under a proper half-normal(1) on `tau` it
+> converges to a mean `tau` of 1.63 where the truth is 0.5, and grades itself
+> `degenerate`. So `engine: 'laplace'` is refused with that explanation rather than
+> served.
+
+#### Why this family is native rather than bridged
+
+`ROADMAP.md` deferred F1 on the expectation that a negative-binomial GLMM through the
+`anofox-statistics` bridge would cover the safety-stock agent adequately. It does not,
+and the reason is exactly the one the roadmap flagged: **the dispersion is estimated
+outside the IRLS loop, so it is not in the curvature.** Three facts about the pinned
+revision of `anofox-stats-core`, each asserted in
+`catalog::f1_hier_negbin::bridge_comparison` rather than quoted:
+
+1. `GlmmFamily::from_name("negbinomial")` returns `theta = 1.0`. The dispersion is an
+   **input** to `fit_glmm`, and `GlmmResult` has no field that could carry a posterior
+   for it.
+2. `GlmmResult::var_group` — the pooling scale — is a Brent profile point estimate,
+   with no standard error anywhere in the struct. A bridged posterior would have to
+   condition on that too.
+3. `fit_negbinomial` with `alpha: None`, the only data-driven dispersion upstream
+   offers, **failed to converge on 20 of 20** simulated thin-SKU panels.
+
+So a bridged F1 conditions on two point estimates, and the measured consequence is the
+one that matters commercially. On 40 SKUs of four periods each, drawn from
+`tau = 0.6`, `phi = 2.0`, the 90 % credible interval for a SKU's own demand rate
+covers:
+
+| | mean demand 3/period | mean demand 25/period |
+|---|---:|---:|
+| bridged, plug-in dispersion | **0.76** | **0.41** |
+| bridged, true dispersion handed to it | 0.75 | 0.81 |
+| **native `hier_negbin`** | **0.90** | — |
+
+Nominal is 0.90. The middle row is the informative one: handing the bridge the true
+dispersion for free moves 0.41 to 0.81, so the dispersion error does not merely widen
+the interval, it *propagates into the pooling scale* — the fitted `tau` collapses from
+0.44 to 0.17 against a true 0.6 — and produces an interval that is both wrong and
+narrower. There is no diagnostic that says so, which is the whole problem.
+
+The predictive interval, as opposed to the parameter interval, is less obviously
+broken: integer support pads a discrete interval, so the bridge's achieved service
+level lands between 0.949 and 0.964 against a nominal 0.95 — sometimes over, sometimes
+under, depending on data it cannot see. That is not a defence of the bridged path. It
+is the reason the parameter interval is the one to measure.
+
 ### `pooled_gaussian` — a linear model
 
 *Use it for:* measuring the effect of something — a price change, a promotion, a
@@ -246,7 +366,7 @@ on the `__engine__` row so a reviewer can see which one ran.
 |---|---|---|
 | `exact` | Samples the closed-form posterior directly. No approximation. | default for the two conjugate families |
 | `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on every family; **the** engine for `censored_aft` |
-| `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | available wherever a gradient is |
+| `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | available wherever a gradient is; **the only** engine for `hier_negbin` |
 | `exact` | Samples the closed-form posterior directly. No approximation. | default for `conjugate_anomaly` and `pooled_gaussian` |
 | `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on `pooled_gaussian`; the only engine for `payer_alive` |
 | `nuts` | General-purpose sampler for models with no closed form. | planned (0.2) |
@@ -512,7 +632,15 @@ of 25.
 
 So every family gets at least one assertion on a linear combination of its parameters,
 not only on each parameter separately. Marginal checks cannot see a joint error, and a
-joint error is what produces a confidently wrong interval.
+joint error is what produces a confidently wrong interval. `hier_negbin`'s SBC suite
+carries that assertion *inside the calibration run*: alongside the three population
+parameters it ranks `marginal_sd`, the standard deviation of one period's demand for a
+randomly chosen group, which reads the level, the pooling scale and the dispersion at
+once and is the number a reorder point is set from. Measured over 1024 replications:
+chi-squared 8.1, 17.3, 21.3 and 14.3 at 15 degrees of freedom, against a 99.9 %
+critical value of 37.7 — and 502, 630, 490 and 616 for the same pipeline with every
+draw pulled 40 % toward its own posterior mean, so the gate is a gate on the joint
+quantity too.
 
 ## 9. Further reading
 

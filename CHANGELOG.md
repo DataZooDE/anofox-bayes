@@ -7,6 +7,54 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Added — F1 `hier_negbin`, the hierarchical count GLM (roadmap gap 7)
+
+Agent 01, C-parts safety stock, is unblocked. `docs/THEORY.md` has the model and
+`test/sql/f1_hier_negbin.test` the scenario a planner would run.
+
+- **The bridge was tested before the family was built, and rejected.** The roadmap
+  deferred F1 on the expectation that a `negbinomial` GLMM through
+  `anofox-statistics` would cover agent 01. Measured on 40 SKUs of four periods, the
+  bridged 90 % credible interval for a SKU's own demand rate covers **0.76** where 0.90
+  is nominal, and **0.41** at a higher demand level; the native family covers **0.90**.
+  Handing the bridge the true dispersion for free moves 0.41 to 0.81, which shows the
+  dispersion error propagating into the pooling scale (fitted `tau` 0.17 against a true
+  0.6) rather than merely widening an interval. Upstream's own dispersion loop
+  (`fit_negbinomial` with `alpha: None`) did not converge on 20 of 20 panels, and
+  `GlmmResult` carries no standard error for `var_group` at all. `ROADMAP.md` §3.4 and
+  `catalog::f1_hier_negbin::bridge_comparison`.
+- **`y ~ NegBin(mu, phi)`, `log mu = intercept + x'beta + tau·z_g + log(exposure)`,
+  `z ~ N(0,1)`.** Optional population-level covariates, optional exposure offset, and
+  `likelihood: 'poisson'` for data that genuinely is Poisson.
+- **Non-centred, and not as a config slot.** Measured on the same data, same sampler,
+  same seed: `tau` reaches ESS 634 with R̂ 1.004 non-centred, against ESS 196 and
+  R̂ 1.016 centred — the centred version fails this extension's own convergence gate.
+- **NUTS only.** `laplace` is refused with an explanation rather than served: a Laplace
+  posterior is a Gaussian at the joint mode, and a non-centred hierarchy has none —
+  when every `z` is zero the likelihood does not depend on `tau` at all, so the mode
+  search climbs a ridge that carries no posterior mass. Under a proper half-normal(1)
+  it converges to a mean `tau` of 1.63 where the truth is 0.5, and grades itself
+  `degenerate`.
+- **Scale-free priors that do not presuppose the answer.** `tau` defaults to uniform on
+  `tau` (proper posterior for ≥ 3 groups); `phi` defaults to uniform on the
+  overdispersion `1/phi`, which is flat exactly at the Poisson limit. Both are declared
+  on the natural scale, so the density carries `+ log tau` and `- log phi`
+  **log-Jacobians**, pinned directly against the closed form — no engine-agreement test
+  can see a missing one.
+- **Overdispersion is detected and not invented.** On overdispersed data a 95 % reorder
+  point achieves 95.4 % under the negative binomial and 87.4 % under Poisson; on
+  genuinely Poisson data the negative binomial widens the interval by 6 % and its
+  posterior for `1/phi` has a median of 0.027.
+- **SBC under NUTS**, 1024 replications: chi-squared 8.1 (`intercept`), 17.3 (`tau`),
+  21.3 (`phi`) and 14.3 on `marginal_sd` — a **function of all three at once**, which
+  is the assertion a per-parameter suite structurally cannot make. The same pipeline
+  with every draw pulled 40 % toward its posterior mean scores 502/630/490/616 and is
+  rejected, so the gate is a gate.
+- **`FamilyCode` 1** is now `hier_negbin` (append-only, as the contract requires), with
+  the matching `anofox_bayes_family_text` arm.
+- `BayesRng::poisson` added, for the count families' simulators.
+
+
 ### Changed — `conjugate_anomaly` fits its groups in parallel
 
 Roadmap gap 14, first of three. `docs/SCALABILITY.md` carries the measurements.

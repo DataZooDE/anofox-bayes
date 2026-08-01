@@ -20,7 +20,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use rand_distr::{Distribution, Gamma, StandardNormal};
+use rand_distr::{Distribution, Gamma, Poisson, StandardNormal};
 
 use crate::errors::{BayesError, BayesResult};
 
@@ -111,6 +111,27 @@ impl BayesRng {
     /// inverse chi-squared.
     pub fn chi_squared(&mut self, df: f64) -> BayesResult<f64> {
         self.gamma(df / 2.0, 0.5)
+    }
+
+    /// A draw from `Poisson(lambda)`.
+    ///
+    /// Present because the count families' simulators need it -- SBC and the
+    /// coverage suites generate data from the model they are about to invert, and a
+    /// simulator drawing from a *different* stream than the one the fit is seeded
+    /// from is the one bug that makes a calibration test pass vacuously.
+    pub fn poisson(&mut self, lambda: f64) -> BayesResult<f64> {
+        if !(lambda.is_finite() && lambda >= 0.0) {
+            return Err(BayesError::config(
+                "poisson.lambda",
+                format!("must be finite and >= 0, got {lambda}"),
+            ));
+        }
+        if lambda == 0.0 {
+            return Ok(0.0);
+        }
+        let dist = Poisson::new(lambda)
+            .map_err(|e| BayesError::Internal(format!("poisson({lambda}): {e}")))?;
+        Ok(dist.sample(&mut self.inner))
     }
 
     /// A draw from the uniform distribution on `[0, 1)`.
@@ -234,6 +255,27 @@ mod tests {
             (var - shape / (rate * rate)).abs() < 0.02,
             "variance {var} vs 1.0"
         );
+    }
+
+    /// A Poisson draw is a whole count with mean *and* variance equal to `lambda`.
+    /// Checking both matters: a generator that got the mean right and the variance
+    /// wrong would make every count family's simulator describe a different model from
+    /// the one its likelihood inverts, and SBC would then certify the wrong thing.
+    #[test]
+    fn poisson_has_mean_and_variance_lambda() {
+        let mut rng = BayesRng::for_chain(11, 0);
+        let lambda = 4.5;
+        let n = 200_000;
+        let draws: Vec<f64> = (0..n).map(|_| rng.poisson(lambda).unwrap()).collect();
+        assert!(draws.iter().all(|d| *d >= 0.0 && d.fract() == 0.0));
+        let mean = draws.iter().sum::<f64>() / n as f64;
+        let var = draws.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+        assert!((mean - lambda).abs() < 0.02, "mean {mean}");
+        assert!((var - lambda).abs() < 0.05, "variance {var}");
+        // Zero is a rate, not an error: a period with no exposure sees no events.
+        assert_eq!(rng.poisson(0.0).unwrap(), 0.0);
+        assert!(rng.poisson(-1.0).is_err());
+        assert!(rng.poisson(f64::NAN).is_err());
     }
 
     #[test]

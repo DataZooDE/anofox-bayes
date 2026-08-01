@@ -16,6 +16,7 @@
 //!
 //! Adding an engine touches no family. Adding a family touches no engine.
 
+pub mod f1_hier_negbin;
 pub mod f2_censored_aft;
 pub mod f3_pooled_gaussian;
 pub mod f5_btyd;
@@ -376,6 +377,7 @@ pub fn lookup(id: &str) -> BayesResult<&'static dyn ModelFamily> {
 /// Every family in the catalog.
 pub fn all() -> &'static [&'static dyn ModelFamily] {
     const FAMILIES: &[&dyn ModelFamily] = &[
+        &f1_hier_negbin::HierNegbin,
         &f2_censored_aft::CensoredAft,
         &f3_pooled_gaussian::PooledGaussian,
         &f5_btyd::PayerAlive,
