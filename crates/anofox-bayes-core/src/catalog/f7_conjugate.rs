@@ -211,11 +211,26 @@ impl Prior {
                     mu0: cfg.f64_or("mu0", 0.0)?,
                     // Zero is the reference prior: no prior observations about the mean.
                     kappa0: cfg.non_negative_f64_or("kappa0", 0.0)?,
-                    // -1/2 is the Jeffreys value and is legitimately negative, so it
-                    // cannot be range-checked as a shape parameter; what matters is
-                    // that the *posterior* shape comes out positive, which
-                    // `GroupPosterior::fit` checks per group.
-                    alpha0: cfg.f64_or("alpha0", -0.5)?,
+                    // Legitimately negative: the reference priors in use are -1
+                    // (uniform on log sigma^2), -1/2 (Jeffreys, the default) and 0.
+                    // Bounded below at -1 all the same, because a value beneath it is
+                    // not a prior anyone holds -- it would simply subtract enough
+                    // shape to make the posterior improper, and would then surface as
+                    // "insufficient data", which is a confusing diagnosis for what is
+                    // really a typo. Propriety is still re-checked per group, since a
+                    // small group can fail it even for an admissible alpha0.
+                    alpha0: {
+                        let a = cfg.f64_or("alpha0", -0.5)?;
+                        if a < -1.0 {
+                            return Err(BayesError::config(
+                                "prior.alpha0",
+                                format!(
+                                    "must be >= -1 (reference values are -1, -0.5 or 0), got {a}"
+                                ),
+                            ));
+                        }
+                        a
+                    },
                     beta0: cfg.non_negative_f64_or("beta0", 0.0)?,
                     a0: 0.0,
                     b0: 0.0,
@@ -839,6 +854,29 @@ mod tests {
         let view = frame.view(&refs);
         let err = compile(r#"{"value": "cost", "grup": "lane"}"#, &view).unwrap_err();
         assert!(err.to_string().contains("did you mean 'group'"), "{err}");
+    }
+
+    /// A negative shape is a real modelling choice, not a mistake: the reference
+    /// priors this family defaults to are negative. Only values beneath every prior
+    /// anyone actually holds are rejected -- and rejected as a config error, so they
+    /// do not masquerade as thin data.
+    #[test]
+    fn admissible_reference_priors_are_accepted_and_absurd_ones_are_a_config_error() {
+        let frame = Frame::new(8).numeric("cost", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        for alpha0 in ["-1.0", "-0.5", "0.0", "2.0"] {
+            let cfg = format!(r#"{{"value": "cost", "prior": {{"alpha0": {alpha0}}}}}"#);
+            assert!(
+                compile(&cfg, &view).is_ok(),
+                "alpha0 = {alpha0} should be admissible"
+            );
+        }
+
+        let err = compile(r#"{"value": "cost", "prior": {"alpha0": -5.0}}"#, &view).unwrap_err();
+        assert!(matches!(err, BayesError::Config { ref slot, .. } if slot == "prior.alpha0"));
+        assert!(err.to_string().contains("reference values"), "{err}");
     }
 
     #[test]

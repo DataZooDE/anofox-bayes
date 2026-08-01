@@ -1,0 +1,271 @@
+# name: test/sql/f7_freight_audit.test
+# description: F7 conjugate anomaly, exercised as the freight-audit agent would use it
+# group: [sql]
+
+require anofox_bayes
+
+#######################################
+# Setup: a year of carrier invoices
+#######################################
+
+# Three lanes billed monthly over three years. HAM-ROT and BRE-ANT are stable at
+# different contractual rates; DUS-MIL picks up an undeclared accessorial surcharge
+# halfway through the window. This is the shape a freight audit is looking for: not
+# "which lane is expensive" -- BRE-ANT is legitimately expensive -- but "which lane
+# stopped behaving like itself".
+statement ok
+CREATE TABLE invoices AS
+SELECT 'HAM-ROT' AS lane, i AS period,
+       2.00 + ((i % 5) - 2) * 0.02 AS cost_per_kg
+FROM generate_series(0, 35) AS t(i)
+UNION ALL
+SELECT 'BRE-ANT', i, 3.00 + ((i % 7) - 3) * 0.03
+FROM generate_series(0, 35) AS t(i)
+UNION ALL
+SELECT 'DUS-MIL', i,
+       2.00 + ((i % 5) - 2) * 0.02 + CASE WHEN i >= 18 THEN 1.20 ELSE 0.0 END
+FROM generate_series(0, 35) AS t(i);
+
+#######################################
+# Fit: one table function call
+#######################################
+
+statement ok
+CREATE TABLE draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT lane, cost_per_kg FROM invoices),
+    'conjugate_anomaly',
+    {'value': 'cost_per_kg', 'group': 'lane', 'draws': 4000, 'seed': 42}
+);
+
+# The draws contract: (model_id, group_id, chain, draw, param, value).
+query I
+SELECT count(*) FROM (DESCRIBE draws);
+----
+6
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE draws);
+----
+model_id	VARCHAR
+group_id	VARCHAR
+chain	INTEGER
+draw	INTEGER
+param	VARCHAR
+value	DOUBLE
+
+# 3 lanes x (mu, sigma) x 4000 draws, plus the 8 model-metadata rows.
+query I
+SELECT count(*) FROM draws;
+----
+24008
+
+# One model, one id.
+query I
+SELECT count(DISTINCT model_id) FROM draws;
+----
+1
+
+#######################################
+# The gate: is this fit safe to act on?
+#######################################
+
+# Status travels inside the draws table, so an agent gates without a second query
+# against extension state that may not survive the session.
+query I
+SELECT value = 0 FROM draws WHERE param = '__status__';
+----
+true
+
+query II
+SELECT param, value FROM draws
+WHERE param IN ('__n_obs__', '__n_groups__', '__schema_version__')
+ORDER BY param;
+----
+__n_groups__	3.0
+__n_obs__	108.0
+__schema_version__	1.0
+
+# Diagnostics as a single pass/fail query per parameter -- the shape a deterministic
+# workflow node enforces before letting a recommendation through.
+query I
+SELECT count(*) FROM (
+    SELECT group_id, param
+    FROM draws WHERE draw >= 0
+    GROUP BY group_id, param
+    HAVING anofox_bayes_ess_bulk(value, chain, draw) < 400
+        OR anofox_bayes_ess_tail(value, chain, draw) < 400
+);
+----
+0
+
+#######################################
+# The decision: which lane stopped behaving like itself?
+#######################################
+
+# A lane's cost level is anomalous relative to *its own* contracted rate, so the
+# audit question is asked per lane against the rate on the contract -- not against a
+# fleet-wide average, which would flag the legitimately expensive lane every time.
+statement ok
+CREATE TABLE contract(lane VARCHAR, agreed_rate DOUBLE);
+
+statement ok
+INSERT INTO contract VALUES ('HAM-ROT', 2.05), ('BRE-ANT', 3.05), ('DUS-MIL', 2.05);
+
+# P(mu > agreed rate) straight off the draws table: no re-fit, pure SQL.
+query II
+SELECT d.group_id,
+       round(avg(CASE WHEN d.value > c.agreed_rate THEN 1.0 ELSE 0.0 END), 2) AS p_overbilled
+FROM draws d
+JOIN contract c ON c.lane = d.group_id
+WHERE d.param = 'mu' AND d.draw >= 0
+GROUP BY d.group_id
+ORDER BY p_overbilled DESC, d.group_id;
+----
+DUS-MIL	1.0
+BRE-ANT	0.0
+HAM-ROT	0.0
+
+# The surcharge also shows up as instability: DUS-MIL's cost dispersion is an order
+# of magnitude wider than the stable lanes', which is a second, independent signal.
+query I
+SELECT (SELECT median(value) FROM draws WHERE param = 'sigma' AND group_id = 'DUS-MIL')
+     > 5 * (SELECT median(value) FROM draws WHERE param = 'sigma' AND group_id = 'HAM-ROT');
+----
+true
+
+# A 95% credible interval for each lane's level -- what goes in the audit report.
+query IIII
+SELECT group_id,
+       round(quantile_cont(value, 0.025), 2) AS lo,
+       round(quantile_cont(value, 0.500), 2) AS mid,
+       round(quantile_cont(value, 0.975), 2) AS hi
+FROM draws WHERE param = 'mu' AND draw >= 0
+GROUP BY group_id ORDER BY group_id;
+----
+BRE-ANT	2.99	3.0	3.01
+DUS-MIL	2.4	2.6	2.8
+HAM-ROT	1.99	2.0	2.01
+
+#######################################
+# Reproducibility
+#######################################
+
+# Same inputs, same model_id and same numbers: an auditor can re-run a recommendation
+# and get the identical answer, which is what makes it checkable.
+query I
+SELECT (SELECT DISTINCT model_id FROM draws)
+     = (SELECT DISTINCT model_id FROM anofox_bayes_fit(
+            (SELECT lane, cost_per_kg FROM invoices), 'conjugate_anomaly',
+            {'value': 'cost_per_kg', 'group': 'lane', 'draws': 4000, 'seed': 42}));
+----
+true
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT * FROM draws
+    EXCEPT ALL
+    SELECT * FROM anofox_bayes_fit(
+        (SELECT lane, cost_per_kg FROM invoices), 'conjugate_anomaly',
+        {'value': 'cost_per_kg', 'group': 'lane', 'draws': 4000, 'seed': 42})
+);
+----
+true
+
+# A different seed is a different model.
+query I
+SELECT (SELECT DISTINCT model_id FROM draws)
+    != (SELECT DISTINCT model_id FROM anofox_bayes_fit(
+            (SELECT lane, cost_per_kg FROM invoices), 'conjugate_anomaly',
+            {'value': 'cost_per_kg', 'group': 'lane', 'draws': 4000, 'seed': 43}));
+----
+true
+
+#######################################
+# Poisson: claims per consignment
+#######################################
+
+# The same family with an exposure column answers a rate question rather than a level
+# question -- damage claims per thousand consignments, by carrier.
+statement ok
+CREATE TABLE claims AS
+SELECT 'CARRIER-A' AS carrier, i AS period,
+       (2 + (i % 3))::BIGINT AS claims, 1000.0 AS consignments
+FROM generate_series(0, 23) AS t(i)
+UNION ALL
+SELECT 'CARRIER-B', i, (11 + (i % 4))::BIGINT, 1000.0
+FROM generate_series(0, 23) AS t(i);
+
+query II
+SELECT group_id, round(median(value) * 1000, 1) AS claims_per_1000
+FROM anofox_bayes_fit(
+    (SELECT carrier, claims, consignments FROM claims), 'conjugate_anomaly',
+    {'value': 'claims', 'group': 'carrier', 'likelihood': 'poisson',
+     'exposure': 'consignments', 'draws': 4000, 'seed': 7})
+WHERE param = 'lambda' AND draw >= 0
+GROUP BY group_id ORDER BY group_id;
+----
+CARRIER-A	3.0
+CARRIER-B	12.5
+
+#######################################
+# Refusal: a lane with one invoice
+#######################################
+
+# A brand-new lane cannot support a variance estimate no matter how the model is
+# configured. The fit succeeds, the status refuses, and the unfittable lane's draws
+# are NULL rather than a number an agent might act on.
+statement ok
+CREATE TABLE thin AS
+SELECT * FROM invoices WHERE lane = 'HAM-ROT'
+UNION ALL
+SELECT 'NEW-LANE', 0, 9.99;
+
+statement ok
+CREATE TABLE thin_draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT lane, cost_per_kg FROM thin), 'conjugate_anomaly',
+    {'value': 'cost_per_kg', 'group': 'lane', 'draws': 1000});
+
+# 2 = insufficient_data
+query I
+SELECT value FROM thin_draws WHERE param = '__status__';
+----
+2.0
+
+query I
+SELECT count(*) = 0 OR bool_and(value IS NULL)
+FROM thin_draws WHERE group_id = 'NEW-LANE' AND draw >= 0;
+----
+true
+
+# ...while the healthy lane in the same fit is untouched.
+query I
+SELECT bool_and(value IS NOT NULL)
+FROM thin_draws WHERE group_id = 'HAM-ROT' AND draw >= 0;
+----
+true
+
+#######################################
+# Errors are precise and arrive before any computation
+#######################################
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT lane, cost_per_kg FROM invoices), 'gaussian_process', {'value': 'cost_per_kg'});
+----
+unknown model family
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT lane, cost_per_kg FROM invoices), 'conjugate_anomaly', {'value': 'cost_per_kilo'});
+----
+not found in input data
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT lane, cost_per_kg FROM invoices), 'conjugate_anomaly', {'value': 'cost_per_kg', 'grup': 'lane'});
+----
+did you mean 'group'
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT lane, cost_per_kg FROM invoices), 'conjugate_anomaly', {'value': 'cost_per_kg', 'prior': {'alpha0': -5.0}});
+----
+prior.alpha0

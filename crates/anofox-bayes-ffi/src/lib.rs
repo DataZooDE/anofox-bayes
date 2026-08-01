@@ -12,6 +12,9 @@
 //! * Fallible calls return `bool` and write a code into an out-parameter; `true`
 //!   means the out-parameters are populated.
 
+mod fit;
+pub use fit::*;
+
 use anofox_bayes_core::{diagnostics, DRAWS_SCHEMA_VERSION};
 use std::os::raw::c_char;
 

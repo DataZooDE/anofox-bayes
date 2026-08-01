@@ -49,6 +49,48 @@ bool anofox_bayes_ffi_diagnostic(int32_t kind, const double *values, const int32
                                  const int32_t *draws, size_t n, double *out_value,
                                  bool *out_defined);
 
+// --- Fitting ---------------------------------------------------------------
+//
+// Lifecycle:  data_new -> add_numeric/add_key -> fit -> fit_rows -> free.
+// Pointers passed in are borrowed for the call only (the builder copies).
+// Pointers handed back borrow from the handle and live until it is freed.
+
+// A borrowed string as (pointer, length). Not NUL-terminated: Rust strings are not,
+// and copying to add a byte would double the cost of the largest output we produce.
+typedef struct {
+	const char *ptr;
+	size_t len;
+} AnofoxBayesStr;
+
+typedef struct {
+	int32_t code;
+	char message[512];
+} AnofoxBayesFfiError;
+
+typedef struct AnofoxBayesData AnofoxBayesData;
+typedef struct AnofoxBayesFit AnofoxBayesFit;
+
+AnofoxBayesData *anofox_bayes_ffi_data_new(size_t n_rows);
+void anofox_bayes_ffi_data_free(AnofoxBayesData *data);
+bool anofox_bayes_ffi_data_add_numeric(AnofoxBayesData *data, AnofoxBayesStr name, const double *values,
+                                       const bool *valid, size_t len);
+bool anofox_bayes_ffi_data_add_key(AnofoxBayesData *data, AnofoxBayesStr name, const AnofoxBayesStr *values,
+                                   const bool *valid, size_t len);
+
+// Returns NULL on failure with *out_error populated.
+AnofoxBayesFit *anofox_bayes_ffi_fit(AnofoxBayesStr family, AnofoxBayesStr config_json, const AnofoxBayesData *data,
+                                     AnofoxBayesFfiError *out_error);
+void anofox_bayes_ffi_fit_free(AnofoxBayesFit *fit);
+size_t anofox_bayes_ffi_fit_row_count(const AnofoxBayesFit *fit);
+
+// Copies up to `max` rows starting at `offset`; returns how many were written.
+size_t anofox_bayes_ffi_fit_rows(const AnofoxBayesFit *fit, size_t offset, size_t max, AnofoxBayesStr *out_model_id,
+                                 AnofoxBayesStr *out_group_id, int32_t *out_chain, int32_t *out_draw,
+                                 AnofoxBayesStr *out_param, double *out_value);
+
+// FitStatus code; -1 for a null handle. Reasons are newline-joined.
+int32_t anofox_bayes_ffi_fit_status(const AnofoxBayesFit *fit, AnofoxBayesStr *out_reasons);
+
 #ifdef __cplusplus
 }
 #endif

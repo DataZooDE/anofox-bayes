@@ -168,6 +168,27 @@ impl Posterior {
                 stats.len()
             )));
         }
+        // Every draw must report the same *set* of statistics, even where the values
+        // differ. A sampler that reported energy on some draws and not others would
+        // make the long format ragged, and a consumer counting rows per draw would
+        // silently misalign. It would also be meaningless: a statistic is a property
+        // of the sampler, not of an individual draw.
+        if let Some(first) = stats.first() {
+            let shape = |s: &SampleStats| {
+                (
+                    s.lp.is_some(),
+                    s.divergent.is_some(),
+                    s.energy.is_some(),
+                    s.step_size.is_some(),
+                )
+            };
+            let expected = shape(first);
+            if stats.iter().any(|s| shape(s) != expected) {
+                return Err(crate::BayesError::Internal(
+                    "sampler reported a different set of statistics on different draws".to_string(),
+                ));
+            }
+        }
         Ok(Self {
             meta,
             params,
@@ -197,11 +218,126 @@ impl Posterior {
         (0..self.n_draws).map(move |d| self.values[base + d * n_params])
     }
 
+    /// Statistics rows emitted per draw. Uniform across draws by construction.
+    fn stats_per_draw(&self) -> usize {
+        match self.stats.first() {
+            None => 0,
+            Some(s) => {
+                usize::from(s.lp.is_some())
+                    + usize::from(s.divergent.is_some())
+                    + usize::from(s.energy.is_some())
+                    + usize::from(s.step_size.is_some())
+            }
+        }
+    }
+
+    /// Total rows this posterior renders to in the long format.
+    pub fn n_rows(&self) -> usize {
+        META_ROWS.len() + self.n_chains * self.n_draws * (self.n_params() + self.stats_per_draw())
+    }
+
+    /// The row at a linear index, in O(1).
+    ///
+    /// Random access rather than a stateful iterator because the C++ layer emits
+    /// draws a DuckDB vector at a time and may be resumed from any offset. It is O(1)
+    /// precisely because the statistics shape is uniform: the number of rows a draw
+    /// occupies is the same for every draw, so a row index divides cleanly into
+    /// (chain, draw, slot) with no scanning.
+    pub fn row_at(&self, index: usize) -> Option<DrawRow<'_>> {
+        let model_id = &self.meta.model_id;
+        if index < META_ROWS.len() {
+            let (param, value) = self.meta_row(index);
+            return Some(DrawRow {
+                model_id,
+                group_id: GLOBAL_GROUP,
+                chain: META_INDEX,
+                draw: META_INDEX,
+                param,
+                value,
+            });
+        }
+
+        let per_draw = self.n_params() + self.stats_per_draw();
+        if per_draw == 0 {
+            return None;
+        }
+        let offset = index - META_ROWS.len();
+        let flat_draw = offset / per_draw;
+        let slot = offset % per_draw;
+        if flat_draw >= self.n_chains * self.n_draws {
+            return None;
+        }
+        let chain = flat_draw / self.n_draws;
+        let draw = flat_draw % self.n_draws;
+
+        if slot < self.n_params() {
+            let p = &self.params[slot];
+            return Some(DrawRow {
+                model_id,
+                group_id: &p.group_id,
+                chain: chain as i32,
+                draw: draw as i32,
+                param: &p.name,
+                value: self.value(chain, draw, slot),
+            });
+        }
+
+        let (param, value) = self.stat_row(flat_draw, slot - self.n_params())?;
+        Some(DrawRow {
+            model_id,
+            group_id: GLOBAL_GROUP,
+            chain: chain as i32,
+            draw: draw as i32,
+            param,
+            value,
+        })
+    }
+
+    fn meta_row(&self, i: usize) -> (&'static str, f64) {
+        let m = &self.meta;
+        match META_ROWS[i] {
+            META_SCHEMA_VERSION => (META_SCHEMA_VERSION, DRAWS_SCHEMA_VERSION as f64),
+            META_STATUS => (META_STATUS, m.status as i32 as f64),
+            META_ENGINE => (META_ENGINE, m.engine as i32 as f64),
+            META_SEED => (META_SEED, m.seed as f64),
+            META_N_OBS => (META_N_OBS, m.n_obs as f64),
+            META_N_GROUPS => (META_N_GROUPS, m.n_groups as f64),
+            META_N_CHAINS => (META_N_CHAINS, self.n_chains as f64),
+            other => (other, self.n_draws as f64),
+        }
+    }
+
+    /// The `nth` present statistic of a draw, in a fixed probe order.
+    fn stat_row(&self, flat_draw: usize, nth: usize) -> Option<(&'static str, f64)> {
+        let s = self.stats.get(flat_draw)?;
+        [
+            (PARAM_LP, s.lp),
+            (PARAM_DIVERGENT, s.divergent),
+            (PARAM_ENERGY, s.energy),
+            (PARAM_STEP_SIZE, s.step_size),
+        ]
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| (name, v)))
+        .nth(nth)
+    }
+
     /// Stream the posterior as long-format rows.
-    pub fn rows(&self) -> DrawRows<'_> {
-        DrawRows::new(self)
+    pub fn rows(&self) -> impl Iterator<Item = DrawRow<'_>> + '_ {
+        (0..self.n_rows()).filter_map(|i| self.row_at(i))
     }
 }
+
+/// Model-level metadata rows, in emission order. Part of the draws contract.
+pub const META_ROWS: &[&str] = &[
+    META_SCHEMA_VERSION,
+    META_STATUS,
+    META_ENGINE,
+    META_SEED,
+    META_N_OBS,
+    META_N_GROUPS,
+    META_N_CHAINS,
+    META_N_DRAWS,
+];
 
 /// One row of the draws contract.
 #[derive(Debug, Clone, PartialEq)]
@@ -212,133 +348,6 @@ pub struct DrawRow<'a> {
     pub draw: i32,
     pub param: &'a str,
     pub value: f64,
-}
-
-/// Streaming long-format view of a [`Posterior`].
-///
-/// An iterator rather than a `Vec<DrawRow>` because a hierarchical fit with thousands
-/// of groups produces tens of millions of rows, and the C++ layer consumes them one
-/// DuckDB vector at a time (HLD §3.3: no full-run buffering).
-///
-/// Emission order is fixed and is part of the contract, so that SQL tests can assert
-/// on `LIMIT`ed output: metadata rows first, then draws in `(chain, draw, param)`
-/// order with each draw's sample statistics immediately after its parameters.
-pub struct DrawRows<'a> {
-    post: &'a Posterior,
-    meta_rows: Vec<(&'static str, f64)>,
-    meta_cursor: usize,
-    chain: usize,
-    draw: usize,
-    param: usize,
-    stat: usize,
-}
-
-impl<'a> DrawRows<'a> {
-    fn new(post: &'a Posterior) -> Self {
-        let m = &post.meta;
-        let meta_rows = vec![
-            (META_SCHEMA_VERSION, DRAWS_SCHEMA_VERSION as f64),
-            (META_STATUS, m.status as i32 as f64),
-            (META_ENGINE, m.engine as i32 as f64),
-            (META_SEED, m.seed as f64),
-            (META_N_OBS, m.n_obs as f64),
-            (META_N_GROUPS, m.n_groups as f64),
-            (META_N_CHAINS, post.n_chains as f64),
-            (META_N_DRAWS, post.n_draws as f64),
-        ];
-        Self {
-            post,
-            meta_rows,
-            meta_cursor: 0,
-            chain: 0,
-            draw: 0,
-            param: 0,
-            stat: 0,
-        }
-    }
-
-    /// The sample statistic at position `stat` of the current draw, if present.
-    fn next_stat(&mut self) -> Option<(&'static str, f64)> {
-        let idx = self.chain * self.post.n_draws + self.draw;
-        let stats = self.post.stats.get(idx)?;
-        // Fixed probe order so the emitted row order is deterministic.
-        let probes: [(&'static str, Option<f64>); 4] = [
-            (PARAM_LP, stats.lp),
-            (PARAM_DIVERGENT, stats.divergent),
-            (PARAM_ENERGY, stats.energy),
-            (PARAM_STEP_SIZE, stats.step_size),
-        ];
-        while self.stat < probes.len() {
-            let (name, value) = probes[self.stat];
-            self.stat += 1;
-            if let Some(v) = value {
-                return Some((name, v));
-            }
-        }
-        None
-    }
-}
-
-impl<'a> Iterator for DrawRows<'a> {
-    type Item = DrawRow<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // 1. Model-level metadata, once.
-        if self.meta_cursor < self.meta_rows.len() {
-            let (param, value) = self.meta_rows[self.meta_cursor];
-            self.meta_cursor += 1;
-            return Some(DrawRow {
-                model_id: &self.post.meta.model_id,
-                group_id: GLOBAL_GROUP,
-                chain: META_INDEX,
-                draw: META_INDEX,
-                param,
-                value,
-            });
-        }
-
-        loop {
-            if self.chain >= self.post.n_chains {
-                return None;
-            }
-
-            // 2. This draw's parameters.
-            if self.param < self.post.n_params() {
-                let p = &self.post.params[self.param];
-                let value = self.post.value(self.chain, self.draw, self.param);
-                self.param += 1;
-                return Some(DrawRow {
-                    model_id: &self.post.meta.model_id,
-                    group_id: &p.group_id,
-                    chain: self.chain as i32,
-                    draw: self.draw as i32,
-                    param: &p.name,
-                    value,
-                });
-            }
-
-            // 3. This draw's sample statistics.
-            if let Some((param, value)) = self.next_stat() {
-                return Some(DrawRow {
-                    model_id: &self.post.meta.model_id,
-                    group_id: GLOBAL_GROUP,
-                    chain: self.chain as i32,
-                    draw: self.draw as i32,
-                    param,
-                    value,
-                });
-            }
-
-            // 4. Advance.
-            self.param = 0;
-            self.stat = 0;
-            self.draw += 1;
-            if self.draw >= self.post.n_draws {
-                self.draw = 0;
-                self.chain += 1;
-            }
-        }
-    }
 }
 
 /// Derive the deterministic `model_id` for a fit.
