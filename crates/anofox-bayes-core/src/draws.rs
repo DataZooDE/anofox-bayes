@@ -350,15 +350,38 @@ pub struct DrawRow<'a> {
     pub value: f64,
 }
 
+/// Bumped whenever a change makes identical inputs produce different draws.
+///
+/// This is not the extension version and not the draws-schema version. It answers one
+/// question: *would this build reproduce the numbers an older build wrote?* A bug fix
+/// in a posterior is exactly the case — the inputs are unchanged and the output is
+/// deliberately different, so without this the two fits would share a `model_id` and
+/// a cache would serve the old, wrong answer for the new, correct request.
+///
+/// That has already happened once: correcting F3's residual-scale degrees of freedom
+/// changed every F3 posterior while leaving the inputs alone.
+///
+/// | version | change |
+/// |---|---|
+/// | 1 | initial |
+/// | 2 | F3 residual scale corrected to `a0 + (n - k)/2` |
+pub const ALGORITHM_VERSION: u32 = 2;
+
 /// Derive the deterministic `model_id` for a fit.
 ///
-/// Hashing `(family, config, fingerprint, seed)` rather than assigning a counter or a
-/// UUID is what makes a fit reproducible and cacheable: the same question asked twice
-/// gets the same id, and a different question can never collide with it.
+/// Hashing the request rather than assigning a counter or a UUID is what makes a fit
+/// reproducible and cacheable: the same question asked twice gets the same id, and a
+/// different question can never collide with it.
+///
+/// The **resolved** engine is part of the digest, not the configured one. A caller who
+/// omits `engine` gets the family's default, and if that default later changes the
+/// same config would produce a different posterior — with a different warranty — under
+/// what would otherwise be the same id.
 pub fn derive_model_id(
     family: &str,
     canonical_config: &str,
     data_fingerprint: &str,
+    engine: EngineKind,
     seed: u64,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -367,6 +390,8 @@ pub fn derive_model_id(
         hasher.update(&(field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
     }
+    hasher.update(&(engine as i32).to_le_bytes());
+    hasher.update(&ALGORITHM_VERSION.to_le_bytes());
     hasher.update(&seed.to_le_bytes());
     hasher.finalize().to_hex()[..16].to_string()
 }
@@ -538,29 +563,81 @@ mod tests {
 
     #[test]
     fn the_same_question_asked_twice_gets_the_same_model_id() {
-        let a = derive_model_id("pooled_gaussian", "{\"y\":\"units\"}", "fp-1", 42);
-        let b = derive_model_id("pooled_gaussian", "{\"y\":\"units\"}", "fp-1", 42);
+        let a = derive_model_id(
+            "pooled_gaussian",
+            "{\"y\":\"units\"}",
+            "fp-1",
+            EngineKind::Exact,
+            42,
+        );
+        let b = derive_model_id(
+            "pooled_gaussian",
+            "{\"y\":\"units\"}",
+            "fp-1",
+            EngineKind::Exact,
+            42,
+        );
         assert_eq!(a, b);
+    }
+
+    /// A caller who omits `engine` gets the family default. If that default changes,
+    /// the same config yields a posterior with a different warranty -- so the resolved
+    /// engine, not the configured one, has to be in the digest.
+    #[test]
+    fn the_resolved_engine_is_part_of_the_identity() {
+        let with = |e| derive_model_id("pooled_gaussian", "{}", "fp-1", e, 42);
+        assert_ne!(with(EngineKind::Exact), with(EngineKind::Laplace));
+        assert_ne!(with(EngineKind::Laplace), with(EngineKind::Nuts));
     }
 
     #[test]
     fn a_different_question_gets_a_different_model_id() {
-        let base = derive_model_id("pooled_gaussian", "{\"y\":\"units\"}", "fp-1", 42);
-        assert_ne!(
-            base,
-            derive_model_id("conjugate_anomaly", "{\"y\":\"units\"}", "fp-1", 42)
+        let base = derive_model_id(
+            "pooled_gaussian",
+            "{\"y\":\"units\"}",
+            "fp-1",
+            EngineKind::Exact,
+            42,
         );
         assert_ne!(
             base,
-            derive_model_id("pooled_gaussian", "{\"y\":\"cost\"}", "fp-1", 42)
+            derive_model_id(
+                "conjugate_anomaly",
+                "{\"y\":\"units\"}",
+                "fp-1",
+                EngineKind::Exact,
+                42
+            )
         );
         assert_ne!(
             base,
-            derive_model_id("pooled_gaussian", "{\"y\":\"units\"}", "fp-2", 42)
+            derive_model_id(
+                "pooled_gaussian",
+                "{\"y\":\"cost\"}",
+                "fp-1",
+                EngineKind::Exact,
+                42
+            )
         );
         assert_ne!(
             base,
-            derive_model_id("pooled_gaussian", "{\"y\":\"units\"}", "fp-1", 43)
+            derive_model_id(
+                "pooled_gaussian",
+                "{\"y\":\"units\"}",
+                "fp-2",
+                EngineKind::Exact,
+                42
+            )
+        );
+        assert_ne!(
+            base,
+            derive_model_id(
+                "pooled_gaussian",
+                "{\"y\":\"units\"}",
+                "fp-1",
+                EngineKind::Exact,
+                43
+            )
         );
     }
 
@@ -569,9 +646,10 @@ mod tests {
     /// in answer to another's question.
     #[test]
     fn model_id_fields_cannot_bleed_into_each_other() {
+        let e = EngineKind::Exact;
         assert_ne!(
-            derive_model_id("ab", "c", "fp", 0),
-            derive_model_id("a", "bc", "fp", 0)
+            derive_model_id("ab", "c", "fp", e, 0),
+            derive_model_id("a", "bc", "fp", e, 0)
         );
     }
 }

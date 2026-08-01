@@ -53,6 +53,7 @@ const SLOTS: &[&str] = &[
     "prior",
     "draws",
     "chains",
+    "max_draw_megabytes",
     "seed",
     "engine",
     "min_obs",
@@ -119,6 +120,13 @@ impl ModelFamily for ConjugateAnomaly {
         let mut posteriors = Vec::with_capacity(groups.len());
         let mut params = Vec::with_capacity(groups.len() * likelihood.param_names().len());
 
+        // Only user-supplied keys are policed. An ungrouped fit uses GLOBAL_GROUP as
+        // its single synthetic key, which is reserved by construction.
+        if group.is_some() {
+            for (key, _) in &groups {
+                crate::types::validate_group_key(key)?;
+            }
+        }
         for (key, idx) in &groups {
             let ys: Vec<f64> = idx.iter().map(|&i| values.values[i]).collect();
             let es: Option<Vec<f64>> = exposures

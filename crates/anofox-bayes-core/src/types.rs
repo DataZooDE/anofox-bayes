@@ -126,6 +126,30 @@ pub fn validate_param_name(name: &str) -> BayesResult<()> {
     Ok(())
 }
 
+/// Reject a group key that would collide with the contract's own sentinels.
+///
+/// `GLOBAL_GROUP` marks population-level parameters, and every metadata row carries
+/// it. A dataset with a literal group named `__global__` would put that group's
+/// parameters in the same bucket, so `WHERE group_id = '__global__'` — the documented
+/// way to select population-level parameters — would silently return one customer
+/// segment's estimates mixed in with them.
+///
+/// Rejecting is right rather than escaping: `__global__` is not a plausible business
+/// key, so an error costs nobody anything, while a mangled key would show up in a
+/// report under a name the analyst does not recognise.
+pub fn validate_group_key(key: &str) -> BayesResult<()> {
+    if key.starts_with(RESERVED_PREFIX) {
+        return Err(BayesError::config(
+            "group",
+            format!(
+                "group key '{key}' begins with the reserved '{RESERVED_PREFIX}' prefix, \
+                 which the draws contract uses for its own rows"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +188,17 @@ mod tests {
     fn an_unknown_engine_is_a_config_error_not_a_silent_default() {
         let err = EngineKind::parse("hmc").unwrap_err();
         assert!(matches!(err, BayesError::Config { ref slot, .. } if slot == "engine"));
+    }
+
+    #[test]
+    fn a_group_key_may_not_occupy_the_reserved_namespace() {
+        assert!(validate_group_key("HAM-ROT").is_ok());
+        assert!(validate_group_key("").is_ok());
+        // A literal `__global__` group would land its parameters in the same bucket
+        // as the population-level ones, so the documented filter would quietly
+        // return the wrong rows.
+        assert!(validate_group_key(GLOBAL_GROUP).is_err());
+        assert!(validate_group_key("__anything__").is_err());
     }
 
     #[test]

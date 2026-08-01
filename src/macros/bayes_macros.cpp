@@ -51,16 +51,25 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
     // question a decision-maker actually asks -- "is the effect bigger than the
     // rollout cost?" -- and on a draws table it is a mean of an indicator, with no
     // distributional theory in between.
+    //
+    // NULL propagates rather than counting as "not greater". A parameter the model
+    // declined to estimate has NULL draws, and the naive
+    // `CASE WHEN value > t THEN 1 ELSE 0 END` scores every one of them as a miss --
+    // so `P(effect > 0)` on a refused parameter comes back `0.0`, a confident
+    // "definitely not", when the honest answer is "no estimate". `avg` already skips
+    // NULLs, so mapping an unestimable draw to NULL makes the whole aggregate NULL
+    // exactly when every draw is unestimable, which is the behaviour the draws
+    // contract promises.
     {DEFAULT_SCHEMA,
      "anofox_bayes_prob_greater",
      {"value", "threshold", nullptr},
      {{nullptr, nullptr}},
-     "avg(CASE WHEN value > threshold THEN 1.0 ELSE 0.0 END)"},
+     "avg(CASE WHEN value IS NULL THEN NULL WHEN value > threshold THEN 1.0 ELSE 0.0 END)"},
     {DEFAULT_SCHEMA,
      "anofox_bayes_prob_less",
      {"value", "threshold", nullptr},
      {{nullptr, nullptr}},
-     "avg(CASE WHEN value < threshold THEN 1.0 ELSE 0.0 END)"},
+     "avg(CASE WHEN value IS NULL THEN NULL WHEN value < threshold THEN 1.0 ELSE 0.0 END)"},
 
     // The quantile a service-level target implies. A 95% service level means the
     // quantity that covers demand in 95% of futures, which is the 95th percentile of

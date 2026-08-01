@@ -36,6 +36,11 @@ impl Config {
     pub fn parse(json: &str) -> BayesResult<Self> {
         let root: Value = serde_json::from_str(json)
             .map_err(|e| BayesError::config("", format!("not valid JSON: {e}")))?;
+        // serde_json resolves a repeated key by keeping the last one, silently. That
+        // is exactly the ambiguity this module exists to refuse: `{"value":"nope",
+        // "value":"cost"}` would fit `cost` and never mention that something else was
+        // asked for first.
+        reject_duplicate_keys(json)?;
         if !root.is_object() {
             return Err(BayesError::config(
                 "",
@@ -274,18 +279,18 @@ impl Config {
     pub fn seed(&self) -> BayesResult<u64> {
         match self.get("seed") {
             None => Ok(DEFAULT_SEED),
-            Some(v) => {
-                let n = v.as_f64().ok_or_else(|| {
-                    BayesError::config("seed", format!("expected a number, got {}", type_name(v)))
-                })?;
-                if !n.is_finite() || n.fract() != 0.0 || n < 0.0 {
-                    return Err(BayesError::config(
-                        "seed",
-                        format!("must be a non-negative whole number, got {n}"),
-                    ));
-                }
-                Ok(n as u64)
-            }
+            // Read as an integer, not through `f64`. Above 2^53 a double cannot
+            // represent every u64, so a seed round-tripped through one would silently
+            // become a *different* seed -- and a fit that cannot be reproduced from
+            // the seed it reports is not auditable.
+            Some(v) if v.is_u64() => Ok(v.as_u64().expect("checked is_u64")),
+            // One message for both rejections: a caller who passed -1 and a caller who
+            // passed 1.5 made the same class of mistake and should read the same
+            // sentence.
+            Some(v) => Err(BayesError::config(
+                "seed",
+                format!("must be a non-negative whole number, got {v}"),
+            )),
         }
     }
 
@@ -297,6 +302,92 @@ impl Config {
     pub fn canonical(&self) -> String {
         self.root.to_string()
     }
+}
+
+/// Reject any object in the document that names the same key twice.
+///
+/// `serde_json` cannot report this — its map keeps the last value and discards the
+/// rest — so the raw text is re-scanned with a streaming visitor that sees keys in
+/// order. The visitor accepts every JSON value type and recurses through objects and
+/// arrays; it exists only for its side effect of noticing a repeat.
+fn reject_duplicate_keys(json: &str) -> BayesResult<()> {
+    use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+    use std::collections::BTreeSet;
+    use std::fmt;
+
+    struct Walk;
+
+    impl<'de> DeserializeSeed<'de> for Walk {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_any(Walk)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Walk {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("any JSON value")
+        }
+
+        // Scalars carry nothing to check; they only have to be accepted.
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_none<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(key));
+                }
+                map.next_value_seed(Walk)?;
+            }
+            Ok(())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element_seed(Walk)?.is_some() {}
+            Ok(())
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(json);
+    Walk.deserialize(&mut de).map_err(|e| {
+        // The offending key is carried as the custom error message; strip serde's
+        // positional suffix so the slot name comes back clean.
+        let slot = e.to_string();
+        let slot = slot
+            .split(" at line")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        BayesError::config(
+            slot,
+            "given more than once; a repeated option is ambiguous, so it is rejected \
+             rather than resolved by position",
+        )
+    })
 }
 
 /// The seed used when a caller does not supply one.
@@ -477,6 +568,18 @@ mod tests {
         assert_eq!(cfg(r#"{"seed": 42}"#).seed().unwrap(), 42);
         assert!(cfg(r#"{"seed": -1}"#).seed().is_err());
         assert!(cfg(r#"{"seed": 1.5}"#).seed().is_err());
+
+        // Above 2^53 an f64 cannot represent every integer. Read through one, this
+        // seed would come back as 9007199254740994 -- a different fit from the one
+        // the caller asked for, reported under the seed they did ask for.
+        assert_eq!(
+            cfg(r#"{"seed": 9007199254740993}"#).seed().unwrap(),
+            9007199254740993
+        );
+        assert_eq!(
+            cfg(r#"{"seed": 18446744073709551615}"#).seed().unwrap(),
+            u64::MAX
+        );
     }
 
     /// Two callers who write the same options in a different order must get the same
@@ -487,6 +590,24 @@ mod tests {
         let a = cfg(r#"{"value": "cost", "draws": 100}"#).canonical();
         let b = cfg(r#"{"draws": 100, "value": "cost"}"#).canonical();
         assert_eq!(a, b);
+    }
+
+    /// `serde_json` keeps the last value for a repeated key, silently. A config that
+    /// names `value` twice is an ambiguous request, and fitting whichever one came
+    /// last is the definition of a plausible answer to the wrong question.
+    #[test]
+    fn a_repeated_key_is_rejected_rather_than_resolved_by_position() {
+        let err = Config::parse(r#"{"value": "nope", "value": "cost"}"#).unwrap_err();
+        assert!(
+            matches!(err, BayesError::Config { ref slot, .. } if slot == "value"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("more than once"), "{err}");
+
+        // Nested objects are checked too.
+        assert!(Config::parse(r#"{"prior": {"a0": 1, "a0": 2}}"#).is_err());
+        // ...and a document with no repeats is untouched.
+        assert!(Config::parse(r#"{"value": "cost", "prior": {"a0": 1, "b0": 2}}"#).is_ok());
     }
 
     #[test]

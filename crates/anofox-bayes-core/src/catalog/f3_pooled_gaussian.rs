@@ -68,6 +68,7 @@ const SLOTS: &[&str] = &[
     "prior",
     "draws",
     "chains",
+    "max_draw_megabytes",
     "seed",
     "engine",
 ];
@@ -103,6 +104,20 @@ impl ModelFamily for PooledGaussian {
         let intercept = cfg.f64_or("intercept", 1.0)? != 0.0;
         let group = cfg.opt_str("group")?.map(str::to_string);
         let pool_scale = cfg.positive_f64_or("pool_scale", 1.0)?;
+        // The precision added to the normal equations is 1/pool_scale^2. Below about
+        // 1e-150 that squares to zero and the reciprocal is infinite, which surfaces
+        // downstream as "singular or rank-deficient design matrix" -- a true statement
+        // about the matrix, and a useless one about the request. Name the slot that
+        // caused it instead.
+        if !(pool_scale * pool_scale).is_normal() {
+            return Err(BayesError::config(
+                "pool_scale",
+                format!(
+                    "{pool_scale} is too small: the implied prior precision \
+                     1/pool_scale^2 is not representable"
+                ),
+            ));
+        }
 
         let prior = cfg.nested("prior")?;
         prior.reject_unknown(&["beta_scale", "a0", "s0"])?;
@@ -138,6 +153,9 @@ impl ModelFamily for PooledGaussian {
             .collect::<BayesResult<_>>()?;
         let groups = data.group_rows(group.as_deref(), &rows)?;
         let group_keys: Vec<String> = if group.is_some() {
+            for (key, _) in &groups {
+                crate::types::validate_group_key(key)?;
+            }
             groups.iter().map(|(k, _)| k.clone()).collect()
         } else {
             Vec::new()

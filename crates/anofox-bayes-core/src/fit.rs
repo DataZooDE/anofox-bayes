@@ -28,8 +28,50 @@ use crate::data::DataView;
 use crate::diagnostics::{self, ParamDiagnostics, Thresholds};
 use crate::draws::{derive_model_id, ModelMeta, Posterior};
 use crate::engines::{self, SampleOptions};
-use crate::errors::BayesResult;
+use crate::errors::{BayesError, BayesResult};
 use crate::types::{EngineKind, FitStatus};
+
+/// Default ceiling on the in-memory draw buffer, in megabytes.
+///
+/// Two gigabytes is chosen to be comfortably above any fit the shipped families
+/// realistically need — 5000 groups x 2 parameters x 4000 draws is ~320 MB — while
+/// staying well below the point where a fit would evict a customer's other work. It
+/// is a config slot, not a constant, because "realistically" is a claim about our
+/// customers rather than a law.
+pub const DEFAULT_MAX_DRAW_MEGABYTES: usize = 2048;
+
+/// Reject a request whose draw buffer would exceed the budget, before allocating it.
+fn check_output_budget(
+    n_params: usize,
+    n_chains: usize,
+    n_draws: usize,
+    max_megabytes: usize,
+) -> BayesResult<()> {
+    // Checked throughout: on a 32-bit target this product overflows long before it
+    // exhausts memory, and a wrapped length would allocate a buffer far too small
+    // and then write past it.
+    let cells = n_chains
+        .checked_mul(n_draws)
+        .and_then(|c| c.checked_mul(n_params));
+    let bytes = cells.and_then(|c| c.checked_mul(std::mem::size_of::<f64>()));
+
+    let budget = max_megabytes.saturating_mul(1024 * 1024);
+    let requested = match bytes {
+        Some(b) if b <= budget => return Ok(()),
+        Some(b) => b,
+        None => usize::MAX,
+    };
+
+    Err(BayesError::config(
+        "draws",
+        format!(
+            "this fit would need {} MB of draws ({n_params} parameters x {n_chains} chain(s) \
+             x {n_draws} draws), above the {max_megabytes} MB limit. Reduce `draws`, fit fewer \
+             groups at a time, or raise `max_draw_megabytes` if the memory is genuinely available",
+            requested / (1024 * 1024)
+        ),
+    ))
+}
 
 /// A completed fit.
 #[derive(Debug)]
@@ -61,10 +103,21 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         None => family.default_engine(),
     };
 
+    // Output size is budgeted *before* the model is compiled into draws. The draw
+    // buffer is `chains * draws * params` f64s, and `params` grows with the number of
+    // groups in the data, which no config slot bounds. Left unchecked, a request like
+    // 100k groups x 10k draws asks for 16 GB and Rust's allocator aborts the process
+    // -- taking the customer's whole DuckDB session with it, for what is really just a
+    // request that was too big. A refusal that names the shape is recoverable; an
+    // abort is not.
+    let max_megabytes =
+        cfg.usize_in("max_draw_megabytes", DEFAULT_MAX_DRAW_MEGABYTES, 1, 1 << 20)?;
+
     let model = family.compile(cfg, data)?;
+    check_output_budget(model.param_names().len(), n_chains, n_draws, max_megabytes)?;
     let engine = engines::resolve(engine_kind)?;
     if !engine.supports(&*model) {
-        return Err(crate::BayesError::config(
+        return Err(BayesError::config(
             "engine",
             format!(
                 "the {} engine cannot serve family '{}'",
@@ -87,6 +140,7 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
             family.id(),
             &cfg.canonical(),
             model.data_fingerprint(),
+            engine_kind,
             seed,
         ),
         family: family.id().to_string(),
@@ -381,6 +435,63 @@ mod tests {
             assert!(r < 1.01, "{}/{}: rhat {r}", d.group_id, d.param);
         }
         assert_eq!(multi.posterior.meta.status, FitStatus::Converged);
+    }
+
+    /// A request too large to hold must be refused, not attempted. Rust's allocator
+    /// aborts the process on failure, which would take the customer's whole DuckDB
+    /// session down for what is only an over-ambitious query.
+    #[test]
+    fn an_oversized_request_is_refused_before_anything_is_allocated() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        // 3 lanes x 2 params x 1_000_000 draws x 8 bytes = 48 MB, under a 1 MB cap.
+        let cfg = Config::parse(
+            r#"{"value": "cost", "group": "lane", "draws": 1000000, "max_draw_megabytes": 1}"#,
+        )
+        .unwrap();
+        let err = fit("conjugate_anomaly", &cfg, &view)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MB of draws"), "{err}");
+        assert!(err.contains("6 parameters"), "{err}");
+        assert!(err.contains("max_draw_megabytes"), "{err}");
+
+        // ...and a fit inside the budget is unaffected.
+        let cfg = Config::parse(
+            r#"{"value": "cost", "group": "lane", "draws": 2000, "max_draw_megabytes": 1}"#,
+        )
+        .unwrap();
+        assert!(fit("conjugate_anomaly", &cfg, &view).is_ok());
+    }
+
+    #[test]
+    fn the_output_budget_uses_checked_arithmetic() {
+        // On any target, this product overflows usize. A wrapped length would
+        // allocate a far-too-small buffer and then be written past.
+        let err = check_output_budget(usize::MAX / 2, 64, 1_000_000, 2048).unwrap_err();
+        assert!(err.to_string().contains("MB of draws"));
+    }
+
+    /// Two posteriors with different warranties must not share an identity, even when
+    /// the caller never named an engine and the two configs are byte-identical.
+    #[test]
+    fn the_engine_that_actually_ran_changes_the_model_id() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let id_of = |cfg: &str| {
+            fit("pooled_gaussian", &Config::parse(cfg).unwrap(), &view)
+                .unwrap()
+                .posterior
+                .meta
+                .model_id
+        };
+        assert_ne!(
+            id_of(r#"{"y": "cost", "draws": 500, "engine": "exact"}"#),
+            id_of(r#"{"y": "cost", "draws": 500, "engine": "laplace"}"#)
+        );
     }
 
     #[test]
