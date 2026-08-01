@@ -429,8 +429,7 @@ SELECT count(*) AS failing_parameters FROM (
     SELECT group_id, param
     FROM draws WHERE draw >= 0
     GROUP BY group_id, param
-    HAVING anofox_bayes_ess_bulk(value, chain, draw) < 400
-        OR anofox_bayes_ess_tail(value, chain, draw) < 400
+    HAVING NOT anofox_bayes_ess_gate(value, chain, draw, 400)
 );
 ```
 

@@ -72,10 +72,14 @@ typedef struct AnofoxBayesFit AnofoxBayesFit;
 
 AnofoxBayesData *anofox_bayes_ffi_data_new(size_t n_rows);
 void anofox_bayes_ffi_data_free(AnofoxBayesData *data);
+// Validity masks are uint8_t (0 = NULL, non-zero = present), not `bool`. C++ `bool`
+// has no guaranteed size or representation and Rust `bool` is UB for any bit pattern
+// other than 0 or 1, so passing one as the other is an ABI accident rather than a
+// contract.
 bool anofox_bayes_ffi_data_add_numeric(AnofoxBayesData *data, AnofoxBayesStr name, const double *values,
-                                       const bool *valid, size_t len);
+                                       const uint8_t *valid, size_t len);
 bool anofox_bayes_ffi_data_add_key(AnofoxBayesData *data, AnofoxBayesStr name, const AnofoxBayesStr *values,
-                                   const bool *valid, size_t len);
+                                   const uint8_t *valid, size_t len);
 
 // Returns NULL on failure with *out_error populated.
 AnofoxBayesFit *anofox_bayes_ffi_fit(AnofoxBayesStr family, AnofoxBayesStr config_json, const AnofoxBayesData *data,

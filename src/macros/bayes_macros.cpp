@@ -74,6 +74,33 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
 
     // --- Gating -----------------------------------------------------------
     //
+    // Whether a parameter clears its effective-sample-size gate, NULL-safe by
+    // construction.
+    //
+    // This exists because the obvious hand-written form is wrong in a way that fails
+    // open. `HAVING ess_bulk < 400` looks like it flags under-sampled parameters, but
+    // ESS is NULL where it is not defined -- a parameter that never moved, or too few
+    // draws to assess -- and `NULL < 400` is NULL, not true. The parameter most in
+    // need of flagging is exactly the one that slips through. Wrapping the comparison
+    // in `coalesce(..., false)` makes an absent diagnostic a failure, which is the
+    // only safe reading.
+    {DEFAULT_SCHEMA,
+     "anofox_bayes_ess_gate",
+     {"value", "chain", "draw", "min_ess", nullptr},
+     {{nullptr, nullptr}},
+     "coalesce(anofox_bayes_ess_bulk(value, chain, draw) >= min_ess"
+     "     AND anofox_bayes_ess_tail(value, chain, draw) >= min_ess, false)"},
+    // The R-hat half of the same idea. A NULL R-hat is *not* a failure -- both 0.1
+    // engines draw independently, so the statistic is legitimately undefined -- which
+    // is why this defaults to true rather than false, and why it is a separate macro
+    // rather than being folded into the ESS gate.
+    {DEFAULT_SCHEMA,
+     "anofox_bayes_rhat_gate",
+     {"value", "chain", "draw", "max_rhat", nullptr},
+     {{nullptr, nullptr}},
+     "coalesce(anofox_bayes_rhat(value, chain, draw) <= max_rhat, true)"},
+
+    //
     // Decodes the reserved __status__ row. Aggregate rather than scalar so it can be
     // applied straight to a draws table without a WHERE clause.
     {DEFAULT_SCHEMA,

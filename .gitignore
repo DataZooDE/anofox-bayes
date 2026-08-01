@@ -13,3 +13,4 @@ test/python/__pycache__/
 validation/.venv/
 validation/**/__pycache__/
 validation/.pytest_cache/
+.codex-delegate/

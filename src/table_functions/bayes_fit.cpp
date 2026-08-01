@@ -185,11 +185,13 @@ void RunFit(const BayesFitBindData &bind_data, BayesFitGlobalState &gstate) {
 	// The FFI builder copies, so these buffers only need to outlive the add_* calls.
 	try {
 		for (idx_t c = 0; c < bind_data.numeric_names.size(); c++) {
-			// vector<bool> is a bitset and has no contiguous storage to hand over.
-			vector<char> valid(gstate.numeric_valid[c].begin(), gstate.numeric_valid[c].end());
+			// vector<bool> is a bitset with no contiguous storage, so it cannot be
+			// handed over directly. uint8_t rather than char or bool: the FFI
+			// contract is an explicit byte, because C++ `bool` has no guaranteed
+			// representation and Rust `bool` is UB for anything but 0 or 1.
+			vector<uint8_t> valid(gstate.numeric_valid[c].begin(), gstate.numeric_valid[c].end());
 			if (!anofox_bayes_ffi_data_add_numeric(data, Borrow(bind_data.numeric_names[c]),
-			                                       gstate.numeric_values[c].data(),
-			                                       reinterpret_cast<const bool *>(valid.data()), gstate.n_rows)) {
+			                                       gstate.numeric_values[c].data(), valid.data(), gstate.n_rows)) {
 				throw InternalException("anofox_bayes_fit: rejected numeric column '%s'", bind_data.numeric_names[c]);
 			}
 		}
@@ -199,9 +201,9 @@ void RunFit(const BayesFitBindData &bind_data, BayesFitGlobalState &gstate) {
 			for (auto &s : gstate.key_values[c]) {
 				slices.push_back(Borrow(s));
 			}
-			vector<char> valid(gstate.key_valid[c].begin(), gstate.key_valid[c].end());
-			if (!anofox_bayes_ffi_data_add_key(data, Borrow(bind_data.key_names[c]), slices.data(),
-			                                   reinterpret_cast<const bool *>(valid.data()), gstate.n_rows)) {
+			vector<uint8_t> valid(gstate.key_valid[c].begin(), gstate.key_valid[c].end());
+			if (!anofox_bayes_ffi_data_add_key(data, Borrow(bind_data.key_names[c]), slices.data(), valid.data(),
+			                                   gstate.n_rows)) {
 				throw InternalException("anofox_bayes_fit: rejected key column '%s'", bind_data.key_names[c]);
 			}
 		}

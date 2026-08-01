@@ -191,3 +191,49 @@ SELECT coalesce(sum(value), 0) = 0
 FROM draws WHERE param = '__divergent__';
 ----
 true
+
+#######################################
+# A gate must fail closed, not open
+#######################################
+
+# A parameter that never moves has no defined ESS, so the aggregate is NULL. The
+# obvious hand-written gate does NOT catch it: `NULL < 400` is NULL, not true, so the
+# parameter most in need of flagging is exactly the one that slips through. This is a
+# real hazard, found by an independent review of a suite that was already green.
+statement ok
+CREATE TABLE frozen AS
+SELECT 0 AS chain, i AS draw, 'x' AS param, 2.0 AS value FROM generate_series(0, 199) AS t(i);
+
+query I
+SELECT anofox_bayes_ess_bulk(value, chain, draw) IS NULL FROM frozen;
+----
+true
+
+# The naive form finds nothing...
+query I
+SELECT count(*) FROM (
+    SELECT param FROM frozen GROUP BY param
+    HAVING anofox_bayes_ess_bulk(value, chain, draw) < 400);
+----
+0
+
+# ...while the gate macro, which coalesces to false, flags it.
+query I
+SELECT anofox_bayes_ess_gate(value, chain, draw, 400) FROM frozen;
+----
+false
+
+query I
+SELECT count(*) FROM (
+    SELECT param FROM frozen GROUP BY param
+    HAVING NOT anofox_bayes_ess_gate(value, chain, draw, 400));
+----
+1
+
+# R-hat gates the other way round: NULL is legitimate under an independent sampler,
+# where there is no Markov chain that could have failed to mix, so an absent R-hat
+# passes rather than failing.
+query I
+SELECT anofox_bayes_rhat_gate(value, chain, draw, 1.01) FROM mixed;
+----
+true

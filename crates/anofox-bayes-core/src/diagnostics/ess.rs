@@ -159,11 +159,14 @@ fn ess_of(chains: &[Vec<f64>]) -> f64 {
         .collect();
     let w = chain_vars.iter().sum::<f64>() / m as f64;
 
-    // A parameter that never moves has no autocorrelation to discount. Reporting the
-    // raw count here (rather than 0) keeps the ESS gate focused on under-sampling;
-    // genuine degeneracy is caught by the status path instead.
+    // A parameter that never moves has no *defined* effective sample size: the
+    // autocorrelation is 0/0. Zero is this estimator's "not assessable" signal, and
+    // it is the honest answer -- reporting the raw count would say "well sampled"
+    // about a series that never moved, and would let a degenerate parameter sail
+    // through an `ess >= 400` gate. It also keeps ESS consistent with `rhat`, which
+    // already returns `None` for a point mass.
     if w <= 0.0 || !w.is_finite() {
-        return total;
+        return 0.0;
     }
 
     let var_plus = if m > 1 {
@@ -175,7 +178,7 @@ fn ess_of(chains: &[Vec<f64>]) -> f64 {
         w
     };
     if var_plus <= 0.0 || !var_plus.is_finite() {
-        return total;
+        return 0.0;
     }
 
     let rho = |lag: usize| -> f64 { 1.0 - (w - acov(lag)) / var_plus };
@@ -335,6 +338,27 @@ mod tests {
         let mut bad = iid_chain(1, 100, 0.0);
         bad[3] = f64::INFINITY;
         assert_eq!(ess_bulk(&[bad]), 0.0);
+    }
+
+    /// A series that never moves has no *defined* effective sample size -- the
+    /// autocorrelation is 0/0. Reporting the raw draw count would say "well sampled"
+    /// about a parameter that never moved, and would let it pass an `ess >= 400`
+    /// gate; `rhat` already returns `None` for the same input, and the two must
+    /// agree. Found by an independent review, not by the suite that shipped with it.
+    #[test]
+    fn a_constant_series_has_no_defined_ess() {
+        let chains = vec![vec![2.0; 100], vec![2.0; 100]];
+        assert_eq!(ess_bulk(&chains), 0.0);
+        assert_eq!(ess_tail(&chains), 0.0);
+        // And it therefore fails the gate, rather than passing it.
+        assert!(!super::super::ParamDiagnostics {
+            group_id: "__global__".into(),
+            param: "frozen".into(),
+            rhat: None,
+            ess_bulk: ess_bulk(&chains),
+            ess_tail: ess_tail(&chains),
+        }
+        .passes(&super::super::Thresholds::default()));
     }
 
     #[test]

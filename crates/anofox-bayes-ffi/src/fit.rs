@@ -8,6 +8,12 @@
 //!   data_new ─▶ add_numeric / add_key ─▶ fit ─▶ rows(offset, max) ─▶ free
 //! ```
 //!
+//! **Validity masks are `u8`, not `bool`.** C++ `bool` has no guaranteed size or
+//! representation, and Rust `bool` is UB for any bit pattern other than 0 or 1 — so a
+//! `vector<char>` reinterpreted as `bool*` is undefined behaviour that happens to work
+//! wherever `sizeof(bool) == 1`. Passing an explicit byte type and testing `!= 0`
+//! makes the contract real rather than an ABI accident.
+//!
 //! **Ownership.** Every pointer the caller hands in is borrowed for the duration of
 //! the call only; the builder copies. Every pointer handed back points into the
 //! handle and is valid until that handle is freed. Strings are returned as
@@ -132,7 +138,7 @@ pub unsafe extern "C" fn anofox_bayes_ffi_data_add_numeric(
     data: *mut BayesData,
     name: BayesStr,
     values: *const f64,
-    valid: *const bool,
+    valid: *const u8,
     len: usize,
 ) -> bool {
     let Some(data) = data.as_mut() else {
@@ -152,7 +158,10 @@ pub unsafe extern "C" fn anofox_bayes_ffi_data_add_numeric(
     let valid = if len == 0 {
         Vec::new()
     } else {
-        std::slice::from_raw_parts(valid, len).to_vec()
+        std::slice::from_raw_parts(valid, len)
+            .iter()
+            .map(|b| *b != 0)
+            .collect()
     };
     data.numeric.push((name.to_string(), values, valid));
     true
@@ -168,7 +177,7 @@ pub unsafe extern "C" fn anofox_bayes_ffi_data_add_key(
     data: *mut BayesData,
     name: BayesStr,
     values: *const BayesStr,
-    valid: *const bool,
+    valid: *const u8,
     len: usize,
 ) -> bool {
     let Some(data) = data.as_mut() else {
@@ -189,7 +198,10 @@ pub unsafe extern "C" fn anofox_bayes_ffi_data_add_key(
     let valid = if len == 0 {
         Vec::new()
     } else {
-        std::slice::from_raw_parts(valid, len).to_vec()
+        std::slice::from_raw_parts(valid, len)
+            .iter()
+            .map(|b| *b != 0)
+            .collect()
     };
     data.keys.push((name.to_string(), owned, valid));
     true
@@ -376,7 +388,7 @@ mod tests {
         unsafe {
             let data = anofox_bayes_ffi_data_new(6);
             let values = [2.0, 2.1, 1.9, 2.05, 1.95, 2.02];
-            let valid = [true; 6];
+            let valid: [u8; 6] = [1; 6];
             assert!(anofox_bayes_ffi_data_add_numeric(
                 data,
                 s("cost"),
@@ -452,7 +464,7 @@ mod tests {
         unsafe {
             let data = anofox_bayes_ffi_data_new(2);
             let values = [1.0, 2.0];
-            let valid = [true; 2];
+            let valid: [u8; 2] = [1; 2];
             anofox_bayes_ffi_data_add_numeric(data, s("cost"), values.as_ptr(), valid.as_ptr(), 2);
 
             let mut err = err_buf();
@@ -484,7 +496,7 @@ mod tests {
         unsafe {
             let data = anofox_bayes_ffi_data_new(3);
             let values = [1.0, 2.0];
-            let valid = [true; 2];
+            let valid: [u8; 2] = [1; 2];
             assert!(!anofox_bayes_ffi_data_add_numeric(
                 data,
                 s("cost"),
@@ -517,7 +529,7 @@ mod tests {
         unsafe {
             let data = anofox_bayes_ffi_data_new(6);
             let values = [1.0, 1.1, 0.9, 5.0, 5.1, 4.9];
-            let valid = [true; 6];
+            let valid: [u8; 6] = [1; 6];
             anofox_bayes_ffi_data_add_numeric(data, s("cost"), values.as_ptr(), valid.as_ptr(), 6);
 
             {
