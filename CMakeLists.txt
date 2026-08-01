@@ -113,6 +113,7 @@ set(EXTENSION_SOURCES
     src/aggregate_functions/diagnostics_aggregates.cpp
     src/include/config_json.cpp
     src/table_functions/bayes_fit.cpp
+    src/macros/bayes_macros.cpp
 )
 
 # Build static extension

@@ -71,6 +71,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	RegisterVersionFunctions(loader);
 	RegisterDiagnosticAggregates(loader);
 	RegisterBayesFitFunction(loader);
+	RegisterBayesMacros(loader);
 }
 
 void AnofoxBayesExtension::Load(ExtensionLoader &loader) {

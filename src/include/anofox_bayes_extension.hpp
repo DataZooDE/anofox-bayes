@@ -15,6 +15,9 @@ void RegisterDiagnosticAggregates(ExtensionLoader &loader);
 // --- Table functions --------------------------------------------------------
 void RegisterBayesFitFunction(ExtensionLoader &loader);
 
+// --- SQL macros -------------------------------------------------------------
+void RegisterBayesMacros(ExtensionLoader &loader);
+
 // Extension class required for static linking
 class AnofoxBayesExtension : public Extension {
 public:

@@ -1,0 +1,225 @@
+# name: test/sql/refusal_semantics.test
+# description: BR-5 -- degenerate inputs never produce silent bad numbers
+# group: [sql]
+
+require anofox_bayes
+
+# The property this file exists to defend: for EVERY degenerate input below, the
+# outcome is either a precise error or a fit whose status refuses. What must never
+# happen is a converged status alongside a number an agent would act on.
+
+statement ok
+CREATE TABLE ok_data AS
+SELECT 'A' AS grp, i AS x, 2.0 + 0.5 * i + ((i % 5) - 2) * 0.3 AS y
+FROM generate_series(0, 39) AS t(i);
+
+#######################################
+# The happy path, for contrast
+#######################################
+
+query II
+SELECT anofox_bayes_status_text(param, value),
+       anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian',
+                      {'y': 'y', 'x': 'x', 'draws': 2000});
+----
+converged	true
+
+#######################################
+# Degenerate input 1: a group with a single observation
+#######################################
+
+statement ok
+CREATE TABLE solo AS
+SELECT * FROM (VALUES ('A', 1.0), ('A', 1.1), ('A', 0.9), ('A', 1.05), ('SOLO', 42.0))
+AS t(grp, v);
+
+query II
+SELECT anofox_bayes_status_text(param, value),
+       anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit((SELECT grp, v FROM solo), 'conjugate_anomaly',
+                      {'value': 'v', 'group': 'grp', 'draws': 1000});
+----
+insufficient_data	false
+
+#######################################
+# Degenerate input 2: zero variance
+#######################################
+
+statement ok
+CREATE TABLE constant AS SELECT 7.0 AS v FROM generate_series(1, 30);
+
+query I
+SELECT anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit((SELECT v FROM constant), 'conjugate_anomaly',
+                      {'value': 'v', 'draws': 1000});
+----
+false
+
+#######################################
+# Degenerate input 3: a perfectly explained response
+#######################################
+
+statement ok
+CREATE TABLE perfect AS SELECT i AS x, 3.0 + 2.0 * i AS y FROM generate_series(0, 19) AS t(i);
+
+query I
+SELECT anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit((SELECT x, y FROM perfect), 'pooled_gaussian',
+                      {'y': 'y', 'x': 'x', 'draws': 1000});
+----
+false
+
+#######################################
+# Degenerate input 4: collinear predictors
+#######################################
+
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x, x * 2 AS x_dup, y FROM ok_data), 'pooled_gaussian',
+    {'y': 'y', 'x': ['x', 'x_dup'], 'draws': 500});
+----
+singular or rank-deficient
+
+#######################################
+# Degenerate input 5: more parameters than observations
+#######################################
+
+statement error
+SELECT * FROM anofox_bayes_fit(
+    (SELECT x, y FROM ok_data LIMIT 1), 'pooled_gaussian',
+    {'y': 'y', 'x': 'x', 'draws': 500});
+----
+insufficient data
+
+#######################################
+# Degenerate input 6: an empty relation
+#######################################
+
+query I
+SELECT anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit((SELECT grp, v FROM solo WHERE false), 'conjugate_anomaly',
+                      {'value': 'v', 'group': 'grp', 'draws': 1000});
+----
+false
+
+#######################################
+# Degenerate input 7: every value NULL
+#######################################
+
+query I
+SELECT anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit(
+    (SELECT NULL::DOUBLE AS v FROM generate_series(1, 20)), 'conjugate_anomaly',
+    {'value': 'v', 'draws': 1000});
+----
+false
+
+#######################################
+# Degenerate input 8: a sampling budget too small for the diagnostics
+#######################################
+
+query I
+SELECT anofox_bayes_is_actionable(param, value)
+FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian',
+                      {'y': 'y', 'x': 'x', 'draws': 50});
+----
+false
+
+#######################################
+# The invariant: no NaN ever reaches SQL
+#######################################
+
+# Across every degenerate case above, a value is either a real number or NULL. A NaN
+# would compare false against every threshold, so a gate written as `value > limit`
+# would silently pass it -- which is precisely the silent-bad-number failure this
+# whole path exists to prevent.
+query I
+SELECT bool_and(value IS NULL OR isfinite(value)) FROM (
+    SELECT value FROM anofox_bayes_fit((SELECT grp, v FROM solo), 'conjugate_anomaly',
+                                       {'value': 'v', 'group': 'grp', 'draws': 200})
+    UNION ALL
+    SELECT value FROM anofox_bayes_fit((SELECT v FROM constant), 'conjugate_anomaly',
+                                       {'value': 'v', 'draws': 200})
+    UNION ALL
+    SELECT value FROM anofox_bayes_fit((SELECT x, y FROM perfect), 'pooled_gaussian',
+                                       {'y': 'y', 'x': 'x', 'draws': 200})
+    UNION ALL
+    SELECT value FROM anofox_bayes_fit((SELECT NULL::DOUBLE AS v FROM generate_series(1, 20)),
+                                       'conjugate_anomaly', {'value': 'v', 'draws': 200})
+);
+----
+true
+
+#######################################
+# Config errors are precise and pre-computational
+#######################################
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian', {'x': 'x'});
+----
+'y': is required
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian',
+                               {'y': 'y', 'x': 'x', 'draws': -5});
+----
+between 4 and
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian',
+                               {'y': 'y', 'x': 'x', 'seed': -1});
+----
+non-negative whole number
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian',
+                               {'y': 'y', 'x': 'x', 'pool_scale': 0});
+----
+must be > 0
+
+#######################################
+# Decision macros
+#######################################
+
+statement ok
+CREATE TABLE eff AS
+SELECT * FROM anofox_bayes_fit((SELECT x, y FROM ok_data), 'pooled_gaussian',
+                               {'y': 'y', 'x': 'x', 'draws': 4000, 'seed': 5});
+
+# The slope is 0.5 by construction. P(slope > 0) is 1; P(slope > 1) is 0.
+query II
+SELECT anofox_bayes_prob_greater(value, 0.0), anofox_bayes_prob_greater(value, 1.0)
+FROM eff WHERE param = 'beta[x]' AND draw >= 0;
+----
+1.0	0.0
+
+# A 90% credible interval brackets the truth and is narrower than a 99% one.
+query II
+SELECT anofox_bayes_credible_lower(value, 0.9) < 0.5
+   AND anofox_bayes_credible_upper(value, 0.9) > 0.5 AS brackets_truth,
+       anofox_bayes_credible_upper(value, 0.99) - anofox_bayes_credible_lower(value, 0.99)
+     > anofox_bayes_credible_upper(value, 0.90) - anofox_bayes_credible_lower(value, 0.90)
+       AS wider_is_wider
+FROM eff WHERE param = 'beta[x]' AND draw >= 0;
+----
+true	true
+
+# A service level is a quantile of the posterior, so raising the target raises the
+# number -- monotonically, which a mean-plus-k-sigma rule only manages when the
+# posterior happens to be symmetric.
+query I
+SELECT anofox_bayes_service_level_quantile(value, 0.50)
+     < anofox_bayes_service_level_quantile(value, 0.95)
+   AND anofox_bayes_service_level_quantile(value, 0.95)
+     < anofox_bayes_service_level_quantile(value, 0.99)
+FROM eff WHERE param = 'sigma' AND draw >= 0;
+----
+true
+
+# prob_greater and prob_less partition the draws.
+query I
+SELECT abs(anofox_bayes_prob_greater(value, 0.5) + anofox_bayes_prob_less(value, 0.5) - 1.0) < 1e-9
+FROM eff WHERE param = 'beta[x]' AND draw >= 0;
+----
+true
