@@ -417,6 +417,8 @@ mod tests {
                 s("conjugate_anomaly"),
                 s(r#"{"value": "cost", "draws": 1000, "seed": 4}"#),
                 data,
+                // A budget of 1: a unit test should not silently take the machine.
+                1,
                 &mut err,
             );
             assert!(!fit.is_null(), "fit failed with code {}", err.code);
@@ -489,6 +491,7 @@ mod tests {
                 s("conjugate_anomaly"),
                 s(r#"{"value": "nope"}"#),
                 data,
+                1,
                 &mut err,
             );
             assert!(fit.is_null());
@@ -571,6 +574,7 @@ mod tests {
                 s("conjugate_anomaly"),
                 s(r#"{"value": "cost", "group": "lane", "draws": 500}"#),
                 data,
+                1,
                 &mut err,
             );
             assert!(!fit.is_null(), "code {}", err.code);
