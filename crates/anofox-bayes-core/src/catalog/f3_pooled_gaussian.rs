@@ -65,6 +65,7 @@ const SLOTS: &[&str] = &[
     "intercept",
     "group",
     "pool_scale",
+    "max_design_megabytes",
     "prior",
     "draws",
     "chains",
@@ -104,6 +105,7 @@ impl ModelFamily for PooledGaussian {
         let intercept = cfg.f64_or("intercept", 1.0)? != 0.0;
         let group = cfg.opt_str("group")?.map(str::to_string);
         let pool_scale = cfg.positive_f64_or("pool_scale", 1.0)?;
+        let max_design_megabytes = cfg.usize_in("max_design_megabytes", 512, 1, 1 << 20)?;
         // The precision added to the normal equations is 1/pool_scale^2. Below about
         // 1e-150 that squares to zero and the reciprocal is infinite, which surfaces
         // downstream as "singular or rank-deficient design matrix" -- a true statement
@@ -185,6 +187,43 @@ impl ModelFamily for PooledGaussian {
 
         if n <= p {
             return Err(BayesError::InsufficientData { rows: n, params: p });
+        }
+
+        // Budget the design matrix before allocating it.
+        //
+        // This family solves the normal equations densely: an `n x p` design and an
+        // `O(n*p^2)` accumulation of X'X, where `p` grows with the number of groups.
+        // Measured, that is roughly 8x the time per doubling of groups -- 0.26 s at
+        // 200 groups, 1.4 s at 400, 10 s at 800 -- so a naive per-customer grouping
+        // at 10 000 groups asks for a 16 GB matrix and hours of arithmetic, and the
+        // allocator aborts the process rather than returning. Refusing with a message
+        // that names the shape and points at the alternative costs one comparison.
+        //
+        // The alternative is real: `conjugate_anomaly` fits each group independently
+        // and handles tens of thousands of groups comfortably. What it does not do is
+        // pool them, which is the trade this message has to make legible.
+        let design_bytes = n
+            .checked_mul(p)
+            .and_then(|c| c.checked_mul(std::mem::size_of::<f64>()));
+        let design_budget = max_design_megabytes * 1024 * 1024;
+        match design_bytes {
+            Some(b) if b <= design_budget => {}
+            other => {
+                let requested = other.unwrap_or(usize::MAX) / (1024 * 1024);
+                return Err(BayesError::config(
+                    "group",
+                    format!(
+                        "this design needs {requested} MB ({n} rows x {p} coefficients) and \
+                         solving it costs roughly n*p^2 operations, which at this size will not \
+                         finish. `pooled_gaussian` is intended for tens to hundreds of groups, \
+                         where pooling is the point. For many independent groups use the \
+                         'conjugate_anomaly' family, which fits each separately and scales to \
+                         tens of thousands -- or coarsen the grouping. Raise \
+                         `max_design_megabytes` only if you have measured that the solve \
+                         completes."
+                    ),
+                ));
+            }
         }
 
         let mut x: Mat<f64> = Mat::zeros(n, p);
@@ -496,6 +535,10 @@ mod tests {
     use crate::data::testing::Frame;
     use crate::types::FitStatus;
 
+    /// 500 distinct group keys, owned so tests can borrow them.
+    static GROUP_KEYS: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| (0..500).map(|i| format!("C{i:04}")).collect());
+
     fn compile<'a>(cfg: &str, data: &'a DataView<'a>) -> BayesResult<Box<dyn CompiledModel + 'a>> {
         PooledGaussian.compile(&Config::parse(cfg).unwrap(), data)
     }
@@ -716,6 +759,44 @@ mod tests {
         assert_eq!(model.readiness().status, FitStatus::Degenerate);
         let cols = draw(&*model, 20, 9);
         assert!(cols[0].iter().all(|v| v.is_nan()));
+    }
+
+    /// A per-customer grouping is the shape that kills this family: the design is
+    /// dense and the solve is O(n*p^2), so 10 000 groups is a 16 GB allocation and
+    /// hours of arithmetic. Refusing with a pointer to the family that *does* scale
+    /// is worth more than either aborting or grinding.
+    #[test]
+    fn a_design_too_large_to_solve_is_refused_and_names_the_alternative() {
+        // 2000 rows across 500 groups: n > p, so it passes the identifiability
+        // check and would really be solved -- 2000 x 502 x 8 = ~8 MB.
+        let n = 2000usize;
+        let keys: Vec<&str> = (0..n)
+            .map(|i| GROUP_KEYS[i % GROUP_KEYS.len()].as_str())
+            .collect();
+        let frame = Frame::new(n)
+            .numeric("y", (0..n).map(|i| (i % 13) as f64).collect())
+            .numeric("x", (0..n).map(|i| i as f64).collect())
+            .key("cust", keys);
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        // Under a budget below what the design needs, it is refused...
+        let err = compile(
+            r#"{"y": "y", "x": "x", "group": "cust", "max_design_megabytes": 1}"#,
+            &view,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, BayesError::Config { ref slot, .. } if slot == "group"),
+            "{msg}"
+        );
+        assert!(msg.contains("502 coefficients"), "{msg}");
+        // ...and the message points at the family that scales, not just a number.
+        assert!(msg.contains("conjugate_anomaly"), "{msg}");
+
+        // ...while the same fit under an adequate budget goes through.
+        assert!(compile(r#"{"y": "y", "x": "x", "group": "cust"}"#, &view).is_ok());
     }
 
     #[test]

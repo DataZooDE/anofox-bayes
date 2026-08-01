@@ -93,6 +93,33 @@ only when the memory genuinely exists.
   `CREATE TABLE ... AS SELECT`, then query the draws; don't re-fit to ask a second
   question. That is the entire point of posterior-as-a-table.
 
+## `pooled_gaussian` scales in *groups*, not rows
+
+The table above measures `conjugate_anomaly`, which fits each group independently.
+`pooled_gaussian` is a different shape and a much harder limit: it solves one dense
+joint system, so cost grows with the **number of coefficients**, and the number of
+coefficients grows with the number of groups.
+
+| groups | rows | wall |
+|---:|---:|---:|
+| 50 | 1 000 | 0.15 s |
+| 200 | 4 000 | 0.26 s |
+| 400 | 8 000 | 1.39 s |
+| 800 | 16 000 | 9.99 s |
+
+Roughly **8× per doubling** — consistent with the `O(n·p²)` accumulation of `X'X` plus
+an `O(p³)` solve. Extrapolated, 10 000 groups is a 16 GB design matrix and hours of
+arithmetic.
+
+That is by design: pooling means one joint system, and one joint system is what makes
+a thin group borrow strength from the rest. It is the right model for **tens to
+hundreds** of groups — segments, plants, depots, stores. It is the wrong model for
+tens of thousands of customers or SKUs.
+
+A request that would not finish is now **refused before allocating**, with a message
+naming the shape and pointing at `conjugate_anomaly`, which fits groups independently
+and scales to tens of thousands. `max_design_megabytes` (default 512) is the dial.
+
 ## Known gaps
 
 Recorded rather than hidden. None of these are hit by the workloads the shipped
