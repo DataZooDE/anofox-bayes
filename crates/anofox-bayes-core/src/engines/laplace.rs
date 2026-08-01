@@ -261,7 +261,11 @@ fn find_mode(target: &dyn LogPosterior) -> BayesResult<Vec<f64>> {
 /// millions and a log-scale parameter of order one both get a sensible perturbation.
 /// The result is symmetrised, because differencing produces a matrix that is only
 /// symmetric up to rounding and Cholesky assumes exactly symmetric input.
-fn negative_hessian(target: &dyn LogPosterior, theta: &[f64]) -> BayesResult<Mat<f64>> {
+///
+/// `pub(super)` because the NUTS engine reuses it — not to find a mode, but to choose
+/// starting points that are overdispersed *in the posterior's own units*. See
+/// [`super::nuts::overdispersed_start`].
+pub(super) fn negative_hessian(target: &dyn LogPosterior, theta: &[f64]) -> BayesResult<Mat<f64>> {
     let dim = target.dim();
     let mut h: Mat<f64> = Mat::zeros(dim, dim);
     let mut plus = vec![0.0; dim];
@@ -407,6 +411,8 @@ mod tests {
             let opts = SampleOptions {
                 n_chains: 1,
                 n_draws: 200_000,
+                // Ignored: this engine draws independently, so there is nothing to adapt.
+                n_warmup: 0,
                 seed: 17,
                 sample_from: crate::types::SampleFrom::Posterior,
             };
@@ -474,6 +480,8 @@ mod tests {
             let opts = SampleOptions {
                 n_chains: 1,
                 n_draws: 200_000,
+                // Ignored: this engine draws independently, so there is nothing to adapt.
+                n_warmup: 0,
                 seed: 31,
                 sample_from: crate::types::SampleFrom::Posterior,
             };
@@ -518,6 +526,8 @@ mod tests {
             let opts = SampleOptions {
                 n_chains: 1,
                 n_draws: 200_000,
+                // Ignored: this engine draws independently, so there is nothing to adapt.
+                n_warmup: 0,
                 seed: 19,
                 sample_from: crate::types::SampleFrom::Posterior,
             };
@@ -552,6 +562,8 @@ mod tests {
             let opts = SampleOptions {
                 n_chains: 2,
                 n_draws: 100,
+                // Ignored: this engine draws independently, so there is nothing to adapt.
+                n_warmup: 0,
                 seed: 23,
                 sample_from: crate::types::SampleFrom::Posterior,
             };
@@ -574,6 +586,8 @@ mod tests {
                     &SampleOptions {
                         n_chains: 1,
                         n_draws: 20_000,
+                        // Ignored: this engine draws independently, so there is nothing to adapt.
+                        n_warmup: 0,
                         seed: 29,
                         sample_from: crate::types::SampleFrom::Posterior,
                     },
@@ -613,6 +627,7 @@ mod tests {
             n_draws: 200_000,
             seed,
             sample_from: crate::types::SampleFrom::Posterior,
+            n_warmup: 0,
         };
         let exact = ExactEngine.sample(&*model, &opts).unwrap();
         let laplace = LaplaceEngine.sample(&*model, &opts).unwrap();
@@ -797,6 +812,7 @@ mod tests {
                     n_draws: 1000,
                     seed: 47,
                     sample_from: crate::types::SampleFrom::Posterior,
+                    n_warmup: 0,
                 },
             )
             .unwrap();

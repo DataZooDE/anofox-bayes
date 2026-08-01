@@ -90,13 +90,6 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
     // parsed here rather than repeated in each one. Families still declare the slots
     // in `config_slots` so that `reject_unknown` accepts them.
     let n_draws = cfg.usize_in("draws", SampleOptions::default().n_draws, 4, 1_000_000)?;
-    // Defaults to one chain, and that is not an oversight. R-hat compares chains to
-    // detect a Markov chain that has not mixed; both engines in 0.1 draw
-    // *independently*, so there is nothing to fail to mix and a second chain would
-    // buy an R-hat of 1.0 that means nothing. The slot exists because a caller may
-    // want the cross-check anyway, and because NUTS in 0.2 will default it to 4.
-    // Until then, the gate is ESS -- see docs/API_REFERENCE.md.
-    let n_chains = cfg.usize_in("chains", 1, 1, 64)?;
     let seed = cfg.seed()?;
     // Posterior unless asked otherwise. Parsed here rather than per family because
     // the slot means the same thing everywhere; families still declare it so that
@@ -109,6 +102,27 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         Some(name) => EngineKind::parse(name)?,
         None => family.default_engine(),
     };
+
+    // The chain default depends on the engine, and has to.
+    //
+    // R-hat compares chains to detect a Markov chain that has not mixed. The exact and
+    // Laplace engines draw *independently*, so there is nothing to fail to mix and a
+    // second chain would buy an R-hat of 1.0 that means nothing; their gate is ESS.
+    // NUTS produces a genuine Markov chain, and one chain of it cannot support the
+    // single diagnostic that would reveal it had not converged -- so a one-chain NUTS
+    // default would ship the fit whose failure mode R-hat exists to catch with R-hat
+    // switched off. Four is the Stan and PyMC default and for the same reason: enough
+    // chains for the between-chain variance to be estimated at all.
+    let default_chains = match engine_kind {
+        EngineKind::Nuts => 4,
+        EngineKind::Exact | EngineKind::Laplace => 1,
+    };
+    let n_chains = cfg.usize_in("chains", default_chains, 1, 64)?;
+    // Adaptation draws, discarded before the output. Bounded below by 1 rather than 0:
+    // an unadapted NUTS run with a default step size is not a sampler whose output
+    // means anything, and letting a caller ask for one would produce draws carrying
+    // the same `converged` warranty as an adapted fit.
+    let n_warmup = cfg.usize_in("warmup", engines::DEFAULT_WARMUP, 1, 1_000_000)?;
 
     // Output size is budgeted *before* the model is compiled into draws. The draw
     // buffer is `chains * draws * params` f64s, and `params` grows with the number of
@@ -148,6 +162,7 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
     let opts = SampleOptions {
         n_chains,
         n_draws,
+        n_warmup,
         seed,
         sample_from,
     };
@@ -196,9 +211,8 @@ fn grade(mut posterior: Posterior, readiness: Readiness, thresholds: &Thresholds
     let mut reasons = readiness.reasons;
 
     let failing: Vec<&ParamDiagnostics> = diags.iter().filter(|d| !d.passes(thresholds)).collect();
-    let sampling_status = if failing.is_empty() {
-        FitStatus::Converged
-    } else {
+    let mut sampling_status = FitStatus::Converged;
+    if !failing.is_empty() {
         for d in &failing {
             reasons.push(format!(
                 "parameter '{}' of group '{}' failed diagnostics (rhat {}, ess_bulk {:.0}, ess_tail {:.0})",
@@ -209,8 +223,35 @@ fn grade(mut posterior: Posterior, readiness: Readiness, thresholds: &Thresholds
                 d.ess_tail
             ));
         }
-        FitStatus::Degenerate
-    };
+        sampling_status = FitStatus::Degenerate;
+    }
+
+    // Divergences, which are a property of the *fit* rather than of any one parameter
+    // and so cannot live in `ParamDiagnostics::passes`.
+    //
+    // A divergent trajectory is the sampler reporting that it left the region it was
+    // integrating over -- the draws that follow it are not from the posterior, they
+    // are from wherever the integrator ended up. THEORY §7 is unambiguous about what
+    // that means here: there is a number, and it must not drive a decision. So a
+    // single divergence downgrades the fit, in line with `Thresholds::max_divergent`
+    // defaulting to zero rather than to a small budget, and by the same worst-wins
+    // doctrine that `Readiness::worst` applies to structural verdicts.
+    //
+    // `None` -- an engine that reported no divergence statistic at all -- is not a
+    // pass. It is silence, and it leaves this branch untouched, exactly as the
+    // omitted `__divergent__` row leaves a SQL consumer's `sum()` NULL.
+    if let Some(divergent) = posterior.n_divergent() {
+        if divergent as f64 > thresholds.max_divergent {
+            reasons.push(format!(
+                "the sampler reported {divergent} divergent transition(s) out of {} kept draws \
+                 (tolerance {}); the draws after a divergence are not from the posterior. \
+                 Raise `warmup`, or reparameterise",
+                posterior.n_chains * posterior.n_draws,
+                thresholds.max_divergent
+            ));
+            sampling_status = FitStatus::Degenerate;
+        }
+    }
 
     // Worse wins. A structurally insufficient fit whose draws happen to mix well is
     // still insufficient, and a structurally fine fit whose draws did not mix is
@@ -609,6 +650,249 @@ mod tests {
         );
     }
 
+    /// R̂ stops being decorative the moment a Markov chain is involved. NUTS therefore
+    /// defaults to four chains, where the exact and Laplace engines default to one:
+    /// a single NUTS chain cannot support the one diagnostic that would reveal it had
+    /// not converged.
+    #[test]
+    fn a_nuts_fit_defaults_to_four_chains_and_produces_a_real_rhat() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(r#"{"y": "cost", "engine": "nuts", "draws": 1000}"#).unwrap();
+        let fit = fit("pooled_gaussian", &cfg, &view).unwrap();
+
+        assert_eq!(fit.posterior.n_chains, 4);
+        assert_eq!(
+            fit.posterior
+                .rows()
+                .find(|r| r.param == "__n_chains__")
+                .unwrap()
+                .value,
+            4.0
+        );
+        for d in &fit.diagnostics {
+            let r = d.rhat.expect("four NUTS chains support an R-hat");
+            assert!(r < 1.01, "{}/{}: rhat {r}", d.group_id, d.param);
+        }
+        assert_eq!(fit.posterior.meta.status, FitStatus::Converged);
+        assert!(fit.reasons.is_empty(), "{:?}", fit.reasons);
+    }
+
+    /// The four reserved sample statistics reach SQL, which no engine had ever made
+    /// them do before. `__divergent__` summing to zero here is the honest "the sampler
+    /// explored cleanly" that the contract reserves it for.
+    #[test]
+    fn a_nuts_fit_puts_the_sampler_statistics_on_the_draws_table() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        // Intercept and residual scale only. The grouped design is deliberately not
+        // used here: see
+        // `a_posterior_nuts_explores_poorly_is_refused_rather_than_shipped`, which is
+        // about that geometry rather than about the statistic rows.
+        let cfg = Config::parse(
+            r#"{"y": "cost", "engine": "nuts", "draws": 500, "chains": 2, "warmup": 500}"#,
+        )
+        .unwrap();
+        let fit = fit("pooled_gaussian", &cfg, &view).unwrap();
+
+        for stat in [
+            crate::draws::PARAM_LP,
+            crate::draws::PARAM_DIVERGENT,
+            crate::draws::PARAM_ENERGY,
+            crate::draws::PARAM_STEP_SIZE,
+        ] {
+            let rows: Vec<f64> = fit
+                .posterior
+                .rows()
+                .filter(|r| r.param == stat)
+                .map(|r| r.value)
+                .collect();
+            assert_eq!(rows.len(), 2 * 500, "{stat} must appear once per kept draw");
+            assert!(
+                rows.iter().all(|v| v.is_finite()),
+                "{stat} carries non-finite values"
+            );
+        }
+        assert_eq!(fit.posterior.n_divergent(), Some(0));
+        assert_eq!(fit.posterior.meta.status, FitStatus::Converged);
+    }
+
+    /// **The diagnostics earning their keep on a real posterior.**
+    ///
+    /// `pooled_gaussian` with a `group` column puts an unpenalised intercept beside
+    /// per-group effects that carry a `pool_scale`-wide prior. Only their *sum* is
+    /// sharply identified by the data, so the posterior is a long, thin ridge — and a
+    /// diagonal mass matrix, which is what this engine adapts, cannot precondition a
+    /// ridge that is not axis-aligned. NUTS therefore mixes slowly here, and at a
+    /// modest budget it says so: R̂ above 1.01 and a bulk ESS in the low hundreds.
+    ///
+    /// The point of the test is that this arrives as a **refusal** rather than as
+    /// draws. The exact engine samples the same ridge perfectly well because it
+    /// factorises the joint; a caller who switches engine and keeps the budget gets
+    /// numbers that look the same in SQL and are worth much less, and `__status__` is
+    /// the only thing standing between that and a decision. It is also the first time
+    /// in this crate that R̂ is a load-bearing diagnostic rather than a structural
+    /// `NULL`.
+    #[test]
+    fn a_posterior_nuts_explores_poorly_is_refused_rather_than_shipped() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(
+            r#"{"y": "cost", "group": "lane", "engine": "nuts", "draws": 500, "chains": 2, "warmup": 500}"#,
+        )
+        .unwrap();
+        let sampled = fit("pooled_gaussian", &cfg, &view).unwrap();
+
+        assert_eq!(sampled.posterior.meta.status, FitStatus::Degenerate);
+        assert!(!sampled.posterior.meta.status.is_actionable());
+        assert!(
+            sampled.reasons.iter().any(|r| r.contains("ess_bulk")),
+            "{:?}",
+            sampled.reasons
+        );
+        // Not a divergence problem: the trajectories are fine, they are just slow.
+        assert_eq!(sampled.posterior.n_divergent(), Some(0));
+        assert!(sampled.reasons.iter().all(|r| !r.contains("divergent")));
+
+        // The same design under the exact engine is fine, which is what makes this a
+        // statement about the sampler rather than about the data.
+        let exact = fit(
+            "pooled_gaussian",
+            &Config::parse(r#"{"y": "cost", "group": "lane", "draws": 1000}"#).unwrap(),
+            &view,
+        )
+        .unwrap();
+        assert_eq!(exact.posterior.meta.status, FitStatus::Converged);
+    }
+
+    /// **The refusal doctrine applied to divergences.** THEORY §7: a fit whose numbers
+    /// are not from the posterior must not drive a decision, and the only thing that
+    /// says so is the status. Graded here on a synthetic posterior rather than by
+    /// hunting for a model that diverges, so the rule is pinned exactly and cannot
+    /// stop being tested when the sampler improves.
+    #[test]
+    fn a_single_divergence_downgrades_the_fit_and_says_why() {
+        let params = vec![crate::draws::ParamName::global("mu").unwrap()];
+        let meta = crate::draws::ModelMeta {
+            model_id: "d".into(),
+            family: crate::types::FamilyCode::PooledGaussian,
+            engine: EngineKind::Nuts,
+            status: FitStatus::Converged,
+            seed: 1,
+            n_obs: 100,
+            n_groups: 1,
+            n_groups_unready: 0,
+            sample_from: crate::types::SampleFrom::Posterior,
+        };
+        // 2 chains x 1000 draws of an independent standard normal: every ESS and R-hat
+        // gate passes comfortably, so the only thing that can fail is the divergence.
+        let mut rng = crate::rng::BayesRng::for_chain(77, 0);
+        let values: Vec<f64> = (0..2000).map(|_| rng.standard_normal()).collect();
+
+        let graded = |n_divergent: usize| {
+            let stats: Vec<crate::draws::SampleStats> = (0..2000)
+                .map(|i| crate::draws::SampleStats {
+                    lp: Some(-1.0),
+                    divergent: Some(if i < n_divergent { 1.0 } else { 0.0 }),
+                    energy: Some(2.0),
+                    step_size: Some(0.5),
+                })
+                .collect();
+            let post = Posterior::new(meta.clone(), params.clone(), 2, 1000, values.clone(), stats)
+                .unwrap();
+            grade(post, Readiness::ready(), &Thresholds::default())
+        };
+
+        let clean = graded(0);
+        assert_eq!(clean.posterior.meta.status, FitStatus::Converged);
+        assert!(clean.reasons.is_empty(), "{:?}", clean.reasons);
+
+        // One divergence in two thousand draws is 0.05 % and is still a refusal: the
+        // default tolerance is zero, not a small budget.
+        let dirty = graded(1);
+        assert_eq!(dirty.posterior.meta.status, FitStatus::Degenerate);
+        assert!(!dirty.posterior.meta.status.is_actionable());
+        assert!(
+            dirty.reasons.iter().any(|r| r.contains("divergent")),
+            "{:?}",
+            dirty.reasons
+        );
+    }
+
+    /// An engine that reports no divergence statistic must not be graded as if it had
+    /// reported none — silence is not a pass.
+    #[test]
+    fn an_engine_that_reports_no_divergences_is_not_credited_with_zero() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(r#"{"value": "cost", "group": "lane", "draws": 2000}"#).unwrap();
+        let fit = fit("conjugate_anomaly", &cfg, &view).unwrap();
+        assert_eq!(fit.posterior.n_divergent(), None);
+        assert_eq!(fit.posterior.meta.status, FitStatus::Converged);
+        assert!(fit.reasons.iter().all(|r| !r.contains("divergent")));
+    }
+
+    /// Warmup is a documented slot with a documented default, and asking for none is a
+    /// config error rather than an unadapted sampler wearing a `converged` badge.
+    #[test]
+    fn the_warmup_budget_is_configurable_and_bounded_below() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let err = fit(
+            "pooled_gaussian",
+            &Config::parse(r#"{"y": "cost", "group": "lane", "engine": "nuts", "warmup": 0}"#)
+                .unwrap(),
+            &view,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("warmup"), "{err}");
+
+        // ...and a legitimate budget is honoured without leaking into the output.
+        let fit = fit(
+            "pooled_gaussian",
+            &Config::parse(
+                r#"{"y": "cost", "group": "lane", "engine": "nuts", "warmup": 300, "draws": 400, "chains": 2}"#,
+            )
+            .unwrap(),
+            &view,
+        )
+        .unwrap();
+        assert_eq!(fit.posterior.n_draws, 400);
+        assert_eq!(fit.posterior.n_chains, 2);
+    }
+
+    /// Warmup is part of the request, so two fits differing only in it are different
+    /// questions and must not share an identity. `warmup` reaches `model_id` through
+    /// the canonical config string, like every other slot.
+    #[test]
+    fn the_warmup_budget_is_part_of_the_model_identity() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let id_of = |cfg: &str| {
+            fit("pooled_gaussian", &Config::parse(cfg).unwrap(), &view)
+                .unwrap()
+                .posterior
+                .meta
+                .model_id
+        };
+        assert_ne!(
+            id_of(
+                r#"{"y": "cost", "group": "lane", "engine": "nuts", "draws": 400, "warmup": 200}"#
+            ),
+            id_of(
+                r#"{"y": "cost", "group": "lane", "engine": "nuts", "draws": 400, "warmup": 300}"#
+            )
+        );
+    }
+
     #[test]
     fn an_unknown_family_fails_before_any_work_is_done() {
         let frame = freight_frame();
@@ -620,12 +904,41 @@ mod tests {
 
     #[test]
     fn an_engine_that_cannot_serve_the_family_is_an_error() {
+        // `exact` on a family with no closed form. This used to be spelled `nuts` on
+        // `conjugate_anomaly`, which stopped being a refusal when that family gained a
+        // differentiable path (roadmap gap 10) -- every engine now serves it. The
+        // property under test is unchanged: an engine that cannot serve a family says
+        // so, rather than quietly substituting one that can.
         let frame = freight_frame();
         let refs = frame.key_refs();
         let view = frame.view(&refs);
-        let cfg = Config::parse(r#"{"value": "cost", "engine": "nuts"}"#).unwrap();
-        let err = fit("conjugate_anomaly", &cfg, &view).unwrap_err();
-        assert!(matches!(err, crate::BayesError::Config { ref slot, .. } if slot == "engine"));
+        let cfg = Config::parse(r#"{"value": "cost", "engine": "exact"}"#).unwrap();
+        let err = fit("censored_aft", &cfg, &view).unwrap_err();
+        assert!(
+            matches!(err, crate::BayesError::Config { .. }),
+            "expected a config error, got {err}"
+        );
+    }
+
+    /// The composition the change above records: `conjugate_anomaly` is now served by
+    /// all three engines, and asking for any of them yields a fit rather than a
+    /// refusal. Three independent routes to one posterior that is known in closed
+    /// form.
+    #[test]
+    fn every_engine_serves_the_conjugate_family_since_it_gained_a_gradient() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        for engine in ["exact", "laplace", "nuts"] {
+            let cfg = Config::parse(&format!(
+                r#"{{"value": "cost", "group": "lane", "draws": 200, "engine": "{engine}"}}"#
+            ))
+            .unwrap();
+            assert!(
+                fit("conjugate_anomaly", &cfg, &view).is_ok(),
+                "the {engine} engine should serve conjugate_anomaly"
+            );
+        }
     }
 
     #[test]

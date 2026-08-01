@@ -12,7 +12,26 @@ repository = "https://github.com/DataZooDE/anofox-bayes"
 [workspace.dependencies]
 # Linear algebra. Default features (which pull in rayon) are off: DuckDB owns
 # parallelism, and a nested thread pool inside a table function is a liability.
+# Held at 0.23 to match `anofox-stats-core`, which the F2 bridge passes matrices to
+# and from: two incompatible `faer::Mat` types across that seam is a build error, not
+# a runtime risk. `nuts-rs` links its own faer 0.24 internally and never sees ours --
+# the NUTS adapter speaks in f64 slices -- so the two trees coexist without meeting.
 faer = { version = "0.23", default-features = false, features = ["std", "linalg"] }
+# The NUTS engine. `nuts-rs` is maintained by pymc-devs and is the sampler behind
+# nutpie; ROADMAP §5 records "writing an MCMC kernel" as a non-goal, so this is a
+# pinned dependency and a single adapter file rather than a kernel of our own.
+#
+# Default features are off because the only thing they add is `rayon`, used by the
+# crate's own multi-chain `Sampler`. This engine drives `nuts_rs::Chain` directly, one
+# chain at a time, for the reason the `faer` line above gives: DuckDB owns
+# parallelism, and a nested thread pool inside a table function is a liability. It is
+# also what makes byte-level determinism independent of the thread layout rather than
+# merely likely.
+#
+# The version is pinned to a single patch release. `nuts-rs` is pre-1.0 and its
+# `Settings`/`Chain` traits are sealed and unstable across minor versions, so a
+# caret range would let a rebuild change a customer's draws without changing an input.
+nuts-rs = { version = "=0.18.3", default-features = false }
 # Distributions and special functions (log-gamma, quantiles, CDFs).
 statrs = "0.18"
 # Sampling. `rand_chacha` is the reproducibility guarantee: a counter-based

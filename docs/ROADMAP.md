@@ -24,8 +24,8 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 3 | F5 payer-alive (BG/NBD) | 05 | Blocker | 8–12 | — |
 | 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | Blocker for 06 — the interaction-column workaround left 10 of 12 intervals not covering | 12–18 | gap 6 for the learned scale |
 | 5 | Per-group variance | 04 | Blocker for the tail question, which is why agent 04 exists | 5–8 with gap 4 | gap 4 |
-| 6 | NUTS engine (`nuts-rs` adapter) | none directly | Dependency of gaps 4, 5, 7 | 8–12 | — |
-| 7 | F1 hierarchical negative binomial | 01 | Blocker natively; degraded path via gap 2 | 12–20 | gap 6 |
+| 6 | NUTS engine (`nuts-rs` adapter) | none directly | Dependency of gaps 4, 5, 7 | **done** | — |
+| 7 | F1 hierarchical negative binomial | 01 | Blocker natively; degraded path via gap 2 | 12–20 | gap 6 — **met** |
 | 8 | F4 payment delay, native | 04 | Degradation — `pooled_gaussian` on log-delay is already a lognormal model | 8–12 | gaps 4, 5 |
 | 9 | F6 hierarchical elasticity, native | 06 | Degradation once gap 4 lands — elasticity is a log-log linear model | 6–10 | gap 4 |
 | 10 | ~~`conjugate_anomaly` has no `as_differentiable`~~ **done** | none | Correctness gate, not a feature | 2–3 | — |
@@ -51,6 +51,18 @@ properly. Nothing else here has that ratio.
 three agents between them — all bottom out in a hierarchical variance parameter whose
 posterior is not conjugate and for which Laplace is known to be poor. Sequencing NUTS
 late means sequencing three agents late.
+
+**Gap 6 is done.** The `nuts` engine ships as a pinned `nuts-rs` adapter isolated in
+`crates/anofox-bayes-core/src/engines/nuts.rs`, certified against `pooled_gaussian`'s
+closed-form posterior at a Monte-Carlo-derived tolerance and by its own SBC suite. It
+is the first engine to produce a Markov chain, so it is also the first to make R̂ and
+`__divergent__ ` mean anything. The 8–12 day estimate below was a guess about an
+integration nobody here had done; the integration itself was small, and what took the
+time was the certification, which is the same shape as every other estimate on this
+page. Two things the estimate did not anticipate, recorded because they are the parts a
+future upgrade will trip over: `nuts-rs` rejects a starting point whose gradient is
+exactly zero — which is what a family's `initial()` returns — and its per-draw
+statistics are reachable only through a struct its crate root does not export.
 
 ## 2. Phases
 

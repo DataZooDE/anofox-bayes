@@ -88,7 +88,7 @@ Enough to read the rest of this page. [Theory](THEORY.md) explains each properly
 | **conjugate** | A model whose posterior has a closed-form solution, so it can be computed exactly instead of approximated. Both shipped families are conjugate. |
 | **parameter** | One unknown the model estimates, named in the `param` column. `mu` is a group's level, `sigma` its variability, `lambda` a rate, `beta[x]` the effect of predictor `x`. |
 | **exposure** | The denominator of a rate — shipments, consignments, store-weeks. Lets you compare units of different sizes. |
-| **R-hat** | A convergence check that compares independent chains. In v0.1 it is `NULL` and that is correct: both engines draw independently, so there is nothing to check. Gate on ESS instead. |
+| **R-hat** | A convergence check that compares independent chains. Under the default `exact` engine (and under `laplace`) it is `NULL` and that is correct: those engines draw independently, so there is nothing to check — gate on ESS instead. Under `engine: 'nuts'` it is computed, defaults to four chains, and must be at or below 1.01. |
 
 Two more you will meet in error messages: a fit is **degenerate** when the draws are
 untrustworthy (take more), and reports **insufficient_data** when the data itself
@@ -443,7 +443,8 @@ than exhausting memory. See [Scalability](SCALABILITY.md).
 |---|---|
 | `Parser Error: syntax error at or near "TABLE"` | Pass a subquery: `(SELECT a, b FROM t)`, not `TABLE t` |
 | Metadata rows in your aggregates | Add `WHERE draw >= 0` |
-| `anofox_bayes_rhat` is always `NULL` | Expected — both engines draw independently, so it is undefined. Gate on ESS. [Why](THEORY.md#6-diagnostics) |
+| `anofox_bayes_rhat` is `NULL` | Expected under `exact` and `laplace` — they draw independently, so it is undefined. Gate on ESS. It is computed under `engine: 'nuts'`. [Why](THEORY.md#6-diagnostics) |
+| A `nuts` fit is `degenerate` with divergences | The posterior has curvature the adapted step size cannot follow, so those draws are not from it. Raise `warmup`; the fit must not be acted on until it is clean. [Why](THEORY.md#7-refusal) |
 | A gate that never flags anything | `HAVING ess < 400` fails open on `NULL`; use `anofox_bayes_ess_gate` |
 | `invalid config at 'grup'` | A typo — the message names the slot and suggests the intended one |
 | `singular or rank-deficient design matrix` | Two predictors carry the same information (e.g. a constant column beside an intercept) |

@@ -349,7 +349,7 @@ mod families {
     };
     use crate::config::Config;
     use crate::data::testing::Frame;
-    use crate::engines::{Engine, ExactEngine, LaplaceEngine, SampleOptions};
+    use crate::engines::{Engine, ExactEngine, LaplaceEngine, NutsEngine, SampleOptions};
     use crate::types::EngineKind;
 
     /// Draw from `InvGamma(shape, rate)`.
@@ -402,6 +402,8 @@ mod families {
                 &SampleOptions {
                     n_chains: 1,
                     n_draws,
+                    // Ignored: this engine draws independently, so there is nothing to adapt.
+                    n_warmup: 0,
                     // A stream distinct from the simulation's, so the posterior draws
                     // cannot correlate with the noise that produced the data.
                     seed: rng.uniform().to_bits(),
@@ -427,6 +429,15 @@ mod families {
         a0: f64,
         s0: f64,
         engine: EngineKind,
+        /// Keep every `thin`-th draw. `1` for the engines that draw independently.
+        ///
+        /// SBC's guarantee is that the rank of the truth among `L` **exchangeable**
+        /// posterior draws is uniform. NUTS draws are a Markov chain and consecutive
+        /// draws are correlated, which biases the rank toward the middle of the
+        /// histogram and would make a perfectly correct sampler look under-confident.
+        /// Talts et al. §4 prescribe thinning for exactly this reason, and it is a
+        /// property of the *sampler*, not of the model, so it lives beside `engine`.
+        thin: usize,
     }
 
     impl SbcModel for F3Slopes {
@@ -475,18 +486,78 @@ mod families {
 
             let opts = SampleOptions {
                 n_chains: 1,
-                n_draws,
+                // Thinning is done by *drawing* more and keeping every `thin`-th, so
+                // the kept draws are `thin` sampler steps apart.
+                n_draws: n_draws * self.thin,
+                // The shipped default, not a reduced one: certifying a warmup budget
+                // nobody uses would certify nothing. Ignored by the other engines.
+                n_warmup: crate::engines::DEFAULT_WARMUP,
                 seed: rng.uniform().to_bits(),
                 sample_from: crate::types::SampleFrom::Posterior,
             };
             let sample = match self.engine {
                 EngineKind::Laplace => LaplaceEngine.sample(&*model, &opts)?,
-                _ => ExactEngine.sample(&*model, &opts)?,
+                EngineKind::Nuts => NutsEngine.sample(&*model, &opts)?,
+                EngineKind::Exact => ExactEngine.sample(&*model, &opts)?,
             };
             let p = model.param_names().len();
             Ok((0..3)
-                .map(|j| sample.values.chunks(p).map(|c| c[j]).collect())
+                .map(|j| {
+                    sample
+                        .values
+                        .chunks(p)
+                        .skip(self.thin - 1)
+                        .step_by(self.thin)
+                        .map(|c| c[j])
+                        .collect()
+                })
                 .collect())
+        }
+    }
+
+    /// A real fit, narrowed on purpose.
+    ///
+    /// **The fixture that proves the gate can fail.** A calibration suite that only
+    /// ever passes is not a gate, and the ones above would still pass if `run_sbc`
+    /// quietly ranked nothing. The unit tests at the top of this module make that
+    /// argument with a synthetic posterior; this one makes it through the *whole* NUTS
+    /// pipeline — the same simulation, the same compile, the same sampler, the same
+    /// ranking — with one deliberate defect injected at the last possible moment.
+    ///
+    /// The defect is over-confidence: every draw is pulled toward the posterior mean,
+    /// so the intervals are too tight. That is the failure mode that matters
+    /// commercially — a service-level decision reads the interval, and one that is 40 %
+    /// too narrow under-covers silently — and it is the one an accuracy test cannot
+    /// see, because the mean is untouched.
+    struct Narrowed<M: SbcModel> {
+        inner: M,
+        /// Multiplier on each parameter's spread about its own posterior mean.
+        factor: f64,
+    }
+
+    impl<M: SbcModel> SbcModel for Narrowed<M> {
+        fn param_names(&self) -> Vec<String> {
+            self.inner.param_names()
+        }
+
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            self.inner.draw_prior(rng)
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            let mut draws = self.inner.simulate_and_fit(truth, rng, n_draws)?;
+            for column in draws.iter_mut() {
+                let mean = column.iter().sum::<f64>() / column.len() as f64;
+                for v in column.iter_mut() {
+                    *v = mean + self.factor * (*v - mean);
+                }
+            }
+            Ok(draws)
         }
     }
 
@@ -660,6 +731,7 @@ mod families {
                     n_draws,
                     seed: rng.uniform().to_bits(),
                     sample_from: crate::types::SampleFrom::Posterior,
+                    n_warmup: 0,
                 },
             )?;
             let p = model.param_names().len();
@@ -801,6 +873,7 @@ mod families {
             a0: 3.0,
             s0: 3.0,
             engine: EngineKind::Exact,
+            thin: 1,
         };
         let hists = run_sbc(&model, REPLICATIONS, BINS, 102).unwrap();
         assert_calibrated(&hists, "f3/exact");
@@ -821,8 +894,92 @@ mod families {
             a0: 3.0,
             s0: 3.0,
             engine: EngineKind::Laplace,
+            thin: 1,
         };
         let hists = run_sbc(&model, REPLICATIONS, BINS, 103).unwrap();
         assert_calibrated(&hists, "f3/laplace");
+    }
+
+    /// The NUTS path certified independently, because SBC is per family **per engine**.
+    ///
+    /// The closed-form and Laplace suites say nothing about this one: the adapter has
+    /// its own transform hand-off, its own warmup discard and its own chain layout, and
+    /// a mistake in any of them produces draws that are individually plausible and
+    /// collectively miscalibrated. This is also the suite that will still be here when
+    /// the engine is serving a family with no closed form to check it against, which is
+    /// the reason gap 6 exists at all.
+    ///
+    /// Run at `n_obs = 30`, matching the exact suite rather than the Laplace one: NUTS
+    /// makes no asymptotic promise, so there is no reason to certify it only where the
+    /// posterior happens to be nearly Gaussian.
+    fn f3_under_nuts() -> F3Slopes {
+        F3Slopes {
+            n_obs: 30,
+            beta_scale: 1.0,
+            a0: 3.0,
+            s0: 3.0,
+            engine: EngineKind::Nuts,
+            // Every fifth draw. See `F3Slopes::thin`: consecutive NUTS draws are
+            // correlated, and SBC ranks assume exchangeability.
+            thin: 5,
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn f3_is_calibrated_under_the_nuts_engine() {
+        let hists = run_sbc(&f3_under_nuts(), REPLICATIONS, BINS, 104).unwrap();
+        assert_calibrated(&hists, "f3/nuts");
+    }
+
+    /// **The suite above, proved to be a gate.**
+    ///
+    /// The same NUTS pipeline, with every draw pulled 40 % of the way toward its own
+    /// posterior mean before ranking. Nothing else changes — same priors, same
+    /// simulated data, same sampler, same seed discipline — so a failure here can only
+    /// be the injected over-confidence, and a *pass* here would mean
+    /// `f3_is_calibrated_under_the_nuts_engine` certifies nothing.
+    ///
+    /// Asserted as ∪-shaped rather than merely failing: a narrow posterior leaves the
+    /// truth outside it too often, so the extreme ranks carry the mass while the slope
+    /// stays near zero. Distinguishing that from a *biased* posterior is what makes an
+    /// SBC failure report actionable rather than just red.
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn a_deliberately_overconfident_nuts_posterior_is_rejected() {
+        let model = Narrowed {
+            inner: f3_under_nuts(),
+            factor: 0.6,
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 105).unwrap();
+        for h in &hists {
+            println!(
+                "f3/nuts/narrowed/{}: chi2 {:.1}, slope {:+.3}, counts {:?}",
+                h.param,
+                h.chi_squared(),
+                h.slope(),
+                h.counts
+            );
+            assert!(
+                !h.passes(CRITICAL_15_DF),
+                "{}: a posterior 40% too narrow passed the calibration gate \
+                 (chi-squared {:.1}); the gate is not a gate",
+                h.param,
+                h.chi_squared()
+            );
+            let bins = h.counts.len();
+            assert!(
+                h.counts[0] + h.counts[bins - 1] > h.counts[bins / 2 - 1] + h.counts[bins / 2],
+                "{}: an over-confident posterior should bow upward at the extremes; counts {:?}",
+                h.param,
+                h.counts
+            );
+            assert!(
+                h.slope().abs() < 0.2,
+                "{}: an over-confident fit should bow, not slope ({:.3})",
+                h.param,
+                h.slope()
+            );
+        }
     }
 }

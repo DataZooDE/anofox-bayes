@@ -93,6 +93,26 @@ impl BayesRng {
     pub fn uniform(&mut self) -> f64 {
         self.inner.gen::<f64>()
     }
+
+    /// Raw bytes off the stream.
+    ///
+    /// These three exist so that a foreign sampler can be driven from *this* stream
+    /// rather than from one of its own. `nuts-rs` takes an `rng` and seeds its
+    /// internal ChaCha8 from it; feeding it [`BayesRng::for_chain`] is what makes a
+    /// NUTS fit reproduce byte-for-byte from `(seed, chain)` alone, on any machine and
+    /// under any thread layout. Exposing the raw stream rather than re-deriving a seed
+    /// inside the engine keeps the chain-seed derivation in one tested place.
+    pub fn next_u32(&mut self) -> u32 {
+        rand::RngCore::next_u32(&mut self.inner)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        rand::RngCore::next_u64(&mut self.inner)
+    }
+
+    pub fn fill_bytes(&mut self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut self.inner, dst)
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +190,30 @@ mod tests {
             (var - 2.0 * df).abs() < 0.35,
             "variance {var} vs {}",
             2.0 * df
+        );
+    }
+
+    /// The raw-byte accessors must read the *same* stream as the typed draws, not a
+    /// parallel one. A foreign sampler driven from a second, independent stream would
+    /// still be reproducible, but `chains_are_independent_streams` would no longer say
+    /// anything about it.
+    #[test]
+    fn the_raw_byte_accessors_advance_the_same_stream() {
+        let mut a = BayesRng::for_chain(9, 2);
+        let mut b = BayesRng::for_chain(9, 2);
+        assert_eq!(a.next_u64(), b.next_u64());
+        let mut buf_a = [0u8; 32];
+        let mut buf_b = [0u8; 32];
+        a.fill_bytes(&mut buf_a);
+        b.fill_bytes(&mut buf_b);
+        assert_eq!(buf_a, buf_b);
+        assert_eq!(a.next_u32(), b.next_u32());
+        // ...and having consumed bytes, the typed draws continue from there rather
+        // than restarting.
+        let after = a.standard_normal();
+        assert_ne!(
+            after.to_bits(),
+            BayesRng::for_chain(9, 2).standard_normal().to_bits()
         );
     }
 

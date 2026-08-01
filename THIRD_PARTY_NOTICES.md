@@ -66,6 +66,51 @@ terms under which the third-party components are used.
 
 ---
 
+## nuts-rs
+
+   <https://github.com/pymc-devs/nuts-rs>
+
+   The No-U-Turn Sampler, maintained by the PyMC developers and the sampler behind
+   nutpie. Pinned to `=0.18.3`.
+
+   The MIT License (MIT)
+
+   Copyright (c) 2022 Adrian Seyboldt and the PyMC Developers
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+   Components used:
+   - The entire `nuts` engine: trajectory sampling, the U-turn criterion, the
+     dual-averaging step size and the diagonal mass matrix adaptation. This
+     extension writes the adapter only
+     (`crates/anofox-bayes-core/src/engines/nuts.rs`).
+
+   Default features — which pull in `rayon` — are disabled: this engine drives one
+   chain at a time and starts no threads of its own, which is both what the
+   surrounding extension requires of it and what makes its output byte-identical
+   irrespective of the thread layout.
+
+   nuts-rs transitively includes `nuts-storable`, `nuts-derive`, `anyhow`,
+   `itertools` and its own major version of `rand` / `rand_distr`.
+
+---
+
 ## statrs
 
    <https://github.com/statrs-dev/statrs>

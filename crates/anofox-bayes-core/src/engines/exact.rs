@@ -161,6 +161,8 @@ mod tests {
         let opts = SampleOptions {
             n_chains: 3,
             n_draws: 7,
+            // Ignored: this engine draws independently, so there is nothing to adapt.
+            n_warmup: 0,
             seed: 1,
             sample_from: crate::types::SampleFrom::Posterior,
         };
@@ -175,6 +177,8 @@ mod tests {
         let opts = SampleOptions {
             n_chains: 2,
             n_draws: 50,
+            // Ignored: this engine draws independently, so there is nothing to adapt.
+            n_warmup: 0,
             seed: 99,
             sample_from: crate::types::SampleFrom::Posterior,
         };
@@ -197,6 +201,8 @@ mod tests {
         let opts = SampleOptions {
             n_chains: 2,
             n_draws: 100,
+            // Ignored: this engine draws independently, so there is nothing to adapt.
+            n_warmup: 0,
             seed: 5,
             sample_from: crate::types::SampleFrom::Posterior,
         };
@@ -250,6 +256,8 @@ mod tests {
                 &SampleOptions {
                     n_chains: 1,
                     n_draws: 100_000,
+                    // Ignored: this engine draws independently, so there is nothing to adapt.
+                    n_warmup: 0,
                     seed: 3,
                     sample_from: crate::types::SampleFrom::Posterior,
                 },

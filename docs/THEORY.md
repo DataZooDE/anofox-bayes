@@ -177,9 +177,10 @@ noisier data pools more at the same setting, which is what you want.
 > every slope the other way to compensate.
 >
 > **Not estimated:** `pool_scale` is fixed by configuration. Estimating it makes the
-> posterior non-conjugate and needs a general sampler; that arrives with the NUTS
-> engine. Fixing it is the documented stepping stone, and the value used is recorded
-> in the fit.
+> posterior non-conjugate and needs a general sampler. The NUTS engine that such a
+> family will run on now exists ([§5](#5-engines)); the family itself does not yet, so
+> for now fixing the scale remains the documented stepping stone, and the value used is
+> recorded in the fit.
 
 ## 5. Engines
 
@@ -190,16 +191,46 @@ on the `__engine__` row so a reviewer can see which one ran.
 | Engine | What it does | Status |
 |---|---|---|
 | `exact` | Samples the closed-form posterior directly. No approximation. | default for the two conjugate families |
-| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available everywhere; **the** engine for `censored_aft` |
-| `nuts` | General-purpose sampler for models with no closed form. | planned (0.2) |
+| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on every family; **the** engine for `censored_aft` |
+| `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | available wherever a gradient is |
 
 Where a closed form exists, `exact` is both faster and more accurate, so it is the
-default. `laplace` exists because it generalises to families that have no closed form
-— and, in the meantime, because it provides an **independent check**: both shipped
-families are conjugate, so both engines describe the same posterior by different
-routes, and they are tested to agree.
+default. `laplace` and `nuts` exist because they generalise to families that have no
+closed form — and, in the meantime, because they provide an **independent check**: on
+the conjugate families every engine describes the same posterior by a different route,
+and they are tested to agree.
 
-**When is the approximation good enough?** Measured, not asserted. On
+**What NUTS is for.** A Gaussian approximation at the mode is excellent for a
+GLM-shaped posterior with reasonable data and poor for a hierarchical variance
+parameter with few groups, which is precisely the shape the next families need. NUTS
+makes no such assumption: given enough draws it converges on the posterior whatever
+shape it is. The price is roughly three orders of magnitude in runtime, so it is not a
+default anywhere it is not needed.
+
+Three things follow from NUTS producing a **Markov chain** rather than independent
+draws, and they are visible from SQL:
+
+- **`chains` defaults to 4** for this engine, where the other two default to 1. R̂
+  compares chains, and one chain cannot support it.
+- **R̂ stops being `NULL`.** See [§6](#6-diagnostics).
+- **The sampler statistics appear.** `__lp__`, `__divergent__`, `__energy__` and
+  `__step_size__` are on the draws table, one row per draw per chain — the first
+  engine to populate rows the contract has always reserved.
+
+**Divergences are a refusal, not a warning.** A divergent trajectory means the
+integrator left the region it was exploring, so the draws around it are not from the
+posterior. One is enough to make `__status__` say `degenerate`; there is no small
+budget of acceptable divergences, because there is no small amount of "these numbers
+are from somewhere else" that a decision can absorb. See [§7](#7-refusal).
+
+**Is NUTS right?** Checked the same way everything else here is, and twice. It is
+compared against `pooled_gaussian`'s **closed-form** posterior — a family with a right
+answer, chosen for the certification precisely because it has one — with a tolerance
+derived from the Monte Carlo standard error rather than picked to pass. And it has its
+own SBC suite, plus a deliberately over-confident fixture that the suite is required to
+reject, so the calibration gate is a gate rather than a formality.
+
+**When is the Laplace approximation good enough?** Measured, not asserted. On
 `pooled_gaussian` the two engines agree on every coefficient to well under a percent
 at n = 400. Where they differ is the tails at small samples: the exact marginal for a
 coefficient is a Student-t, and Laplace returns its Gaussian limit, so it slightly
@@ -260,6 +291,27 @@ A regression coefficient's posterior is close to Gaussian at modest sample sizes
 variance parameter's is not.
 
 > **In detail.** Laplace works on an unconstrained scale — `sigma` is sampled as
+> **In detail (NUTS).** NUTS is not implemented here. The sampler is
+> [`nuts-rs`](https://github.com/pymc-devs/nuts-rs), maintained by pymc-devs and the
+> engine behind nutpie; this extension writes only the adapter — the same `logp` and
+> analytic gradient the Laplace engine uses, on the same unconstrained scale, plus the
+> warmup discard and the translation of the per-draw diagnostics into the draws
+> contract. Adaptation is `nuts-rs`'s dual-averaging step size and diagonal mass
+> matrix, 1000 warmup draws by default (`warmup`), discarded. Chains start
+> overdispersed — drawn from the Laplace approximation at the mode, widened by a factor
+> of two — so that R̂ has a real failure to detect rather than agreement built in by
+> starting every chain in the same place. Chains run sequentially and each is seeded
+> from `(seed, chain)`, so the draws are byte-identical regardless of how many chains
+> were requested or how many threads are in flight.
+>
+> One consequence worth knowing: a diagonal mass matrix cannot precondition a posterior
+> whose correlations are not axis-aligned. `pooled_gaussian` with a `group` column is
+> such a posterior — the intercept and the group effects trade off along a ridge — and
+> NUTS mixes slowly there, reporting a low ESS and an R̂ above 1.01 rather than pretending
+> otherwise. The exact engine has no such difficulty on the same design, which is the
+> reason it remains the default for this family.
+
+> **In detail (Laplace).** Laplace works on an unconstrained scale — `sigma` is sampled as
 > `log sigma`, so every draw is positive by construction; a Gaussian fitted directly to
 > a scale parameter would put mass below zero. The mode is found by Newton iteration on
 > an analytic gradient with a backtracking line search, and the covariance is the
@@ -297,11 +349,27 @@ would certify precisely the number you are not entitled to use. **Gate on both**
 R̂ compares variance *between* chains to variance *within* them. Above about 1.01, the
 chains have not settled on the same answer and nothing else should be believed.
 
-**In v0.1 this is usually `NULL`, and that is correct.** Both current engines draw
+**Under `exact` and `laplace` this is `NULL`, and that is correct.** Both draw
 independently, so there is no Markov chain that could fail to mix and the statistic is
 undefined. It returns `NULL` rather than a reassuring `1.00` because a diagnostic that
-was never computed must not read as one that passed. It becomes load-bearing when NUTS
-arrives.
+was never computed must not read as one that passed.
+
+**Under `nuts` it is computed, and it is the gate.** That engine produces a genuine
+Markov chain, defaults to four of them, and starts them at overdispersed points so
+that chains which have not found the same answer say so. An R̂ above 1.01 makes the fit
+`degenerate`.
+
+### Divergences — did the sampler stay where it was integrating?
+
+Only NUTS reports this, on the `__divergent__` rows. A divergence means the
+leapfrog integrator lost energy conservation badly enough that the trajectory left the
+region it was exploring — usually a posterior with curvature too sharp for the adapted
+step size, which is the classic signature of a hierarchical model that wants
+reparameterising. The draws around a divergence are not from the posterior, so **any**
+divergence is a refusal rather than a warning.
+
+`sum(__divergent__)` is `NULL` for the other engines, and deliberately so: a zero would
+read as "the sampler explored cleanly" when the truth is that no sampler ran.
 
 > **In detail.** Both follow Vehtari et al. (2021): split chains, rank-normalised
 > draws, and Geyer's initial monotone positive sequence for the autocorrelation

@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 anofox-stats-core.workspace = true
 faer.workspace = true
+nuts-rs.workspace = true
 statrs.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

@@ -467,6 +467,7 @@ mod tests {
                     n_draws: 100_000,
                     seed: 5,
                     sample_from: crate::types::SampleFrom::Posterior,
+                    n_warmup: 0,
                 },
             )
             .unwrap();
@@ -555,6 +556,7 @@ mod tests {
                     n_draws: 20_000,
                     seed: 9,
                     sample_from: crate::types::SampleFrom::Posterior,
+                    n_warmup: 0,
                 },
             )
             .unwrap();
@@ -587,6 +589,7 @@ mod tests {
                     n_draws: 500,
                     seed: 3,
                     sample_from: crate::types::SampleFrom::Posterior,
+                    n_warmup: 0,
                 },
             )
             .unwrap();
@@ -706,6 +709,7 @@ mod tests {
                     n_draws: 500,
                     seed: 13,
                     sample_from: crate::types::SampleFrom::Posterior,
+                    n_warmup: 0,
                 },
             )
             .unwrap();
@@ -814,6 +818,7 @@ mod tests {
                         n_draws: 200,
                         seed: 21,
                         sample_from: crate::types::SampleFrom::Posterior,
+                        n_warmup: 0,
                     },
                 )
                 .unwrap();

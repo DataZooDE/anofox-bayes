@@ -53,6 +53,17 @@ returning 0 over an exact fit means *no rows*, not *no divergences* — check
 `count(*)` if the distinction matters to you. Emitting a reassuring zero for a sampler
 that never ran would be the more dangerous default.
 
+**The `nuts` engine emits all four**, one row per kept draw per chain. Warmup draws are
+not kept, so no statistic row describes one. `__divergent__` is the one to gate on:
+a fit with any divergence has `__status__ = degenerate`, because the draws around a
+divergent trajectory are not from the posterior.
+
+```sql
+-- Did this fit's sampler explore cleanly? NULL means no sampler ran.
+SELECT sum(value) FILTER (WHERE param = '__divergent__') AS divergences
+FROM draws;
+```
+
 ### 3. Model metadata — `chain = -1, draw = -1`
 
 Emitted exactly once per fit, with `group_id = '__global__'`.
@@ -245,9 +256,11 @@ order-independent by construction.
 consumer written today keeps working:
 
 **Consumers must ignore reserved rows they do not recognise.** New `__`-prefixed
-metadata and sampler-statistic rows will be added — the NUTS engine brings several —
-and their arrival is *not* breaking. Filter on the names you know rather than
-assuming a fixed set.
+metadata and sampler-statistic rows will be added, and their arrival is *not* breaking.
+Filter on the names you know rather than assuming a fixed set. The `nuts` engine is the
+worked example: it began populating all four sampler statistics without moving
+`__schema_version__`, because a consumer that filters on the rows it knows sees exactly
+what it saw before.
 
 | Change | Breaking? |
 |---|---|

@@ -201,6 +201,6 @@ _anofox_bayes_diagnostics(model_id, param, rhat, ess_bulk, ess_tail,
 
 | Phase | Deliverables |
 |---|---|
-| **0.1** | Extension skeleton, draws contract, F3 (pooled Gaussian linear) + F7 (conjugate anomaly), Laplace engine, diagnostics aggregates, SBC + golden-run CI |
-| **0.2** | F1 (hier. NB) + F2 (censored durations) on crate's pooling/censoring; nuts-rs adapter; status/refusal hardening; scenario-catalog registration |
+| **0.1** | Extension skeleton, draws contract, F3 (pooled Gaussian linear) + F7 (conjugate anomaly), exact + Laplace + NUTS engines, diagnostics aggregates, SBC + golden-run CI |
+| **0.2** | F1 (hier. NB) + F2 (censored durations) on crate's pooling/censoring; status/refusal hardening; scenario-catalog registration |
 | **0.3** | F4–F6, posterior-/prior-predictive functions, decision macros, optional async-fit API |
