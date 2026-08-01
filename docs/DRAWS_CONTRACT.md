@@ -120,12 +120,17 @@ Two of the inputs are not part of the caller's request, and both are deliberate:
   deliberately different. Without it a cache would serve the old, wrong answer for the
   new, correct request — which has already happened once during development.
 
-**One thing `model_id` does not cover.** It fingerprints the *fit*. Any step you run
-downstream of the draws — posterior prediction, forward simulation, anything using
-`random()` — draws its noise from DuckDB's own RNG, which the fit's `seed` does not
-touch. Call `setseed(...)` before such a step and record that value beside `model_id`,
-or the recommendation will not regenerate. See
-[the Guide](GUIDE.md#ask-a-what-if-without-re-fitting).
+**One thing `model_id` does not cover.** It fingerprints the *fit*, not what you do
+downstream of it. A posterior prediction or forward simulation adds noise of its own,
+and that noise carries its own seed.
+
+Use `anofox_bayes_std_normal(seed, key, draw)` — or `anofox_bayes_uniform` — for it,
+and record that seed beside `model_id`. The pair is then sufficient to regenerate a
+recommendation exactly, which is what the reproducibility claim above depends on.
+
+Do **not** use DuckDB's `random()`. It is seeded per session by `setseed()`, not by the
+fit, so a recipe built on it is reproducible only if the caller remembers a `SET` —
+and the audit trail records nothing about whether they did.
 
 Consequences worth relying on:
 

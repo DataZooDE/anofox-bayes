@@ -36,6 +36,13 @@ const char *anofox_bayes_ffi_version(void);
 // Version of the long-format draws contract (docs/DRAWS_CONTRACT.md).
 int32_t anofox_bayes_ffi_draws_schema_version(void);
 
+// Keyed randomness for the predictive step (docs/GUIDE.md, keyed_rng.rs).
+//
+// Pure functions of their arguments: same coordinates, same value, on any thread and
+// in any evaluation order. `key` may be NULL when `key_len` is 0.
+double anofox_bayes_ffi_uniform(int64_t seed, const uint8_t *key, size_t key_len, int64_t draw);
+double anofox_bayes_ffi_std_normal(int64_t seed, const uint8_t *key, size_t key_len, int64_t draw);
+
 // Selector for anofox_bayes_ffi_diagnostic.
 #define ANOFOX_BAYES_DIAGNOSTIC_RHAT 0
 #define ANOFOX_BAYES_DIAGNOSTIC_ESS_BULK 1

@@ -8,6 +8,7 @@ class ExtensionLoader;
 
 // --- Scalar functions -------------------------------------------------------
 void RegisterVersionFunctions(ExtensionLoader &loader);
+void RegisterKeyedRandomFunctions(ExtensionLoader &loader);
 
 // --- Aggregate functions ----------------------------------------------------
 void RegisterDiagnosticAggregates(ExtensionLoader &loader);

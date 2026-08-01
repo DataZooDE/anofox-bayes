@@ -478,6 +478,50 @@ SELECT anofox_bayes_version() AS version,
 --  0.1.0 | 1
 ```
 
+### 4.1 Keyed randomness
+
+```sql
+anofox_bayes_uniform(seed BIGINT, key VARCHAR, draw BIGINT)    -> DOUBLE  -- in (0, 1)
+anofox_bayes_std_normal(seed BIGINT, key VARCHAR, draw BIGINT) -> DOUBLE  -- N(0, 1)
+```
+
+Noise for a predictive step. **Use these rather than DuckDB's `random()`**, which is
+seeded per session rather than by the fit and therefore makes any recipe built on it
+irreproducible — see [the Guide](GUIDE.md#ask-a-what-if-without-re-fitting).
+
+Both are *pure functions of their three arguments*: the value is a function of where
+it sits in the stream, not of how many values were produced before it. So the same
+query returns the same numbers under any thread count, any row order, and any
+re-execution — properties pinned in `test/sql/keyed_random.test`.
+
+| Argument | Meaning |
+|---|---|
+| `seed` | Any value you choose. Record it beside `model_id` and the run regenerates. |
+| `key` | What is being simulated — a SKU, a lane, a row id. Cast to `VARCHAR`. |
+| `draw` | The draw index, so each posterior draw carries its own noise. |
+
+`anofox_bayes_std_normal` is exactly the standard normal quantile of
+`anofox_bayes_uniform` at the same coordinates. That identity is contractual: it lets
+you build any other distribution by applying its own quantile function to
+`anofox_bayes_uniform` and inheriting every property above.
+
+```sql
+-- An exponential with rate 2, on the same reproducible stream.
+SELECT -ln(anofox_bayes_uniform(42, sku, draw)) / 2.0 FROM ...;
+```
+
+The uniform is open at both ends, so `ln(u)` and `ln(1 - u)` are always finite —
+DuckDB raises on `ln(0)`, so a closed endpoint would abort the query rather than
+quietly produce an infinity.
+
+Two consequences worth using deliberately:
+
+* **Paired scenarios share their noise.** A baseline and a what-if evaluated at the
+  same `(seed, key, draw)` see the same shock, so their difference is the effect
+  rather than the effect plus sampling jitter.
+* **Vary the key across rows.** Passing one key for every row gives every row the
+  identical shock, which shows up as an implausibly smooth forecast band.
+
 ---
 
 ## 5. Settings

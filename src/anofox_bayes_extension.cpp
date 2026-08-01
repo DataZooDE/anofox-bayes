@@ -69,6 +69,7 @@ void LoadInternal(ExtensionLoader &loader) {
 #endif // ANOFOX_TELEMETRY_ENABLED
 
 	RegisterVersionFunctions(loader);
+	RegisterKeyedRandomFunctions(loader);
 	RegisterDiagnosticAggregates(loader);
 	RegisterBayesFitFunction(loader);
 	RegisterBayesMacros(loader);

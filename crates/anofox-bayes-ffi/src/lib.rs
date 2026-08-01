@@ -145,6 +145,64 @@ fn defined_if_positive(ess: f64) -> Option<f64> {
     (ess > 0.0).then_some(ess)
 }
 
+// --- Keyed randomness for the predictive step -------------------------------
+//
+// Pure functions of their arguments, so unlike the fit entry points there is no
+// handle to own and nothing to free. They still go through `guard`: the core call
+// reaches `statrs`'s inverse CDF, and a panic crossing this boundary would be UB
+// regardless of how unlikely it is.
+
+/// A draw from `Uniform(0, 1)`, open at both ends.
+///
+/// `key`/`key_len` is arbitrary caller-supplied bytes and may be empty; `key` may be
+/// null only when `key_len` is zero.
+///
+/// # Safety
+/// `key` must point to at least `key_len` readable bytes, or be null with
+/// `key_len == 0`.
+#[no_mangle]
+pub unsafe extern "C" fn anofox_bayes_ffi_uniform(
+    seed: i64,
+    key: *const u8,
+    key_len: usize,
+    draw: i64,
+) -> f64 {
+    guard(f64::NAN, || {
+        let bytes = key_slice(key, key_len);
+        anofox_bayes_core::keyed_rng::uniform(seed, bytes, draw)
+    })
+}
+
+/// A draw from `N(0, 1)`. See [`anofox_bayes_ffi_uniform`] for the key contract.
+///
+/// # Safety
+/// Same as [`anofox_bayes_ffi_uniform`].
+#[no_mangle]
+pub unsafe extern "C" fn anofox_bayes_ffi_std_normal(
+    seed: i64,
+    key: *const u8,
+    key_len: usize,
+    draw: i64,
+) -> f64 {
+    guard(f64::NAN, || {
+        let bytes = key_slice(key, key_len);
+        anofox_bayes_core::keyed_rng::std_normal(seed, bytes, draw)
+    })
+}
+
+/// Borrow caller-owned key bytes.
+///
+/// A null pointer with a zero length is the natural spelling of an empty DuckDB
+/// string and must not reach `slice::from_raw_parts`, which requires a non-null
+/// aligned pointer even for an empty slice.
+unsafe fn key_slice<'a>(key: *const u8, key_len: usize) -> &'a [u8] {
+    if key.is_null() || key_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(key, key_len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +232,39 @@ mod tests {
         assert_eq!(caught, -1, "a panic must become the fallback, not unwind");
         // ...and the happy path is untouched.
         assert_eq!(guard(-1i32, || 7), 7);
+    }
+
+    /// The C++ layer passes `string_t::GetData()` straight through, and DuckDB is
+    /// entitled to hand back a null pointer for an empty string. `from_raw_parts`
+    /// requires non-null even at length zero, so this path is a genuine UB obligation
+    /// rather than a defensive nicety.
+    #[test]
+    fn an_empty_key_may_arrive_as_a_null_pointer() {
+        let from_null = unsafe { anofox_bayes_ffi_std_normal(1, std::ptr::null(), 0, 0) };
+        let from_empty = unsafe { anofox_bayes_ffi_std_normal(1, b"".as_ptr(), 0, 0) };
+        assert!(from_null.is_finite());
+        assert_eq!(from_null, from_empty);
+        assert_eq!(
+            from_null,
+            anofox_bayes_core::keyed_rng::std_normal(1, b"", 0)
+        );
+    }
+
+    /// A non-empty key must actually be read, not silently treated as empty — the
+    /// failure mode where every group shares one random stream.
+    #[test]
+    fn the_key_bytes_reach_the_core_unchanged() {
+        let key = b"lane-7";
+        let through_ffi = unsafe { anofox_bayes_ffi_uniform(9, key.as_ptr(), key.len(), 4) };
+        assert_eq!(
+            through_ffi,
+            anofox_bayes_core::keyed_rng::uniform(9, key, 4)
+        );
+        assert_ne!(
+            through_ffi,
+            unsafe { anofox_bayes_ffi_uniform(9, std::ptr::null(), 0, 4) },
+            "a populated key must not behave like an empty one"
+        );
     }
 
     #[test]

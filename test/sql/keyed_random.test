@@ -1,0 +1,184 @@
+# name: test/sql/keyed_random.test
+# description: Deterministic randomness for the predictive step
+# group: [anofox_bayes]
+#
+# The property under test is the one that makes a recommendation auditable: a
+# predictive query is a pure function of the draws table and a seed, with no
+# dependence on session state, evaluation order or thread count.
+#
+# `setseed()` is deliberately never called in this file. That is the point -- these
+# recipes are correct without it.
+
+require anofox_bayes
+
+#######################################
+# The primitive
+#######################################
+
+query I
+SELECT anofox_bayes_std_normal(42, 'sku-7', 3) = anofox_bayes_std_normal(42, 'sku-7', 3);
+----
+true
+
+# Every coordinate is load-bearing.
+query III
+SELECT anofox_bayes_std_normal(42, 'sku-7', 3) <> anofox_bayes_std_normal(43, 'sku-7', 3),
+       anofox_bayes_std_normal(42, 'sku-7', 3) <> anofox_bayes_std_normal(42, 'sku-8', 3),
+       anofox_bayes_std_normal(42, 'sku-7', 3) <> anofox_bayes_std_normal(42, 'sku-7', 4);
+----
+true	true	true
+
+# The normal is the quantile of the uniform at the same coordinates. DuckDB has no
+# `erfinv` to state that identity directly, so assert its observable consequence:
+# the map from uniform to normal is strictly increasing. A Box-Muller construction --
+# the obvious alternative, and the one the guide used to recommend inline -- consumes
+# two uniforms and is not monotone in either, so it fails this.
+query I
+SELECT bool_and(u_rank = z_rank) FROM (
+    SELECT rank() OVER (ORDER BY anofox_bayes_uniform(9, 'lane', i))    AS u_rank,
+           rank() OVER (ORDER BY anofox_bayes_std_normal(9, 'lane', i)) AS z_rank
+    FROM range(500) t(i)
+);
+----
+true
+
+# Open at both ends. A caller building an exponential writes ln(u), and DuckDB raises
+# on ln(0) rather than returning -inf, so a closed endpoint would abort their query
+# rather than quietly producing an infinity. Neither endpoint is reachable.
+query II
+SELECT min(u) > 0, max(u) < 1
+FROM (SELECT anofox_bayes_uniform(1, 'k', i) AS u FROM range(20000) t(i));
+----
+true	true
+
+# Distributionally sound, checked through SQL rather than trusted from the Rust tests.
+query II
+SELECT abs(avg(z)) < 0.03, abs(stddev_samp(z) - 1) < 0.03
+FROM (SELECT anofox_bayes_std_normal(5, 'lane', i) AS z FROM range(20000) t(i));
+----
+true	true
+
+#######################################
+# Order and thread independence
+#######################################
+
+statement ok
+CREATE TABLE coords AS SELECT i FROM range(5000) t(i);
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE serial AS SELECT i, anofox_bayes_std_normal(7, 'lane-a', i) AS z FROM coords;
+
+statement ok
+SET threads = 8;
+
+# Shuffled input order, eight threads. `random()` would give a different answer here;
+# a pure function of the row cannot.
+statement ok
+CREATE TABLE parallel AS
+SELECT i, anofox_bayes_std_normal(7, 'lane-a', i) AS z FROM coords ORDER BY hash(i);
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT i, z FROM serial EXCEPT ALL SELECT i, z FROM parallel
+);
+----
+true
+
+#######################################
+# The recipe it exists for
+#######################################
+
+statement ok
+CREATE TABLE sales(region VARCHAR, units DOUBLE);
+
+statement ok
+INSERT INTO sales
+SELECT 'north', 100 + (i % 7) FROM range(40) t(i)
+UNION ALL SELECT 'south', 50 + (i % 5) FROM range(40) t(i);
+
+statement ok
+CREATE TABLE draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT region, units FROM sales),
+    'conjugate_anomaly',
+    {'value': 'units', 'group': 'region', 'draws': 500, 'seed': 42});
+
+# A posterior predictive, written the way the guide now recommends: the noise is keyed
+# by the thing being simulated and the draw index, not drawn from session state.
+statement ok
+CREATE MACRO predictive() AS TABLE
+SELECT m.group_id, m.draw,
+       m.value + s.value * anofox_bayes_std_normal(2026, m.group_id, m.draw) AS y
+FROM (SELECT group_id, draw, value FROM draws WHERE param = 'mu' AND draw >= 0) m
+JOIN (SELECT group_id, draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s
+  USING (group_id, draw);
+
+statement ok
+CREATE TABLE run_a AS SELECT * FROM predictive();
+
+statement ok
+CREATE TABLE run_b AS SELECT * FROM predictive();
+
+# Identical to the last bit, across two independent evaluations, with no setseed
+# anywhere in this file. This is the assertion the whole module exists to make true.
+query I
+SELECT count(*) = 0 FROM (
+    SELECT * FROM run_a EXCEPT ALL SELECT * FROM run_b
+);
+----
+true
+
+# ...and the test is asserting reproducibility rather than a constant: a different seed
+# genuinely moves the draws.
+query I
+SELECT count(*) > 0 FROM (
+    SELECT group_id, draw, y FROM run_a
+    EXCEPT ALL
+    SELECT m.group_id, m.draw,
+           m.value + s.value * anofox_bayes_std_normal(2027, m.group_id, m.draw)
+    FROM (SELECT group_id, draw, value FROM draws WHERE param = 'mu' AND draw >= 0) m
+    JOIN (SELECT group_id, draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s
+      USING (group_id, draw)
+);
+----
+true
+
+# The predictive must be wider than the posterior for the mean -- it carries the
+# observation noise as well as the parameter uncertainty. A keyed generator that
+# collapsed to a constant would pass every equality test above and fail this one.
+query I
+SELECT bool_and(pred_sd > mu_sd * 2) FROM (
+    SELECT r.group_id,
+           stddev_samp(r.y) AS pred_sd,
+           any_value(m.sd)  AS mu_sd
+    FROM run_a r
+    JOIN (SELECT group_id, stddev_samp(value) AS sd FROM draws
+          WHERE param = 'mu' AND draw >= 0 GROUP BY group_id) m USING (group_id)
+    GROUP BY r.group_id
+);
+----
+true
+
+#######################################
+# Paired scenarios share their noise
+#######################################
+
+# The composability property: a baseline and a what-if evaluated at the same
+# coordinates see the same shock, so their difference is the effect rather than the
+# effect plus sampling jitter. Here a +10% uplift must show up as exactly +10% of mu
+# in every paired draw, with the noise cancelling to the last bit.
+query I
+SELECT count(*) = 0 FROM (
+    SELECT m.group_id, m.draw,
+           (1.1 * m.value + s.value * anofox_bayes_std_normal(2026, m.group_id, m.draw))
+             - (m.value + s.value * anofox_bayes_std_normal(2026, m.group_id, m.draw))
+             - 0.1 * m.value AS residual
+    FROM (SELECT group_id, draw, value FROM draws WHERE param = 'mu' AND draw >= 0) m
+    JOIN (SELECT group_id, draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s
+      USING (group_id, draw)
+) WHERE abs(residual) > 1e-9;
+----
+true

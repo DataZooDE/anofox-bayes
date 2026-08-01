@@ -34,6 +34,7 @@ pub mod draws;
 pub mod engines;
 pub mod errors;
 pub mod fit;
+pub mod keyed_rng;
 pub mod linalg;
 pub mod rng;
 pub mod sbc;

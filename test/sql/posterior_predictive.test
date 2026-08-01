@@ -95,16 +95,15 @@ FROM mu_pred WHERE row_id = 120;
 # service-level decision needs the latter, which is wider by sigma -- getting this
 # wrong is the single most common way a forecast interval ends up too tight.
 #
-# `random()` is DuckDB's RNG and is NOT covered by the fit's `seed`, so a predictive
-# step is only reproducible if the caller seeds it. Measured without this: the same
-# draws table returned 0.4224 and 0.5518 on consecutive runs.
-statement ok
-SELECT setseed(0.42);
-
+# The noise comes from `anofox_bayes_std_normal`, not `random()`. DuckDB's RNG is
+# seeded per session and not by the fit, so a recipe built on it makes the fit
+# reproducible and the forecast not -- measured, the same draws table returned 0.4224
+# and 0.5518 on consecutive runs. Keying on (row, draw) instead makes the noise a
+# function of the row, which is what the audit claim in DRAWS_CONTRACT.md needs.
 statement ok
 CREATE TABLE y_pred AS
 SELECT m.row_id, m.draw,
-       m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+       m.mu + s.value * anofox_bayes_std_normal(2026, m.row_id::VARCHAR, m.draw) AS y
 FROM mu_pred m
 JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
 
@@ -167,29 +166,20 @@ WHERE m.row_id = 125;
 # A predictive step must be reproducible
 #######################################
 
-# The fit is reproducible by construction; the noise added on top of it is not, unless
-# the caller seeds DuckDB's RNG. This asserts the whole recipe -- fit plus predictive --
-# gives the same answer twice, which is what the audit claim in DRAWS_CONTRACT.md
-# actually needs. Without the setseed calls below these two runs differ in the second
-# decimal place.
-
-statement ok
-SELECT setseed(0.1234);
+# The whole recipe -- fit plus predictive -- must give the same answer twice with no
+# `setseed` anywhere, which is the property that makes a recommendation auditable.
 
 statement ok
 CREATE TABLE pred_run_a AS
 SELECT m.row_id, m.draw,
-       m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+       m.mu + s.value * anofox_bayes_std_normal(7, m.row_id::VARCHAR, m.draw) AS y
 FROM mu_pred m
 JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
 
 statement ok
-SELECT setseed(0.1234);
-
-statement ok
 CREATE TABLE pred_run_b AS
 SELECT m.row_id, m.draw,
-       m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+       m.mu + s.value * anofox_bayes_std_normal(7, m.row_id::VARCHAR, m.draw) AS y
 FROM mu_pred m
 JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
 
@@ -205,15 +195,12 @@ true
 
 # ...and a different seed genuinely produces different draws, so the test above is
 # asserting reproducibility rather than a constant.
-statement ok
-SELECT setseed(0.9876);
-
 query I
 SELECT count(*) > 0 FROM (
     SELECT row_id, draw, y FROM pred_run_a
     EXCEPT ALL
     SELECT m.row_id, m.draw,
-           m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+           m.mu + s.value * anofox_bayes_std_normal(8, m.row_id::VARCHAR, m.draw) AS y
     FROM mu_pred m
     JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw)
 );

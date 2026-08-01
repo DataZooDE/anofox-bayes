@@ -278,20 +278,45 @@ interval is wider, and confusing the two is the most common way a forecast inter
 ends up too tight:
 
 ```sql
--- Seed DuckDB's RNG first. `random()` is NOT covered by the fit's `seed`, so without
--- this the fit is reproducible and the forecast is not -- the same draws table gives
--- a different answer on every run.
-SELECT setseed(0.42);
-
 CREATE TABLE y_pred AS
 SELECT m.row_id, m.draw,
-       m.mu + s.value * sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS y
+       m.mu + s.value * anofox_bayes_std_normal(2026, m.row_id::VARCHAR, m.draw) AS y
 FROM mu_pred m
 JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
 ```
 
+**Use `anofox_bayes_std_normal`, not `random()`.** This is the one place where the
+obvious SQL is wrong. `random()` is seeded per *session* by `setseed()` and is not
+covered by the fit's `seed`, so a recipe built on it makes the fit reproducible and the
+forecast not — measured on this repo, the same draws table gave `P(units > 105)` of
+0.142 and 0.132 on consecutive runs. `anofox_bayes_std_normal(seed, key, draw)` is a
+pure function of its three arguments, so the same query returns the same numbers
+whatever the thread count, the row order, or what the session did earlier.
+
+Read the arguments as *coordinates in a fixed random stream*:
+
+| Argument | What to pass |
+|---|---|
+| `seed` | any `BIGINT` you choose; record it beside `model_id` and the run regenerates |
+| `key` | what is being simulated — a SKU, a lane, a row id. Cast to `VARCHAR` |
+| `draw` | the draw index, so each posterior draw gets its own noise |
+
+Vary all three. Reusing one key across rows gives every row the *same* shock, which
+looks like a fit with suspiciously smooth forecasts.
+
+`anofox_bayes_uniform(seed, key, draw)` is the same stream before the normal quantile
+is applied — use it to build any other distribution, e.g. `-ln(u) / rate` for an
+exponential. `anofox_bayes_std_normal` is exactly the normal quantile of
+`anofox_bayes_uniform` at the same coordinates.
+
+One consequence worth exploiting: **a scenario and its baseline evaluated at the same
+coordinates share their noise**, so their difference is the effect rather than the
+effect plus sampling jitter. That is what makes a paired what-if comparison stable
+enough to act on.
+
 A worked end-to-end version, including a counterfactual, is in
-`test/sql/posterior_predictive.test`.
+`test/sql/posterior_predictive.test`; the properties themselves are pinned in
+`test/sql/keyed_random.test`.
 
 ### …check my fit is trustworthy?
 
@@ -412,7 +437,9 @@ than exhausting memory. See [Scalability](SCALABILITY.md).
 | `invalid config at 'grup'` | A typo — the message names the slot and suggests the intended one |
 | `singular or rank-deficient design matrix` | Two predictors carry the same information (e.g. a constant column beside an intercept) |
 | Effect estimate looks far too large | A before/after comparison with no control group absorbs the underlying trend |
-| A forecast changes between runs of the same fit | `random()` is not covered by the fit's `seed`. Call `setseed(...)` before any predictive step, and record the value alongside `model_id` |
+| A forecast changes between runs of the same fit | The recipe uses `random()`, which the fit's `seed` does not cover. Use `anofox_bayes_std_normal(seed, key, draw)` instead and record the seed alongside `model_id` |
+| Every simulated row moves together; the band is implausibly smooth | The same `key` was passed for every row, so they all got the same shock. Key on the thing being simulated |
+| A predictive interval barely wider than the interval for the mean | The observation noise was never added — see [the what-if recipe](#ask-a-what-if-without-re-fitting) |
 
 ---
 

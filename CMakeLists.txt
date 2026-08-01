@@ -110,6 +110,7 @@ include_directories(src/include)
 set(EXTENSION_SOURCES
     src/anofox_bayes_extension.cpp
     src/scalar_functions/version.cpp
+    src/scalar_functions/keyed_random.cpp
     src/aggregate_functions/diagnostics_aggregates.cpp
     src/include/config_json.cpp
     src/table_functions/bayes_fit.cpp
