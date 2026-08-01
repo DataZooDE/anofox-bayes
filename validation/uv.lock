@@ -19,6 +19,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pymc" },
     { name = "pytest" },
+    { name = "scipy" },
 ]
 
 [package.metadata]
@@ -30,6 +31,7 @@ requires-dist = [
     { name = "pandas", specifier = "==3.0.5" },
     { name = "pymc", specifier = "==6.2.0" },
     { name = "pytest", specifier = "==9.1.1" },
+    { name = "scipy", specifier = "==1.18.0" },
 ]
 
 [[package]]

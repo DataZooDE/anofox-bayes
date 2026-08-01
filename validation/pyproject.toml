@@ -26,6 +26,12 @@ dependencies = [
     # accepts numpy >= 2.3) still references the removed np.row_stack and fails
     # at import. numba 0.62.1 + numpy 2.2.6 is the last working pair.
     "numba==0.62.1",
+    # Transitive via pytensor, but this suite uses it *directly*: the two
+    # Laplace-served families (F2, F5) are checked against a mode and an observed
+    # information matrix computed here in Python, independently of both the
+    # extension and PyMC. An undeclared direct dependency is one that a future
+    # `uv lock` is free to drop.
+    "scipy==1.18.0",
 ]
 
 [tool.pytest.ini_options]

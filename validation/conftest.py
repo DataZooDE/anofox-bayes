@@ -49,18 +49,20 @@ def pytest_terminal_summary(terminalreporter):
     """
     try:
         from _support import (  # noqa: PLC0415 - test-only import
+            ALL_TOLERANCES,
             MARGINS,
-            F3_TOL,
-            F7_TOL,
         )
     except Exception:  # pragma: no cover - suite skipped before import
         return
     if not MARGINS:
         return
 
+    # Driven off ALL_TOLERANCES rather than a hand-written tuple: a family added
+    # to the suite but forgotten here would be sampled, asserted, and then left
+    # out of the one table anybody reads before touching a tolerance.
     limits = {
         tol.label: {"mean": tol.mean, "sd": tol.sd, "q05": tol.quantile, "q95": tol.quantile}
-        for tol in (F7_TOL, F3_TOL)
+        for tol in ALL_TOLERANCES
     }
     stats = ("mean", "sd", "q05", "q95")
     terminalreporter.write_sep("=", "parity margins (delta / tolerance; 1.0 = at the limit)")
