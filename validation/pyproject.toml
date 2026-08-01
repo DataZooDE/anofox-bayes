@@ -1,0 +1,37 @@
+[project]
+name = "anofox-bayes-validation"
+version = "0.1.0"
+description = "PyMC golden-run parity validation for the anofox-bayes DuckDB extension"
+# PyMC/PyTensor and the numba backend agree on 3.12; 3.13 is not a combination
+# this suite has been run against, and a validation harness that floats its
+# interpreter is not a golden run.
+requires-python = ">=3.12,<3.13"
+
+# Everything is pinned to an exact version. This suite exists to answer "did the
+# extension's numbers change?", and it can only answer that if nothing else did:
+# a PyMC or ArviZ minor bump can move a default (ci_kind, the ESS estimator,
+# NUTS initialisation) and turn a parity delta into an upgrade artefact. Bump
+# these deliberately, one at a time, and re-check the margins in TOLERANCES.md.
+dependencies = [
+    "pymc==6.2.0",
+    "arviz==1.2.0",
+    # Must match the DuckDB the extension is built against (the duckdb/ submodule
+    # is at v1.5.5); a mismatch is refused at LOAD time, so this is a hard pin.
+    "duckdb==1.5.5",
+    "numpy==2.2.6",
+    "pandas==3.0.5",
+    "pytest==9.1.1",
+    # Transitive via pytensor, pinned here because it is the constraint that
+    # decides which numpy is installable: numba 0.63.0b1 (the only release that
+    # accepts numpy >= 2.3) still references the removed np.row_stack and fails
+    # at import. numba 0.62.1 + numpy 2.2.6 is the last working pair.
+    "numba==0.62.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A test marked xfail that starts passing is a signal, not a shrug: the residual
+# scale tests in test_parity_f3.py document a live extension bug and must turn
+# red the moment it is fixed.
+xfail_strict = true
+addopts = "-ra"

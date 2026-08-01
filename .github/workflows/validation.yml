@@ -1,0 +1,117 @@
+#
+# PyMC golden-run parity validation.
+#
+# This is a *correctness* gate, deliberately kept out of any platform matrix.
+# The question it answers -- "does the extension's closed-form posterior equal
+# the posterior a general-purpose sampler finds for the same model?" -- has one
+# answer, not one per operating system, and running it 12 times would only mean
+# 12 chances to flake on the same NUTS seed. One linux job, required.
+#
+# See validation/README.md for what it proves and validation/TOLERANCES.md for
+# why the tolerances are what they are.
+#
+name: Validation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  parity:
+    name: PyMC parity (linux-amd64)
+    runs-on: ubuntu-latest
+    # The build is the long pole; NUTS itself is under a minute.
+    timeout-minutes: 90
+
+    env:
+      GEN: ninja
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux
+      # Only the parity suite runs here; the SQL logic tests are the platform
+      # matrix's job and duplicating them would just slow this gate down.
+      DUCKDB_PLATFORM: linux_amd64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # duckdb/ and extension-ci-tools/ are submodules the build cannot do
+          # without, and the DuckDB pin decides which Python duckdb wheel the
+          # suite must load against (pinned in validation/pyproject.toml).
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build cmake make build-essential \
+                                     git curl zip unzip tar pkg-config
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: validation-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: validation-cargo-${{ runner.os }}-
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          # Same pin DuckDB itself builds against (duckdb/.github/workflows/Main.yml).
+          # Keep it in step with the duckdb submodule; a drifted vcpkg is a source
+          # of "works here, not in CI" openssl link failures.
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build the extension
+        run: make release
+
+      - name: Verify the extension was produced
+        # An absent binary makes the suite *skip*, which would be reported as a
+        # green run. Assert it exists here so a broken build fails as a build.
+        run: |
+          test -f build/release/extension/anofox_bayes/anofox_bayes.duckdb_extension \
+            || { echo "::error::extension binary missing after 'make release'"; exit 1; }
+          ls -l build/release/extension/anofox_bayes/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: validation/uv.lock
+
+      - name: Sync the pinned validation environment
+        working-directory: validation
+        # --frozen refuses to re-resolve: if uv.lock and pyproject.toml have
+        # drifted apart, that is a change to the reference implementation and it
+        # has to be committed deliberately, not discovered here.
+        run: uv sync --frozen
+
+      - name: Run the parity suite
+        working-directory: validation
+        env:
+          ANOFOX_BAYES_EXTENSION: ${{ github.workspace }}/build/release/extension/anofox_bayes/anofox_bayes.duckdb_extension
+        run: uv run pytest -v
+
+      - name: Upload the built extension on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anofox-bayes-extension-validation
+          path: build/release/extension/anofox_bayes/anofox_bayes.duckdb_extension
+          if-no-files-found: ignore
+          retention-days: 7

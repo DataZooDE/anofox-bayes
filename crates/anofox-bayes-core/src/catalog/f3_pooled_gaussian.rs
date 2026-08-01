@@ -10,13 +10,16 @@
 //! ```
 //!
 //! with a Normal-Inverse-Gamma prior on `(beta, sigma^2)`. The posterior is available
-//! in closed form, so no approximation and no sampler are involved:
+//! in closed form, so no approximation and no sampler are involved. The prior mean
+//! `b0` is fixed at zero — it is not a config slot, because a non-zero prior mean on
+//! a coefficient is a claim almost nobody can justify — which is why the `b0' P b0`
+//! term of the general formula does not appear below:
 //!
 //! ```text
 //!   A     = X'X + P                (P is the prior precision, zero for a flat prior)
 //!   b_n   = A^-1 (X'y + P b0)
-//!   a_n   = a0 + n/2
-//!   s_n   = s0 + (y'y + b0' P b0 - b_n' A b_n) / 2
+//!   a_n   = a0 + (n - k)/2         (k = coefficients carrying a flat prior)
+//!   s_n   = s0 + (y'y - b_n' X'y) / 2
 //!
 //!   sigma^2 | y  ~ InvGamma(a_n, s_n)
 //!   beta | sigma^2, y ~ N(b_n, sigma^2 A^-1)
@@ -29,7 +32,12 @@
 //! be pushed through `P(effect > threshold)` in SQL without further theory.
 //!
 //! **Pooling.** An optional `group` column adds one intercept per group, each with an
-//! independent `N(0, pool_scale^2)` prior. Small groups are therefore shrunk toward
+//! independent `N(0, sigma^2 * pool_scale^2)` prior. The scaling by `sigma^2` is what
+//! makes the prior conjugate — it is the `V0` of the Normal-Inverse-Gamma — and it
+//! means `pool_scale` is measured *in residual standard deviations*, not in the units
+//! of the response. A noisier dataset therefore pools more at the same `pool_scale`,
+//! which is the behaviour you want: the noisier the data, the less a single group's
+//! deviation should be believed. Small groups are therefore shrunk toward
 //! the population intercept and large ones are not, which is the partial pooling that
 //! makes a thin segment borrow strength instead of reporting noise. The pooling scale
 //! is *fixed by configuration, not estimated*: estimating it means a hierarchical
@@ -255,7 +263,23 @@ impl ModelFamily for PooledGaussian {
 
         let yty: f64 = y.iter().map(|v| v * v).sum();
         let bab: f64 = (0..p).map(|j| b_n[j] * xty[j]).sum();
-        let a_n = a0 + n as f64 / 2.0;
+        // Each coefficient carrying a *flat* prior costs one degree of freedom.
+        //
+        // Under the proper conjugate NIG prior, `beta | sigma^2 ~ N(b0, sigma^2 V0)`
+        // is scaled by sigma^2, so those coefficients act as prior observations and
+        // the shape is simply `a0 + n/2`. A flat coefficient is not sigma^2-scaled:
+        // estimating it consumes an observation's worth of information about the
+        // residual scale, and the textbook result is
+        // `sigma^2 | y ~ Inv-chi^2(n - k, s^2)` with `k` the number of freely
+        // estimated coefficients.
+        //
+        // Using `a0 + n/2` regardless makes the posterior for sigma too tight by
+        // sqrt((n - k)/n) -- an overconfident interval, which is the direction that
+        // matters: it is the one that produces service levels that quietly under-cover.
+        // Found by the PyMC parity suite; SBC could not see it, because SBC must draw
+        // the truth from a proper prior and the bug only appears under a flat one.
+        let n_flat = precision.iter().filter(|p| **p == 0.0).count();
+        let a_n = a0 + (n as f64 - n_flat as f64) / 2.0;
         // s_n = s0 + (y'y - b_n' X'y) / 2, which is s0 + RSS/2 for a flat prior. The
         // small negative values that rounding can produce are clamped: a residual sum
         // of squares is not negative, and letting one through would make the scale
@@ -683,6 +707,89 @@ mod tests {
         let view = frame.view(&refs);
         let err = compile(r#"{"y": "y", "intercept": 0}"#, &view).unwrap_err();
         assert!(err.to_string().contains("nothing to estimate"), "{err}");
+    }
+
+    /// The residual scale must match the textbook `sigma^2 | y ~ Inv-chi^2(n - k, s^2)`
+    /// under a flat prior, whose mean is `RSS / (n - k - 2)`. Using `n` in place of
+    /// `n - k` makes the posterior too tight by `sqrt((n - k)/n)`, which is an
+    /// overconfident interval -- the direction that produces service levels that
+    /// quietly under-cover.
+    #[test]
+    fn the_residual_scale_matches_the_textbook_inverse_chi_squared() {
+        let n = 24usize;
+        let x1: Vec<f64> = (0..n).map(|i| i as f64 / 3.0).collect();
+        let x2: Vec<f64> = (0..n).map(|i| ((i % 5) as f64) - 2.0).collect();
+        let y: Vec<f64> = (0..n)
+            .map(|i| 2.0 + 1.5 * x1[i] - 0.4 * x2[i] + ((i % 7) as f64 - 3.0) * 0.5)
+            .collect();
+
+        let frame = Frame::new(n)
+            .numeric("y", y.clone())
+            .numeric("x1", x1.clone())
+            .numeric("x2", x2.clone());
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = compile(r#"{"y": "y", "x": ["x1", "x2"]}"#, &view).unwrap();
+
+        let k = 3usize; // intercept + two slopes, all flat
+        let cols = draw(&*model, 200_000, 41);
+        let var: Vec<f64> = cols[index_of(&*model, "sigma")].iter().map(|s| s * s).collect();
+
+        // The degrees of freedom are what set the *shape*, so the scale-free
+        // signature to check is the coefficient of variation: for InvGamma(a, b) the
+        // mean is b/(a-1) and the sd is b/((a-1) sqrt(a-2)), so CV = 1/sqrt(a-2) --
+        // independent of `b`, and therefore of the residual sum of squares, which is
+        // exactly what makes it a clean test of `a_n` alone.
+        let m = var.iter().sum::<f64>() / var.len() as f64;
+        let sd = (var.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (var.len() - 1) as f64).sqrt();
+        let a_n = (n - k) as f64 / 2.0;
+        let expected_cv = 1.0 / (a_n - 2.0).sqrt();
+        let cv = sd / m;
+        assert!(
+            (cv - expected_cv).abs() < 0.03 * expected_cv,
+            "coefficient of variation {cv} vs Inv-chi^2(n-k) prediction {expected_cv}"
+        );
+
+        // And the wrong shape -- a_n = n/2, ignoring the flat coefficients -- would be
+        // visibly tighter. Pinning the distance from it is what stops the test from
+        // passing under the bug it was written to catch.
+        let wrong_cv = 1.0 / (n as f64 / 2.0 - 2.0).sqrt();
+        assert!(
+            (cv - wrong_cv).abs() > 0.03 * wrong_cv,
+            "cv {cv} must be distinguishable from the a_n = n/2 answer {wrong_cv}"
+        );
+    }
+
+    /// A *proper* coefficient prior is sigma^2-scaled, so it costs no degrees of
+    /// freedom and the shape stays `a0 + n/2`. The correction must apply only where
+    /// the prior is flat.
+    #[test]
+    fn a_proper_coefficient_prior_costs_no_degrees_of_freedom() {
+        let n = 24usize;
+        let frame = Frame::new(n)
+            .numeric("y", (0..n).map(|i| 2.0 + ((i % 7) as f64 - 3.0) * 0.5).collect())
+            .numeric("x1", (0..n).map(|i| i as f64 / 3.0).collect());
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        // intercept flat (always), slope proper -> one flat coefficient.
+        let model = compile(
+            r#"{"y": "y", "x": "x1", "prior": {"beta_scale": 1.0}}"#,
+            &view,
+        )
+        .unwrap();
+        let cols = draw(&*model, 200_000, 43);
+        let var: Vec<f64> = cols[index_of(&*model, "sigma")].iter().map(|s| s * s).collect();
+        let m = var.iter().sum::<f64>() / var.len() as f64;
+        let sd = (var.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (var.len() - 1) as f64).sqrt();
+
+        let a_n = (n as f64 - 1.0) / 2.0; // only the intercept is flat
+        let expected_cv = 1.0 / (a_n - 2.0).sqrt();
+        assert!(
+            (sd / m - expected_cv).abs() < 0.03 * expected_cv,
+            "cv {} vs expected {expected_cv}",
+            sd / m
+        );
     }
 
     #[test]

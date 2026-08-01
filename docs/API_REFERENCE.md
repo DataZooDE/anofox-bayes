@@ -276,7 +276,7 @@ must look at before acting on any of it.
 | `x` | column or list of columns | no | `[]` | Predictors. A bare string is accepted for a single predictor. |
 | `intercept` | flag | no | `1` | `0` drops the intercept. |
 | `group` | column | no | none | Adds one intercept per group, partially pooled. |
-| `pool_scale` | double | no | `1.0` | > 0. Standard deviation of the `N(0, pool_scale^2)` prior on each group intercept. |
+| `pool_scale` | double | no | `1.0` | > 0. Standard deviation of the `N(0, sigma^2 * pool_scale^2)` prior on each group intercept. |
 | `prior` | struct | no | flat | See below. |
 | `draws`, `seed`, `engine` | | | | [§1.2](#12-common-config-slots) |
 
