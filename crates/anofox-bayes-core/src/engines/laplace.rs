@@ -492,20 +492,257 @@ mod tests {
         });
     }
 
+    //=== conjugate_anomaly ================================================//
+    //
+    // F7's posterior is closed form too, so the same two-independent-derivations gate
+    // applies to it. What differs from F3 is the arithmetic of *how closely* they may
+    // be expected to agree, which is worked out per parameter below rather than
+    // assumed.
+
+    /// Mean and sample standard deviation of parameter `j` in a draws buffer.
+    fn summarise(values: &[f64], p: usize, j: usize) -> (f64, f64) {
+        let col: Vec<f64> = values.chunks(p).map(|c| c[j]).collect();
+        let m = col.iter().sum::<f64>() / col.len() as f64;
+        let sd = (col.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (col.len() - 1) as f64).sqrt();
+        (m, sd)
+    }
+
+    /// Compile F7 over `n` synthetic observations and return both engines' summaries
+    /// per parameter, as `(exact_mean, exact_sd, laplace_mean, laplace_sd)`.
+    fn f7_engines(cfg: &str, f: &Frame, seed: u64) -> Vec<(f64, f64, f64, f64)> {
+        let refs = f.key_refs();
+        let view = f.view(refs.as_slice());
+        let model = crate::catalog::f7_conjugate::ConjugateAnomaly
+            .compile(&Config::parse(cfg).unwrap(), &view)
+            .unwrap();
+        let opts = SampleOptions {
+            n_chains: 1,
+            n_draws: 200_000,
+            seed,
+        };
+        let exact = ExactEngine.sample(&*model, &opts).unwrap();
+        let laplace = LaplaceEngine.sample(&*model, &opts).unwrap();
+        let p = model.param_names().len();
+        (0..p)
+            .map(|j| {
+                let (em, esd) = summarise(&exact.values, p, j);
+                let (lm, lsd) = summarise(&laplace.values, p, j);
+                (em, esd, lm, lsd)
+            })
+            .collect()
+    }
+
+    fn normal_frame(n: usize) -> Frame {
+        // Deterministic, and genuinely spread out: a sinusoid at an irrational-ish
+        // step never repeats over the sample sizes used here.
+        Frame::new(n).numeric(
+            "cost",
+            (0..n)
+                .map(|i| 12.0 + (i as f64 * 0.7).sin() * 1.5 + (i as f64 * 0.13).cos())
+                .collect(),
+        )
+    }
+
+    /// **The correctness gate this family did not have.** `conjugate_anomaly`'s
+    /// posterior is closed form, so the Laplace engine serving it makes the two engines
+    /// two independent derivations of one distribution -- one of them exact.
+    ///
+    /// **Tolerance and why.** Under the reference prior `alpha_n = (n-1)/2` and
+    /// `kappa_n = n`, and the Laplace covariance is the inverse curvature at the mode.
+    /// Both are closed form, so how far apart the engines may legitimately be is
+    /// derived rather than guessed:
+    ///
+    /// * `mu` -- both engines centre on `mu_n` exactly, so the means differ only by
+    ///   Monte Carlo error. The spreads differ by a factor that is available in closed
+    ///   form: the exact marginal is Student-t with variance
+    ///   `beta_n / (kappa_n (alpha_n - 1))`, the Laplace one is Gaussian with variance
+    ///   `2 beta_n / (kappa_n (2 alpha_n + 1))`, so
+    ///   `sd_laplace / sd_exact = sqrt((n-3)/n)`, i.e. **0.38 % low at n = 400**
+    ///   against 0.51 % measured, the gap being Monte Carlo noise. Where the effect is
+    ///   large enough to swamp the noise the prediction is exact: 0.29289 predicted
+    ///   against 0.29288 measured at n = 6.
+    /// * `sigma` -- Laplace draws it as `exp` of a Gaussian in `u = log sigma` with
+    ///   `Var(u) = 1/(2 (2 alpha_n + 1))`, while the exact marginal is a scaled inverse
+    ///   chi. Working the two through: the mean is **0.25 % low** and the sd **0.70 %
+    ///   low** at n = 400 (measured 0.24 % and 0.68 %).
+    ///
+    /// Monte Carlo error over 200 000 draws is ~0.22 % of an sd on a mean and ~0.16 %
+    /// of an sd on an sd, from each engine. **1 % on means and 2 % on spreads** is
+    /// therefore about three times the largest genuine discrepancy and six times the
+    /// noise floor. Both engines are seeded, so there is no flake to guard against;
+    /// the headroom exists so that the bound tracks the approximation rather than a
+    /// particular sample. These are the same numbers used for `pooled_gaussian` above,
+    /// which is not a coincidence -- both families are Normal-Inverse-Gamma.
+    ///
+    /// **What this gate does not catch, and why the family's own tests exist.** A
+    /// missing log-Jacobian shifts `alpha_n` by one, which is an `O(1/n)` change --
+    /// the same order as the approximation error being measured here, and at n = 400
+    /// it moves both the mean and the sd of `sigma` by only 0.25 %. Verified by
+    /// mutation: dropping the Jacobian leaves *this* test green and fails
+    /// `f7_conjugate::tests::the_normal_log_density_matches_the_closed_form_posterior_up_to_a_constant`.
+    /// Two-engine agreement is a strong gate against sign errors and mis-assembled
+    /// hyperparameters, and a weak one against anything that only perturbs a shape
+    /// parameter. It is not a substitute for checking the density itself.
     #[test]
-    fn a_family_without_a_gradient_is_refused_rather_than_approximated() {
-        // The conjugate anomaly family exposes no differentiable log posterior.
-        let f = Frame::new(6).numeric("cost", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    fn the_laplace_engine_agrees_with_the_exact_conjugate_posterior_for_the_normal_likelihood() {
+        let names = ["mu", "sigma"];
+        for (j, (em, esd, lm, lsd)) in f7_engines(r#"{"value": "cost"}"#, &normal_frame(400), 37)
+            .into_iter()
+            .enumerate()
+        {
+            let name = names[j];
+            assert!(
+                (em - lm).abs() < 0.01 * em.abs().max(esd),
+                "{name}: exact mean {em} vs laplace {lm} (exact sd {esd})"
+            );
+            assert!(
+                (esd - lsd).abs() < 0.02 * esd,
+                "{name}: exact sd {esd} vs laplace {lsd}"
+            );
+        }
+    }
+
+    /// The Poisson half. `lambda ~ Gamma(a_n, rate b_n)` exactly; Laplace fits a
+    /// Gaussian to `v = log lambda`, where the curvature at the mode is exactly `a_n`,
+    /// so it draws `lambda` lognormal with `mean = (a_n/b_n) exp(1/(2 a_n))` against an
+    /// exact mean of `a_n/b_n`. The relative error is `1/(2 a_n)` on the mean and
+    /// `~3/(4 a_n)` on the spread. With `a_n = 0.5 + sum(y) ~ 2000` here that is
+    /// **0.025 % and 0.04 %**, both *below* the ~0.16 % Monte Carlo floor at this draw
+    /// count -- so for a well-observed rate the two engines are not merely close, they
+    /// are indistinguishable, and the 1 % / 2 % bounds are measuring nothing but the
+    /// absence of a mistake. Where the approximation does bite is small counts:
+    /// `1/(2 a_n)` is 4.76 % at `a_n = 10.5`, and a four-observation group measures
+    /// 4.82 %.
+    #[test]
+    fn the_laplace_engine_agrees_with_the_exact_conjugate_posterior_for_the_poisson_likelihood() {
+        let n = 400;
+        let f = Frame::new(n)
+            .numeric("claims", (0..n).map(|i| ((i % 9) + 1) as f64).collect())
+            .numeric(
+                "consignments",
+                (0..n).map(|i| 5.0 + (i % 4) as f64).collect(),
+            );
+        let summaries = f7_engines(
+            r#"{"value": "claims", "likelihood": "poisson", "exposure": "consignments"}"#,
+            &f,
+            41,
+        );
+        assert_eq!(summaries.len(), 1);
+        let (em, esd, lm, lsd) = summaries[0];
+        assert!(
+            (em - lm).abs() < 0.01 * em.abs().max(esd),
+            "lambda: exact mean {em} vs laplace {lm} (exact sd {esd})"
+        );
+        assert!(
+            (esd - lsd).abs() < 0.02 * esd,
+            "lambda: exact sd {esd} vs laplace {lsd}"
+        );
+    }
+
+    /// **Where the approximation is not admissible, measured.** The agreement above is
+    /// a statement about a well-observed group, and `conjugate_anomaly` exists to look
+    /// at groups that are *not* well observed. `1 - sqrt((n-3)/n)` is 0.4 % at n = 400
+    /// and **29 % at n = 6** -- measured 0.2929 against a predicted 0.29289. A thin
+    /// lane's Laplace interval for `mu` is nearly a third too narrow, and `sigma` is
+    /// worse: 44 % on the sd and 20 % on the mean at n = 6. Too narrow is the direction
+    /// that turns "this lane is behaving oddly" into a false alarm and "this lane is
+    /// fine" into an unearned all-clear.
+    ///
+    /// This is a finding, not a defect: the closed form says the error must be this
+    /// size, and the measurement agrees to four digits. It is why `exact` remains the
+    /// family's default, and why this test pins the error rather than tolerating it
+    /// silently.
+    #[test]
+    fn the_laplace_spread_on_a_thin_group_is_far_too_narrow_and_the_error_shrinks_with_the_group() {
+        let error_at = |n: usize| {
+            let s = f7_engines(r#"{"value": "cost"}"#, &normal_frame(n), 43);
+            let (_, esd, _, lsd) = s[0]; // mu
+            (esd - lsd) / esd
+        };
+
+        // Predicted 1 - sqrt((n-3)/n): 0.35 at n = 6, 0.0038 at n = 400.
+        let thin = error_at(6);
+        let thick = error_at(400);
+        assert!(
+            thin > 0.2,
+            "at n = 6 the Laplace spread for mu should be visibly too narrow, got {thin}"
+        );
+        assert!(
+            thick < 0.02,
+            "at n = 400 the error should be negligible, got {thick}"
+        );
+        assert!(
+            thin / thick > 10.0,
+            "the error should shrink sharply with the group: {thin} at n = 6 vs {thick} at n = 400"
+        );
+    }
+
+    /// A group whose posterior does not exist must not take the rest of the fit down
+    /// with it. Its coordinates are excluded from the unconstrained vector entirely, so
+    /// the mode search and the Cholesky never see a `NaN` -- and the group comes back
+    /// NULL-shaped, the same answer the exact engine gives.
+    #[test]
+    fn an_unfittable_group_draws_null_under_laplace_without_poisoning_the_others() {
+        let f = Frame::new(7)
+            .numeric("cost", vec![1.0, 1.2, 0.9, 1.1, 1.05, 0.95, 42.0])
+            .key("lane", vec!["A", "A", "A", "A", "A", "A", "SOLO"]);
         let refs = f.key_refs();
         let view = f.view(&refs);
         let model = crate::catalog::f7_conjugate::ConjugateAnomaly
-            .compile(&Config::parse(r#"{"value": "cost"}"#).unwrap(), &view)
+            .compile(
+                &Config::parse(r#"{"value": "cost", "group": "lane"}"#).unwrap(),
+                &view,
+            )
             .unwrap();
 
-        assert!(!LaplaceEngine.supports(&*model));
-        let err = LaplaceEngine
-            .sample(&*model, &SampleOptions::default())
-            .unwrap_err();
-        assert!(err.to_string().contains("differentiable"), "{err}");
+        let sample = LaplaceEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 1,
+                    n_draws: 1000,
+                    seed: 47,
+                },
+            )
+            .unwrap();
+        let p = model.param_names().len();
+        assert_eq!(p, 4); // (mu, sigma) for A and for SOLO
+        for row in sample.values.chunks(p) {
+            assert!(row[0].is_finite() && row[1] > 0.0, "lane A: {row:?}");
+            assert!(row[2].is_nan() && row[3].is_nan(), "SOLO: {row:?}");
+        }
+    }
+
+    /// With `conjugate_anomaly` differentiable, no shipped family declines the Laplace
+    /// engine any more -- so the invariant worth asserting is the positive one: every
+    /// family in the closed catalog carries the two-engine cross-check. A family added
+    /// without a `LogPosterior` fails here and has to justify itself.
+    #[test]
+    fn every_family_in_the_catalog_can_be_served_by_both_engines() {
+        let f = Frame::new(8)
+            .numeric("y", vec![1.0, 2.0, 3.5, 4.0, 5.5, 6.0, 7.5, 8.0])
+            .numeric("cost", vec![1.0, 2.0, 3.5, 4.0, 5.5, 6.0, 7.5, 8.0])
+            .numeric("x1", vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+
+        for (family, cfg) in [
+            ("pooled_gaussian", r#"{"y": "y", "x": "x1"}"#),
+            ("conjugate_anomaly", r#"{"value": "cost"}"#),
+        ] {
+            let model = crate::catalog::lookup(family)
+                .unwrap()
+                .compile(&Config::parse(cfg).unwrap(), &view)
+                .unwrap();
+            assert!(
+                LaplaceEngine.supports(&*model),
+                "{family} must expose a differentiable log posterior"
+            );
+            assert!(
+                crate::engines::ExactEngine.supports(&*model),
+                "{family} must expose a closed-form posterior"
+            );
+        }
+        assert_eq!(crate::catalog::all().len(), 2, "a family was added");
     }
 }

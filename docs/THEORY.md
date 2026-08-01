@@ -190,14 +190,14 @@ on the `__engine__` row so a reviewer can see which one ran.
 | Engine | What it does | Status |
 |---|---|---|
 | `exact` | Samples the closed-form posterior directly. No approximation. | default for both families |
-| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on `pooled_gaussian` |
+| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on both families |
 | `nuts` | General-purpose sampler for models with no closed form. | planned (0.2) |
 
 Where a closed form exists, `exact` is both faster and more accurate, so it is the
 default. `laplace` exists because it generalises to families that have no closed form
-— and, in the meantime, because it provides an **independent check**: on
-`pooled_gaussian` both engines describe the same posterior by different routes, and
-they are tested to agree.
+— and, in the meantime, because it provides an **independent check**: both shipped
+families are conjugate, so both engines describe the same posterior by different
+routes, and they are tested to agree.
 
 **When is the approximation good enough?** Measured, not asserted. On
 `pooled_gaussian` the two engines agree on every coefficient to well under a percent
@@ -206,6 +206,16 @@ coefficient is a Student-t, and Laplace returns its Gaussian limit, so it slight
 *understates* how wide a 99 % interval should be. The scale parameter carries a
 separate O(1/n) discrepancy, measured falling from ~5 % at n = 20 to ~0.1 % at
 n = 2 000.
+
+On `conjugate_anomaly` the same comparison has a closed-form answer, and the
+measurement matches it to four digits: the Laplace spread for `mu` is too narrow by
+exactly `1 − √((n−3)/n)` **per group** — 0.4 % on a group of 400 observations and
+**29 % on a group of 6**, with `sigma` worse still (44 % on the spread, 20 % on the
+mean, at n = 6). Since this family fits every group independently, the relevant `n` is
+the group's own observation count, not the size of the table. That is a strong reason
+to leave `exact` in place here: an anomaly model earns its keep on exactly the thin
+lanes where the approximation is worst, and too narrow is the direction that
+manufactures both false alarms and unearned all-clears.
 
 > **In detail.** Laplace works on an unconstrained scale — `sigma` is sampled as
 > `log sigma`, so every draw is positive by construction; a Gaussian fitted directly to

@@ -124,7 +124,7 @@ load-bearing when the NUTS engine lands. Memory scales linearly with it.
 | Value | Status |
 |---|---|
 | `exact` | **Available**, and the default for both families. Samples the closed-form conjugate posterior directly — no approximation, so where it applies it is both faster and more accurate. |
-| `laplace` | **Available on `pooled_gaussian`.** Fits a Gaussian at the posterior mode on an unconstrained scale. `conjugate_anomaly` exposes no gradient and rejects it: *"the laplace engine cannot serve family 'conjugate_anomaly'"*. |
+| `laplace` | **Available on both families.** Fits a Gaussian at the posterior mode on an unconstrained scale. Neither family needs it — both are conjugate — so on both it serves as an independent check on the exact posterior rather than as the way to fit. |
 | `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2. Until then use 'exact' … or 'laplace' …"*. |
 
 Switching engines changes no caller SQL: same function, same output columns, same
@@ -136,7 +136,12 @@ warranties must not share an identity.
 n = 400. Where they differ is the tails at small n — the exact marginal is a Student-t
 and Laplace returns its Gaussian limit, so it slightly *understates* a 99 % interval —
 and in the scale parameter, whose discrepancy falls from ~5 % at n = 20 to ~0.1 % at
-n = 2000. Both engines have their own calibration suite. See
+n = 2000. On `conjugate_anomaly` the answer is closed form and less comfortable: the
+Laplace spread for `mu` is too narrow by exactly `1 - sqrt((n-3)/n)`, where `n` is the
+**group's own** observation count, since this family fits each group independently.
+That is 0.4 % on a group of 400 and 29 % on a group of 6, with `sigma` worse still.
+Prefer `exact` here — it is the default, it is faster, and a thin lane is precisely
+what an anomaly model is looking at. Both engines have their own calibration suite. See
 [Theory §5](THEORY.md#5-engines).
 
 `__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts.

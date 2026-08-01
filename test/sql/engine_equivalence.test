@@ -102,17 +102,42 @@ SELECT value = 0 FROM laplace_draws WHERE param = '__status__';
 true
 
 #######################################
-# An engine that cannot serve a family says so
+# Both shipped families carry the cross-check
 #######################################
 
-# The conjugate anomaly family has no differentiable log posterior, so Laplace
-# declines rather than silently substituting something else.
-statement error
+# `conjugate_anomaly`'s posterior is closed form too, so the Laplace engine serving it
+# makes the two engines two independent derivations of one distribution here as well.
+statement ok
+CREATE TABLE f7_exact AS
 SELECT * FROM anofox_bayes_fit(
     (SELECT y FROM obs), 'conjugate_anomaly',
-    {'value': 'y', 'engine': 'laplace', 'draws': 100});
+    {'value': 'y', 'draws': 20000, 'seed': 5, 'engine': 'exact'});
+
+statement ok
+CREATE TABLE f7_laplace AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT y FROM obs), 'conjugate_anomaly',
+    {'value': 'y', 'draws': 20000, 'seed': 5, 'engine': 'laplace'});
+
+# With 400 observations in the group they agree to well under a percent. They would
+# not on a thin group: this family fits each group independently, so the relevant
+# sample size is the group's own, and the Laplace spread for `mu` is too narrow by
+# 1 - sqrt((n-3)/n) -- 29 % at n = 6. That is why `exact` stays the default here.
+query III
+SELECT e.param,
+       abs(e.m - l.m) < 0.01 * abs(e.m)  AS means_agree,
+       abs(e.s - l.s) < 0.03 * e.s       AS spreads_agree
+FROM (SELECT param, avg(value) m, stddev_samp(value) s FROM f7_exact   WHERE draw >= 0 GROUP BY param) e
+JOIN (SELECT param, avg(value) m, stddev_samp(value) s FROM f7_laplace WHERE draw >= 0 GROUP BY param) l
+  USING (param)
+ORDER BY e.param;
 ----
-cannot serve
+mu	true	true
+sigma	true	true
+
+#######################################
+# An engine that does not exist yet says so
+#######################################
 
 # NUTS arrives in 0.2, and asking for it today is an error rather than a quiet
 # downgrade to an approximation with a different warranty.

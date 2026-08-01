@@ -33,9 +33,12 @@ tables persisted by a customer stay readable across extension upgrades.
 **Engines**
 
 - `exact` — closed-form sampling for conjugate families; the default for both.
-- `laplace` — MAP plus curvature on an unconstrained scale, available on
-  `pooled_gaussian`. Checked against the exact posterior, which is the strongest
-  correctness gate in the suite: two independent derivations of one distribution.
+- `laplace` — MAP plus curvature on an unconstrained scale, available on **both**
+  families. Neither needs it, since both are conjugate; it is there because checking
+  it against the exact posterior is the strongest correctness gate in the suite, two
+  independent derivations of one distribution. On `conjugate_anomaly` the size of the
+  disagreement is itself closed form (`1 - sqrt((n-3)/n)` on the spread of `mu`, per
+  group), and the measurement matches it to four digits.
 
 **Validation**
 
