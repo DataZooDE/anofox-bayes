@@ -36,6 +36,19 @@ const char *anofox_bayes_ffi_version(void);
 // Version of the long-format draws contract (docs/DRAWS_CONTRACT.md).
 int32_t anofox_bayes_ffi_draws_schema_version(void);
 
+// Selector for anofox_bayes_ffi_diagnostic.
+#define ANOFOX_BAYES_DIAGNOSTIC_RHAT 0
+#define ANOFOX_BAYES_DIAGNOSTIC_ESS_BULK 1
+#define ANOFOX_BAYES_DIAGNOSTIC_ESS_TAIL 2
+
+// Compute one convergence diagnostic from unordered (value, chain, draw) triples.
+// Returns false only on a misuse (null out-pointers, unknown kind). *out_defined is
+// false when the statistic does not exist for this input -- a single chain has no
+// R-hat -- which the caller must surface as SQL NULL rather than as a number.
+bool anofox_bayes_ffi_diagnostic(int32_t kind, const double *values, const int32_t *chains,
+                                 const int32_t *draws, size_t n, double *out_value,
+                                 bool *out_defined);
+
 #ifdef __cplusplus
 }
 #endif

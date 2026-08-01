@@ -9,6 +9,9 @@ class ExtensionLoader;
 // --- Scalar functions -------------------------------------------------------
 void RegisterVersionFunctions(ExtensionLoader &loader);
 
+// --- Aggregate functions ----------------------------------------------------
+void RegisterDiagnosticAggregates(ExtensionLoader &loader);
+
 // Extension class required for static linking
 class AnofoxBayesExtension : public Extension {
 public:

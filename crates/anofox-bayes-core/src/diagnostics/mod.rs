@@ -134,6 +134,63 @@ impl ParamDiagnostics {
     }
 }
 
+/// Rebuild ordered chains from the unordered `(value, chain, draw)` triples that a
+/// SQL aggregate sees.
+///
+/// This is why the aggregates take three arguments rather than the one the BRD
+/// sketched. DuckDB makes no promise about the order in which rows reach an aggregate
+/// state — it parallelises, and it may combine partial states in any order — but every
+/// statistic here is a function of the *sequence*: R̂ splits each chain at its
+/// midpoint, and ESS is an autocorrelation. Fed shuffled rows, both would report
+/// excellent numbers for a badly mixed fit, because shuffling destroys exactly the
+/// autocorrelation they exist to detect. Reconstructing the order from the explicit
+/// `draw` index is the only way an aggregate can compute them honestly.
+///
+/// Rows with a negative `chain` or `draw` are the reserved metadata rows of the draws
+/// contract, and are skipped — so `GROUP BY param` over a whole draws table is safe
+/// without a `WHERE draw >= 0` filter.
+///
+/// Returns an empty vector when the input cannot form equal-length chains, which the
+/// callers translate into "not assessable" rather than into a number.
+pub fn chains_from_rows(values: &[f64], chains: &[i32], draws: &[i32]) -> Vec<Vec<f64>> {
+    if values.len() != chains.len() || values.len() != draws.len() {
+        return Vec::new();
+    }
+
+    // Group by chain id, keeping (draw, value) so the sequence can be restored.
+    let mut by_chain: std::collections::BTreeMap<i32, Vec<(i32, f64)>> = Default::default();
+    for i in 0..values.len() {
+        if chains[i] < 0 || draws[i] < 0 {
+            continue;
+        }
+        by_chain
+            .entry(chains[i])
+            .or_default()
+            .push((draws[i], values[i]));
+    }
+    if by_chain.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(by_chain.len());
+    let mut expected: Option<usize> = None;
+    for (_, mut rows) in by_chain {
+        rows.sort_by_key(|(draw, _)| *draw);
+        // A duplicated draw index means the caller joined something twice; the
+        // resulting "chain" is not a sequence and no honest statistic exists for it.
+        if rows.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Vec::new();
+        }
+        match expected {
+            None => expected = Some(rows.len()),
+            Some(n) if n == rows.len() => {}
+            Some(_) => return Vec::new(),
+        }
+        out.push(rows.into_iter().map(|(_, v)| v).collect());
+    }
+    out
+}
+
 /// Compute diagnostics for every parameter of a posterior.
 pub fn diagnose(post: &Posterior) -> Vec<ParamDiagnostics> {
     (0..post.n_params())
@@ -237,6 +294,68 @@ mod tests {
             ess_tail: 4000.0,
         };
         assert!(!d.passes(&t));
+    }
+
+    /// The reason the aggregates take `(value, chain, draw)`. Rows arrive from
+    /// DuckDB in arbitrary order; if the order were taken as given, an AR(1) chain
+    /// shuffled by the executor would look independent and ESS would certify a badly
+    /// mixed fit as well sampled.
+    #[test]
+    fn shuffled_rows_are_restored_to_their_draw_order() {
+        let chain0 = ar1_chain(1, 200, 0.9, 0.0);
+        let chain1 = ar1_chain(2, 200, 0.9, 0.0);
+
+        let mut values = Vec::new();
+        let mut chains = Vec::new();
+        let mut draws = Vec::new();
+        // Interleave and reverse: a plausible shape for parallel partial states.
+        for d in (0..200).rev() {
+            values.push(chain1[d]);
+            chains.push(1);
+            draws.push(d as i32);
+            values.push(chain0[d]);
+            chains.push(0);
+            draws.push(d as i32);
+        }
+
+        let restored = chains_from_rows(&values, &chains, &draws);
+        assert_eq!(restored, vec![chain0.clone(), chain1.clone()]);
+
+        // And the point of restoring it: the shuffled sequence would have looked
+        // independent, while the restored one shows its autocorrelation.
+        let shuffled: Vec<Vec<f64>> = vec![
+            values.iter().step_by(2).copied().collect(),
+            values.iter().skip(1).step_by(2).copied().collect(),
+        ];
+        assert!(
+            ess_bulk(&restored) < ess_bulk(&shuffled),
+            "restoring draw order must expose autocorrelation the shuffle hid"
+        );
+    }
+
+    /// `GROUP BY param` over a whole draws table sees the reserved metadata rows too.
+    /// They carry `chain = draw = -1` and must not be mistaken for draws.
+    #[test]
+    fn reserved_metadata_rows_are_skipped_rather_than_treated_as_draws() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 999.0];
+        let chains = vec![0, 0, 0, 0, -1];
+        let draws = vec![0, 1, 2, 3, -1];
+        assert_eq!(
+            chains_from_rows(&values, &chains, &draws),
+            vec![vec![1.0, 2.0, 3.0, 4.0]]
+        );
+    }
+
+    #[test]
+    fn input_that_is_not_a_set_of_equal_length_chains_is_not_assessable() {
+        // Ragged chains.
+        assert!(chains_from_rows(&[1.0, 2.0, 3.0], &[0, 0, 1], &[0, 1, 0]).is_empty());
+        // A duplicated draw index -- the caller joined something twice.
+        assert!(chains_from_rows(&[1.0, 2.0], &[0, 0], &[0, 0]).is_empty());
+        // Mismatched column lengths.
+        assert!(chains_from_rows(&[1.0, 2.0], &[0], &[0, 1]).is_empty());
+        // Nothing but metadata.
+        assert!(chains_from_rows(&[1.0], &[-1], &[-1]).is_empty());
     }
 
     #[test]

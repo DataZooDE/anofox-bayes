@@ -69,6 +69,7 @@ void LoadInternal(ExtensionLoader &loader) {
 #endif // ANOFOX_TELEMETRY_ENABLED
 
 	RegisterVersionFunctions(loader);
+	RegisterDiagnosticAggregates(loader);
 }
 
 void AnofoxBayesExtension::Load(ExtensionLoader &loader) {

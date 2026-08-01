@@ -1,0 +1,193 @@
+# name: test/sql/diagnostics.test
+# description: Convergence diagnostics as SQL aggregates -- the agent's quality gate
+# group: [sql]
+
+require anofox_bayes
+
+# Every fixture below is built from setseed()+random(), so the numbers are the same
+# on every run and every platform. The assertions are inequalities rather than exact
+# values: what matters is that a well-mixed fit passes the gate and a badly mixed one
+# does not, not that R-hat lands on a particular digit.
+
+statement ok
+SELECT setseed(0.42);
+
+#######################################
+# Fixture: four well-mixed chains
+#######################################
+
+# Independent draws from the same distribution: the chains agree, so R-hat is ~1 and
+# ESS is close to the raw draw count.
+statement ok
+CREATE TABLE mixed AS
+SELECT
+    (i // 1000)::INTEGER AS chain,
+    (i % 1000)::INTEGER  AS draw,
+    'mu'                 AS param,
+    random()             AS value
+FROM generate_series(0, 3999) AS t(i);
+
+query I
+SELECT anofox_bayes_rhat(value, chain, draw) < 1.01 FROM mixed;
+----
+true
+
+query I
+SELECT anofox_bayes_ess_bulk(value, chain, draw) > 3000 FROM mixed;
+----
+true
+
+#######################################
+# Fixture: chains stuck in different places
+#######################################
+
+# The headline failure mode. Chain 1 never visits the region chain 0 explores, so the
+# between-chain variance swamps the within-chain variance.
+statement ok
+CREATE TABLE separated AS
+SELECT
+    (i // 1000)::INTEGER AS chain,
+    (i % 1000)::INTEGER  AS draw,
+    'mu'                 AS param,
+    random() + (i // 1000) * 5.0 AS value
+FROM generate_series(0, 1999) AS t(i);
+
+query I
+SELECT anofox_bayes_rhat(value, chain, draw) > 1.5 FROM separated;
+----
+true
+
+# ...and therefore the gate rejects it.
+query I
+SELECT anofox_bayes_rhat(value, chain, draw) <= 1.01 FROM separated;
+----
+false
+
+#######################################
+# Fixture: one strongly autocorrelated chain
+#######################################
+
+# An AR(1) chain has the same stationary distribution as an independent one -- the
+# histogram, mean and variance all look fine. Only the autocorrelation reveals that
+# 2000 draws are worth far fewer, which is exactly what ESS is for.
+statement ok
+CREATE TABLE sticky AS
+WITH RECURSIVE ar1(i, x) AS (
+    SELECT 0, random()
+    UNION ALL
+    SELECT i + 1, 0.95 * x + random() FROM ar1 WHERE i < 1999
+)
+SELECT 0::INTEGER AS chain, i::INTEGER AS draw, 'mu' AS param, x AS value FROM ar1;
+
+query I
+SELECT anofox_bayes_ess_bulk(value, chain, draw) < 500 FROM sticky;
+----
+true
+
+# The same values, permuted, look independent: shuffling destroys exactly the
+# autocorrelation ESS exists to detect. This is why the aggregates take an explicit
+# draw index instead of trusting arrival order -- fed a shuffle, the estimator would
+# certify this badly mixed chain as well sampled.
+query I
+SELECT anofox_bayes_ess_bulk(value, chain, draw)
+     < (SELECT anofox_bayes_ess_bulk(value, chain, draw)
+        FROM (SELECT chain, row_number() OVER (ORDER BY hash(draw)) - 1 AS draw, value FROM sticky))
+FROM sticky;
+----
+true
+
+#######################################
+# Row order must not change the answer
+#######################################
+
+# DuckDB gives no ordering guarantee to an aggregate and may combine partial states in
+# any order. The diagnostic must be a function of (chain, draw), not of arrival order.
+query I
+SELECT abs(
+         (SELECT anofox_bayes_ess_bulk(value, chain, draw) FROM sticky)
+       - (SELECT anofox_bayes_ess_bulk(value, chain, draw)
+          FROM (SELECT * FROM sticky ORDER BY value DESC))
+       ) < 1e-9;
+----
+true
+
+#######################################
+# Undefined statistics are NULL, never a reassuring number
+#######################################
+
+# A single chain has no between-chain variance, so split R-hat over chains does not
+# exist. Returning 1.0 here would tell an agent "converged" about something never
+# computed.
+query I
+SELECT anofox_bayes_rhat(value, chain, draw) IS NULL FROM sticky;
+----
+true
+
+# Too few draws to assess.
+query I
+SELECT anofox_bayes_ess_bulk(value, chain, draw) IS NULL
+FROM (SELECT 0 AS chain, i AS draw, i::DOUBLE AS value FROM generate_series(0, 2) AS t(i));
+----
+true
+
+# An empty group.
+query I
+SELECT anofox_bayes_rhat(value, chain, draw) IS NULL FROM mixed WHERE false;
+----
+true
+
+#######################################
+# Reserved metadata rows are not draws
+#######################################
+
+# GROUP BY param over a whole draws table also sees the __-prefixed metadata rows,
+# which carry chain = draw = -1. They must not perturb the statistic.
+statement ok
+CREATE TABLE with_meta AS
+SELECT * FROM mixed
+UNION ALL
+SELECT -1, -1, 'mu', 999999.0;
+
+query I
+SELECT abs(
+         (SELECT anofox_bayes_ess_bulk(value, chain, draw) FROM with_meta)
+       - (SELECT anofox_bayes_ess_bulk(value, chain, draw) FROM mixed)
+       ) < 1e-9;
+----
+true
+
+#######################################
+# The gate as an agent would write it
+#######################################
+
+# One query, one row per parameter, pass/fail against configurable thresholds. This
+# is the shape a deterministic workflow node enforces.
+statement ok
+CREATE TABLE draws AS
+SELECT * FROM mixed
+UNION ALL
+SELECT chain, draw, 'theta', value * 3.0 FROM mixed;
+
+query IIII
+SELECT param,
+       anofox_bayes_rhat(value, chain, draw) <= 1.01      AS rhat_ok,
+       anofox_bayes_ess_bulk(value, chain, draw) >= 400   AS bulk_ok,
+       anofox_bayes_ess_tail(value, chain, draw) >= 400   AS tail_ok
+FROM draws
+GROUP BY param
+ORDER BY param;
+----
+mu	true	true	true
+theta	true	true	true
+
+#######################################
+# Divergences need no new function
+#######################################
+
+# The draws contract stores divergences as a reserved parameter, so counting them is
+# plain SQL. A NUTS fit with any divergence is not safe to act on.
+query I
+SELECT coalesce(sum(value), 0) = 0
+FROM draws WHERE param = '__divergent__';
+----
+true
