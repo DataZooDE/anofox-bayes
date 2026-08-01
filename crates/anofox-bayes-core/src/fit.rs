@@ -134,6 +134,17 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         ));
     }
 
+    if sample_from == SampleFrom::Prior && !engine.can_sample_prior() {
+        return Err(BayesError::config(
+            "sample_from",
+            format!(
+                "the {} engine cannot draw from a prior; a prior-predictive check \
+                 needs the exact engine, which is available for conjugate families",
+                engine_kind.as_str()
+            ),
+        ));
+    }
+
     let opts = SampleOptions {
         n_chains,
         n_draws,
@@ -652,5 +663,49 @@ mod tests {
             .rows()
             .filter(|r| r.draw >= 0)
             .all(|r| r.value.is_finite()));
+    }
+    /// A prior-predictive request that the engine cannot honour must be refused.
+    ///
+    /// The dangerous case, and the reason this is checked centrally rather than per
+    /// family: only the exact engine knows how to draw from a prior. A Laplace or
+    /// NUTS fit given `sample_from: 'prior'` would otherwise run normally and return
+    /// the *posterior*, correctly shaped, correctly graded, with a `__sample_from__`
+    /// row claiming it is the prior. A pre-fit gate that silently agrees with the
+    /// data it is meant to be checked against is worse than no gate at all.
+    #[test]
+    fn a_prior_predictive_is_refused_by_an_engine_that_cannot_draw_from_a_prior() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(
+            r#"{"value": "cost", "group": "lane", "engine": "laplace",
+                "sample_from": "prior",
+                "prior": {"mu0": 2.0, "kappa0": 2.0, "alpha0": 3.0, "beta0": 2.0}}"#,
+        )
+        .unwrap();
+
+        let err = fit("conjugate_anomaly", &cfg, &view).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("laplace") && msg.contains("prior"),
+            "the refusal must name the engine and the request: {msg}"
+        );
+    }
+
+    /// ...and the same request on the exact engine goes through, so the test above is
+    /// about the engine rather than about the slot being rejected everywhere.
+    #[test]
+    fn the_exact_engine_serves_the_same_prior_predictive_request() {
+        let frame = freight_frame();
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = Config::parse(
+            r#"{"value": "cost", "group": "lane", "sample_from": "prior",
+                "prior": {"mu0": 2.0, "kappa0": 2.0, "alpha0": 3.0, "beta0": 2.0}}"#,
+        )
+        .unwrap();
+
+        let f = fit("conjugate_anomaly", &cfg, &view).unwrap();
+        assert_eq!(f.posterior.meta.sample_from, SampleFrom::Prior);
     }
 }

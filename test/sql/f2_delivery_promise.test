@@ -90,7 +90,7 @@ value	DOUBLE
 query I
 SELECT count(*) FROM draws;
 ----
-18010
+18011
 
 query I
 SELECT count(DISTINCT model_id) FROM draws;
@@ -317,12 +317,12 @@ SELECT * FROM anofox_bayes_fit(
      'group': 'lane', 'draws': 2000, 'seed': 42}
 );
 
-# 4 lanes x 3 parameters x 2000 draws, plus the 10 metadata rows: the refused lane
+# 4 lanes x 3 parameters x 2000 draws, plus the 11 metadata rows: the refused lane
 # occupies its slots rather than vanishing from the table.
 query I
 SELECT count(*) FROM mixed_draws;
 ----
-24010
+24011
 
 query I
 SELECT anofox_bayes_status_text(param, value) FROM mixed_draws;

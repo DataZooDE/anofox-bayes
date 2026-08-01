@@ -80,6 +80,7 @@ const SLOTS: &[&str] = &[
     "max_draw_megabytes",
     "seed",
     "engine",
+    "sample_from",
 ];
 
 const DISTRIBUTIONS: &[&str] = &["weibull", "lognormal", "loglogistic", "exponential"];
@@ -465,6 +466,7 @@ mod tests {
                     n_chains: 1,
                     n_draws: 100_000,
                     seed: 5,
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )
             .unwrap();
@@ -552,6 +554,7 @@ mod tests {
                     n_chains: 1,
                     n_draws: 20_000,
                     seed: 9,
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )
             .unwrap();
@@ -583,6 +586,7 @@ mod tests {
                     n_chains: 1,
                     n_draws: 500,
                     seed: 3,
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )
             .unwrap();
@@ -701,6 +705,7 @@ mod tests {
                     n_chains: 1,
                     n_draws: 500,
                     seed: 13,
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )
             .unwrap();
@@ -808,6 +813,7 @@ mod tests {
                         n_chains: 1,
                         n_draws: 200,
                         seed: 21,
+                        sample_from: crate::types::SampleFrom::Posterior,
                     },
                 )
                 .unwrap();

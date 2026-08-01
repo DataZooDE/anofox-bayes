@@ -30,6 +30,12 @@ impl Engine for ExactEngine {
         model.as_exact().is_some()
     }
 
+    /// Conjugate families carry their prior in the same closed form as their
+    /// posterior, so the exact engine draws from either through the same sampler.
+    fn can_sample_prior(&self) -> bool {
+        true
+    }
+
     fn sample(&self, model: &dyn CompiledModel, opts: &SampleOptions) -> BayesResult<Sample> {
         let exact = model.as_exact().ok_or_else(|| {
             BayesError::config(

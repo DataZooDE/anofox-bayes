@@ -68,6 +68,18 @@ pub trait Engine: std::fmt::Debug {
     /// and received an approximation would report unearned confidence.
     fn supports(&self, model: &dyn CompiledModel) -> bool;
 
+    /// Whether this engine can draw from a model's **prior** rather than its
+    /// posterior, for a prior-predictive check (BR-11).
+    ///
+    /// Defaults to `false`, and the default is the safe direction. An engine that
+    /// ignored `sample_from` would run normally and return the posterior under a row
+    /// claiming it is the prior — a pre-fit gate silently agreeing with the very data
+    /// it exists to be checked against, which is worse than having no gate. Any new
+    /// engine is therefore opted out until it has actually implemented the path.
+    fn can_sample_prior(&self) -> bool {
+        false
+    }
+
     fn sample(&self, model: &dyn CompiledModel, opts: &SampleOptions) -> BayesResult<Sample>;
 }
 

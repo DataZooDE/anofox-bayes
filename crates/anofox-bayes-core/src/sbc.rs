@@ -659,6 +659,7 @@ mod families {
                     n_chains: 1,
                     n_draws,
                     seed: rng.uniform().to_bits(),
+                    sample_from: crate::types::SampleFrom::Posterior,
                 },
             )?;
             let p = model.param_names().len();
