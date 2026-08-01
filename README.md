@@ -109,21 +109,25 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 |---|---|---|
 | `conjugate_anomaly` | A level or rate per group; anomaly detection | `mu`, `sigma` (Normal) or `lambda` (Poisson) |
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
+| `censored_aft` | Time until something happens, when some of it has not happened yet — delivery promises, time-to-pay | `intercept`, `beta[…]`, `sigma` (accelerated failure time) |
 | `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by
-predictors → `pooled_gaussian`; a repeat-purchase history and a churn question →
-`payer_alive`.**
+predictors → `pooled_gaussian`; a duration where some cases have not finished →
+`censored_aft`; a repeat-purchase history and a churn question → `payer_alive`.**
+
+`pooled_gaussian` also does **random slopes**: each group gets its own coefficient on a
+predictor, pooled toward the population value rather than estimated in isolation. That
+is what a per-store price elasticity actually is.
 
 Three engines: `exact` (closed-form, the default), `laplace` (a Gaussian at the mode)
 and `nuts` (the No-U-Turn Sampler, via [`nuts-rs`](https://github.com/pymc-devs/nuts-rs)).
 Switching between them changes no caller SQL.
 
-Planned, and *not* present today: hierarchical negative-binomial (F1), censored
-survival (F2), payment delay (F4), payer-alive/BTYD (F5) and elasticity (F6). See
-[the roadmap](#roadmap).
-survival (F2), payment delay (F4), elasticity (F6), and the
-NUTS engine. See [the roadmap](#roadmap).
+Planned, and *not* present today: hierarchical negative-binomial (F1), per-group
+variance with a learned pooling scale, payment delay (F4) and a native elasticity
+family (F6) — though random slopes above already cover most of what F6 is for. See
+[the roadmap](docs/ROADMAP.md).
 
 There is deliberately **no `predict` function** — posterior prediction is a join over
 the draws table, which is both simpler and faster. See
@@ -164,11 +168,9 @@ test suite, so they cannot drift from the implementation.
 
 | | |
 |---|---|
-| **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, exact + Laplace + NUTS engines, diagnostics, calibration suites |
-| v0.2 | Hierarchical negative-binomial (F1), censored survival (F2) |
-| **v0.1** (now) | `conjugate_anomaly`, `pooled_gaussian`, `payer_alive`, exact + Laplace engines, diagnostics, calibration suites |
-| v0.2 | NUTS engine, hierarchical negative-binomial (F1), censored survival (F2) |
-| v0.3 | Payment delay, BTYD, elasticity families; scenario integration |
+| **now** | Four families — `conjugate_anomaly`, `pooled_gaussian` (with random slopes), `censored_aft`, `payer_alive`. All three engines: exact, Laplace, NUTS. Diagnostics, SBC and PyMC parity, prior-predictive checks, deterministic predictive draws |
+| next | Hierarchical negative-binomial (F1); per-group variance with a learned pooling scale |
+| later | Payment delay (F4), native elasticity (F6), streaming sufficient statistics |
 
 Breaking changes are expected at v0.x. Use the
 [issues page](https://github.com/DataZooDE/anofox-bayes/issues) to report a bug or ask
