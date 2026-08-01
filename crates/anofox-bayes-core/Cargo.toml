@@ -1,0 +1,21 @@
+[package]
+name = "anofox-bayes-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bayesian inference for a closed catalog of enterprise decision models"
+
+[lib]
+name = "anofox_bayes_core"
+path = "src/lib.rs"
+
+[dependencies]
+faer.workspace = true
+statrs.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
+blake3.workspace = true
+thiserror.workspace = true

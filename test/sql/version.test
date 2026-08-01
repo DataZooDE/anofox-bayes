@@ -1,0 +1,20 @@
+# name: test/sql/version.test
+# description: The extension loads and the Rust core is reachable across the FFI boundary
+# group: [sql]
+
+require anofox_bayes
+
+# A version string proves the whole toolchain is wired: corrosion built the Rust
+# core, the FFI archive linked into the loadable extension, and C++ can call it.
+query I
+SELECT anofox_bayes_version();
+----
+0.1.0
+
+# The draws-schema version is a separate, independently evolving contract: draw
+# tables written by an older extension must remain readable, so this number is
+# allowed to lag the extension version and is asserted on its own.
+query I
+SELECT anofox_bayes_draws_schema_version();
+----
+1
