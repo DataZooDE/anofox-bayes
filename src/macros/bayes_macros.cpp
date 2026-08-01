@@ -159,6 +159,7 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
      {"param", "value", nullptr},
      {{nullptr, nullptr}},
      "CASE max(CASE WHEN param = '__family__' THEN value END)"
+     "  WHEN 1 THEN 'hier_negbin'"
      "  WHEN 2 THEN 'censored_aft'"
      "  WHEN 3 THEN 'pooled_gaussian'"
      "  WHEN 5 THEN 'payer_alive'"

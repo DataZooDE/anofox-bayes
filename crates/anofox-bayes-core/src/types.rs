@@ -96,6 +96,8 @@ impl FitStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum FamilyCode {
+    /// F1 — hierarchical count GLM (Poisson / negative binomial), non-centred.
+    HierNegbin = 1,
     /// F2 — censored accelerated failure time, bridged onto `anofox-stats-core`.
     CensoredAft = 2,
     /// F3 — pooled Gaussian linear model.
@@ -121,6 +123,7 @@ impl FamilyCode {
     /// a catalog test enforces it.
     pub fn as_str(&self) -> &'static str {
         match self {
+            FamilyCode::HierNegbin => "hier_negbin",
             FamilyCode::CensoredAft => "censored_aft",
             FamilyCode::PooledGaussian => "pooled_gaussian",
             FamilyCode::PayerAlive => "payer_alive",
@@ -132,6 +135,7 @@ impl FamilyCode {
     /// Decode a `__family__` value read back off a draws table.
     pub fn from_code(code: i32) -> Option<Self> {
         match code {
+            1 => Some(FamilyCode::HierNegbin),
             2 => Some(FamilyCode::CensoredAft),
             3 => Some(FamilyCode::PooledGaussian),
             5 => Some(FamilyCode::PayerAlive),
@@ -292,11 +296,13 @@ mod tests {
     /// change what a table written last quarter says it contains.
     #[test]
     fn family_codes_are_stable_and_round_trip() {
+        assert_eq!(FamilyCode::HierNegbin as i32, 1);
         assert_eq!(FamilyCode::CensoredAft as i32, 2);
         assert_eq!(FamilyCode::PooledGaussian as i32, 3);
         assert_eq!(FamilyCode::PayerAlive as i32, 5);
         assert_eq!(FamilyCode::ConjugateAnomaly as i32, 7);
         for code in [
+            FamilyCode::HierNegbin,
             FamilyCode::CensoredAft,
             FamilyCode::PooledGaussian,
             FamilyCode::PayerAlive,
@@ -319,8 +325,8 @@ mod tests {
         );
         // The gaps are families the catalog does not ship, not aliases for one it
         // does -- decoding one must fail rather than pick a neighbour.
-        assert_eq!(FamilyCode::from_code(1), None);
         assert_eq!(FamilyCode::from_code(4), None);
+        assert_eq!(FamilyCode::from_code(6), None);
     }
 
     #[test]

@@ -28,7 +28,7 @@ them down was to find out.
 | 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | **Done.** Random slopes in `pooled_gaussian` (still conjugate, three engines agree); the learned scale in `varying_variance_gaussian` | — |
 | 5 | Per-group variance + learned pooling scale | 04, 06 | **Done.** `varying_variance_gaussian`, non-centred on both hierarchies. SBC says Laplace is inadmissible here — NUTS is the default | — |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | **Done.** Pinned `=0.18.3`; byte-identical across thread counts | — |
-| 7 | F1 hierarchical negative binomial | 01 | In progress — bridged path assessed first, per the deferral | — |
+| 7 | F1 hierarchical negative binomial | 01 | **Done, natively.** The bridge was built and measured first and cannot cover a thin SKU — its plug-in dispersion error propagates into the pooling scale (§3.5) | PyMC parity test |
 | 8 | F4 payment delay, native | 04 | Not started, and the same question as §3.4 applies: `pooled_gaussian` on log-delay is already a lognormal model, and `censored_aft` covers the case where some invoices have not been paid yet | Decide before building; 8–12 d if built |
 | 9 | F6 hierarchical elasticity, native | 06 | **Closed without building it** — random slopes on a log-log model *are* hierarchical elasticity. Reasoning in §3.4 | — |
 | 10 | `conjugate_anomaly` has no `as_differentiable` | none | **Done.** All three engines now serve it, so a closed form has three independent derivations | — |
@@ -144,10 +144,11 @@ say so.
 Not scheduled, and not ranked against each other until a customer or an agent forces
 the order.
 
-- **F1 native** (gap 7), deferred on the expectation that the bridge over
-  `glmm_fit_agg` with a `negbinomial` family covers agent 01 adequately. If SBC or
-  field use shows the interval too tight where it matters — thin SKUs, which is most of
-  them — this moves up sharply.
+- ~~**F1 native** (gap 7)~~ **shipped.** The expectation that a bridged
+  `negbinomial` GLMM would cover agent 01 was tested before anything was built, and it
+  does not hold: the interval on a thin SKU's own demand rate covers 0.76 where 0.90 is
+  nominal, and 0.41 at a higher demand level. §3.4 has the measurement and the three
+  upstream facts behind it. The native family is `hier_negbin`, NUTS only, non-centred.
 - **F4 native** (gap 8). A lognormal delay model is a Gaussian model on `log(delay)`,
   so `pooled_gaussian` already substitutes and the v0.3 family covers per-segment
   spread. A native Gamma-delay family buys the Gamma branch and little else.
@@ -313,6 +314,58 @@ something the upstream crate publishes.** The `std_errors` agreement check is wh
 this a dependency rather than a fork — it is a standing assertion that both crates still
 mean the same thing by the same likelihood, and it will fail loudly if the pinned
 revision is bumped to something that does not.
+
+### 3.4 Was the bridge enough for F1? Measured, and no.
+
+This was the deferral's own condition — *"if SBC or field use shows the interval too
+tight where it matters — thin SKUs, which is most of them — this moves up sharply"* —
+so it was tested first, before any family code was written. The measurement lives in
+`catalog::f1_hier_negbin::bridge_comparison` and re-runs on demand.
+
+**Three facts about `anofox-stats-core` at the pinned revision.**
+
+1. `GlmmFamily::from_name("negbinomial")` returns `theta = 1.0`. The dispersion is an
+   **input** to `fit_glmm`; `GlmmResult` has no field that could carry a posterior for
+   it. This is §3.1a's warning in its most concrete form.
+2. `GlmmResult::var_group`, the pooling scale, is a Brent profile point estimate with
+   no standard error anywhere in the struct. So a bridged F1 conditions on **two**
+   point estimates, not one.
+3. `fit_negbinomial` with `alpha: None` — upstream's only data-driven dispersion —
+   failed to converge on **20 of 20** simulated thin-SKU panels. Even at a fixed
+   `alpha`, the IRLS needs its tolerance relaxed to `1e-3` to terminate on count data
+   with many small counts. The measurement below therefore steel-mans the bridge with a
+   damped version of upstream's own moment update.
+
+**What it costs.** 40 SKUs of four periods, `tau = 0.6`, `phi = 2.0`, 1600 intervals.
+The quantity is the 90 % credible interval for a SKU's own demand rate — the parameter
+interval, where integer support cannot flatter the number.
+
+| | mean demand 3/period | mean demand 25/period | fitted `tau` (true 0.6) |
+|---|---:|---:|---:|
+| bridged, plug-in dispersion | 0.76 | **0.41** | 0.39 / 0.17 |
+| bridged, true dispersion for free | 0.75 | 0.81 | 0.39 / 0.44 |
+| native `hier_negbin` | **0.90** | — | — |
+
+The middle row is the one that decides it. Handing the bridge the true dispersion moves
+0.41 to 0.81, which means the dispersion error does not merely widen the interval — it
+propagates into the variance component, collapsing `tau` from 0.44 to 0.17, and
+produces an interval that is both wrong and *narrower*. A dispersion reported without a
+posterior would have been a defensible documented limitation; a dispersion whose plug-in
+error silently halves the pooling scale is not, because nothing downstream can see it.
+
+**What was not wrong with the bridge.** Its *predictive* interval is fine — achieved
+service levels between 0.949 and 0.964 against a nominal 0.95 — because integer support
+pads a discrete interval. That is the trap: the number an agent would naturally check is
+the one the bridged path gets approximately right.
+
+**Cost of the native family, against the 12–20 day estimate.** The dispersion under
+NUTS, flagged in §6 as the single biggest source of uncertainty in that estimate, turned
+out to be the *best*-mixing parameter of the three (ESS 5207 of 8000 draws, R̂ 1.0002).
+The bottleneck is the population intercept against the group offsets — ESS ~740 of 8000
+— which is the ordinary hierarchical ridge and is handled by asking for more draws. The
+genuine surprise was the Laplace engine: it is not merely poor here but inadmissible,
+because a non-centred hierarchy has no usable joint mode, so `engine: 'laplace'` is
+refused with an explanation rather than served.
 
 ### 3.2 Is NUTS genuinely required for F5?
 

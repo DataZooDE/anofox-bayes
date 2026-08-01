@@ -111,6 +111,7 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 | `conjugate_anomaly` | A level or rate per group; anomaly detection | `mu`, `sigma` (Normal) or `lambda` (Poisson) |
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
 | `censored_aft` | Time until something happens, when some of it has not happened yet — delivery promises, time-to-pay | `intercept`, `beta[…]`, `sigma` (accelerated failure time) |
+| `hier_negbin` | How much of this part will be wanted? Safety stock and reorder points across a catalogue where most items are thin | `intercept`, `tau`, `phi` (population); `u`, `rate` per group |
 | `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
 | `varying_variance_gaussian` | A *spread* per group: service levels, buffers, "which segments are unpredictable" | `intercept`, `beta[…]`, `pool_scale`, `sigma_pop`, `sigma_spread`, plus `group_effect` and `sigma` per group |
 

@@ -1,0 +1,417 @@
+# name: test/sql/f1_hier_negbin.test
+# description: F1 hierarchical count GLM, exercised as the C-parts safety-stock agent would use it
+# group: [sql]
+
+require anofox_bayes
+
+#######################################
+# Setup: a spare-parts demand history
+#######################################
+
+# Weekly issues of fourteen spare parts from one plant's store, one row per part per
+# week. Six are running bearings with more than nine months of history; eight are
+# seals introduced last month, with five weeks each. That mixture is the point: a
+# C-parts catalogue is mostly the second kind, and a per-part model fitted
+# independently on five observations produces an interval so wide it is useless and a
+# point estimate so noisy it is worse.
+#
+# The table was drawn from the model itself -- true rate ~ lognormal around six units
+# a week with a pooling scale of 0.7, and a dispersion of 2.5 on top -- so the answers
+# below can be checked against a truth. It is literal rather than generated so that
+# the same numbers feed the Rust suite and this file, and the two cannot drift.
+statement ok
+CREATE TABLE issues(part VARCHAR, week INTEGER, units INTEGER);
+
+statement ok
+INSERT INTO issues VALUES
+  ('BRG-100',1,2),('BRG-100',2,0),('BRG-100',3,1),('BRG-100',4,1),('BRG-100',5,2),('BRG-100',6,5),('BRG-100',7,0),('BRG-100',8,2),
+  ('BRG-100',9,1),('BRG-100',10,1),('BRG-100',11,4),('BRG-100',12,0),('BRG-100',13,3),('BRG-100',14,3),('BRG-100',15,2),('BRG-100',16,4),
+  ('BRG-100',17,3),('BRG-100',18,3),('BRG-100',19,6),('BRG-100',20,2),('BRG-100',21,5),('BRG-100',22,5),('BRG-100',23,4),('BRG-100',24,2),
+  ('BRG-100',25,6),('BRG-100',26,5),('BRG-100',27,3),('BRG-100',28,1),('BRG-100',29,3),('BRG-100',30,1),('BRG-100',31,3),('BRG-100',32,2),
+  ('BRG-100',33,0),('BRG-100',34,5),('BRG-100',35,4),('BRG-100',36,1),('BRG-100',37,0),('BRG-100',38,5),('BRG-100',39,0),('BRG-100',40,2),
+  ('BRG-101',1,9),('BRG-101',2,10),('BRG-101',3,7),('BRG-101',4,4),('BRG-101',5,17),('BRG-101',6,9),('BRG-101',7,5),('BRG-101',8,16),
+  ('BRG-101',9,8),('BRG-101',10,13),('BRG-101',11,10),('BRG-101',12,10),('BRG-101',13,3),('BRG-101',14,2),('BRG-101',15,4),('BRG-101',16,3),
+  ('BRG-101',17,4),('BRG-101',18,0),('BRG-101',19,24),('BRG-101',20,35),('BRG-101',21,9),('BRG-101',22,12),('BRG-101',23,2),('BRG-101',24,15),
+  ('BRG-101',25,4),('BRG-101',26,39),('BRG-101',27,3),('BRG-101',28,6),('BRG-101',29,15),('BRG-101',30,16),('BRG-101',31,0),('BRG-101',32,3),
+  ('BRG-101',33,5),('BRG-101',34,5),('BRG-101',35,7),('BRG-101',36,9),('BRG-101',37,6),('BRG-101',38,2),('BRG-101',39,6),('BRG-101',40,3),
+  ('BRG-102',1,4),('BRG-102',2,16),('BRG-102',3,47),('BRG-102',4,12),('BRG-102',5,13),('BRG-102',6,3),('BRG-102',7,36),('BRG-102',8,4),
+  ('BRG-102',9,19),('BRG-102',10,19),('BRG-102',11,13),('BRG-102',12,8),('BRG-102',13,22),('BRG-102',14,51),('BRG-102',15,5),('BRG-102',16,24),
+  ('BRG-102',17,42),('BRG-102',18,14),('BRG-102',19,49),('BRG-102',20,17),('BRG-102',21,7),('BRG-102',22,26),('BRG-102',23,31),('BRG-102',24,11),
+  ('BRG-102',25,25),('BRG-102',26,28),('BRG-102',27,27),('BRG-102',28,7),('BRG-102',29,18),('BRG-102',30,44),('BRG-102',31,17),('BRG-102',32,8),
+  ('BRG-102',33,32),('BRG-102',34,10),('BRG-102',35,9),('BRG-102',36,9),('BRG-102',37,5),('BRG-102',38,63),('BRG-102',39,23),('BRG-102',40,53),
+  ('BRG-103',1,6),('BRG-103',2,2),('BRG-103',3,1),('BRG-103',4,5),('BRG-103',5,3),('BRG-103',6,2),('BRG-103',7,6),('BRG-103',8,4),
+  ('BRG-103',9,5),('BRG-103',10,0),('BRG-103',11,4),('BRG-103',12,5),('BRG-103',13,1),('BRG-103',14,2),('BRG-103',15,3),('BRG-103',16,0),
+  ('BRG-103',17,5),('BRG-103',18,0),('BRG-103',19,0),('BRG-103',20,3),('BRG-103',21,8),('BRG-103',22,5),('BRG-103',23,5),('BRG-103',24,6),
+  ('BRG-103',25,6),('BRG-103',26,0),('BRG-103',27,17),('BRG-103',28,4),('BRG-103',29,2),('BRG-103',30,0),('BRG-103',31,7),('BRG-103',32,6),
+  ('BRG-103',33,6),('BRG-103',34,3),('BRG-103',35,5),('BRG-103',36,9),('BRG-103',37,3),('BRG-103',38,3),('BRG-103',39,1),('BRG-103',40,0),
+  ('BRG-104',1,3),('BRG-104',2,0),('BRG-104',3,3),('BRG-104',4,3),('BRG-104',5,1),('BRG-104',6,1),('BRG-104',7,4),('BRG-104',8,0),
+  ('BRG-104',9,2),('BRG-104',10,0),('BRG-104',11,1),('BRG-104',12,1),('BRG-104',13,0),('BRG-104',14,2),('BRG-104',15,4),('BRG-104',16,1),
+  ('BRG-104',17,2),('BRG-104',18,1),('BRG-104',19,2),('BRG-104',20,0),('BRG-104',21,1),('BRG-104',22,1),('BRG-104',23,3),('BRG-104',24,2),
+  ('BRG-104',25,1),('BRG-104',26,3),('BRG-104',27,4),('BRG-104',28,0),('BRG-104',29,1),('BRG-104',30,1),('BRG-104',31,2),('BRG-104',32,6),
+  ('BRG-104',33,3),('BRG-104',34,2),('BRG-104',35,4),('BRG-104',36,1),('BRG-104',37,1),('BRG-104',38,0),('BRG-104',39,1),('BRG-104',40,0),
+  ('BRG-105',1,23),('BRG-105',2,31),('BRG-105',3,14),('BRG-105',4,1),('BRG-105',5,37),('BRG-105',6,4),('BRG-105',7,15),('BRG-105',8,16),
+  ('BRG-105',9,13),('BRG-105',10,20),('BRG-105',11,19),('BRG-105',12,5),('BRG-105',13,38),('BRG-105',14,30),('BRG-105',15,30),('BRG-105',16,15),
+  ('BRG-105',17,3),('BRG-105',18,12),('BRG-105',19,8),('BRG-105',20,8),('BRG-105',21,2),('BRG-105',22,19),('BRG-105',23,29),('BRG-105',24,47),
+  ('BRG-105',25,31),('BRG-105',26,18),('BRG-105',27,15),('BRG-105',28,7),('BRG-105',29,7),('BRG-105',30,30),('BRG-105',31,3),('BRG-105',32,41),
+  ('BRG-105',33,21),('BRG-105',34,33),('BRG-105',35,19),('BRG-105',36,8),('BRG-105',37,21),('BRG-105',38,12),('BRG-105',39,12),('BRG-105',40,8),
+  ('SEA-206',1,9),('SEA-206',2,5),('SEA-206',3,9),('SEA-206',4,12),('SEA-206',5,7),('SEA-207',1,5),('SEA-207',2,1),('SEA-207',3,14),
+  ('SEA-207',4,2),('SEA-207',5,10),('SEA-208',1,1),('SEA-208',2,1),('SEA-208',3,4),('SEA-208',4,2),('SEA-208',5,10),('SEA-209',1,2),
+  ('SEA-209',2,12),('SEA-209',3,3),('SEA-209',4,3),('SEA-209',5,9),('SEA-210',1,29),('SEA-210',2,15),('SEA-210',3,22),('SEA-210',4,30),
+  ('SEA-210',5,11),('SEA-211',1,3),('SEA-211',2,5),('SEA-211',3,6),('SEA-211',4,5),('SEA-211',5,27),('SEA-212',1,1),('SEA-212',2,2),
+  ('SEA-212',3,5),('SEA-212',4,4),('SEA-212',5,2),('SEA-213',1,3),('SEA-213',2,34),('SEA-213',3,11),('SEA-213',4,12),('SEA-213',5,9)
+;
+
+query I
+SELECT count(*) FROM issues;
+----
+280
+
+# Six thick parts, eight thin ones.
+query II
+SELECT count(*) FILTER (WHERE n >= 40), count(*) FILTER (WHERE n = 5)
+FROM (SELECT part, count(*) AS n FROM issues GROUP BY part);
+----
+6	8
+
+#######################################
+# Fit: one table function call
+#######################################
+
+# Partial pooling is the whole reason this is one fit and not fourteen. Each part gets
+# its own rate, and each rate is pulled toward what the rest of the catalogue does by
+# an amount the data decides: hardly at all for a bearing with forty weeks, most of
+# the way for a seal with five.
+statement ok
+CREATE TABLE draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT units, part FROM issues),
+    'hier_negbin',
+    {'y': 'units', 'group': 'part', 'draws': 1000, 'chains': 4, 'seed': 42}
+);
+
+# The draws contract, unchanged: (model_id, group_id, chain, draw, param, value).
+query II
+SELECT column_name, column_type FROM (DESCRIBE draws);
+----
+model_id	VARCHAR
+group_id	VARCHAR
+chain	INTEGER
+draw	INTEGER
+param	VARCHAR
+value	DOUBLE
+
+# 31 parameters (intercept, tau, phi, plus u and rate for each of fourteen parts)
+# x 4 chains x 1000 draws, plus four NUTS sampler statistics per draw, plus the 11
+# model-metadata rows.
+query I
+SELECT count(*) FROM draws;
+----
+140011
+
+query I
+SELECT string_agg(DISTINCT param, ',' ORDER BY param)
+FROM draws WHERE draw >= 0 AND group_id = '__global__' AND param NOT LIKE '\_\_%' ESCAPE '\';
+----
+intercept,phi,tau
+
+#######################################
+# The gate: is this fit safe to act on?
+#######################################
+
+query I
+SELECT anofox_bayes_status_text(param, value) FROM draws;
+----
+converged
+
+query I
+SELECT anofox_bayes_family_text(param, value) FROM draws;
+----
+hier_negbin
+
+query II
+SELECT param, value FROM draws
+WHERE param IN ('__n_obs__', '__n_groups__', '__n_groups_unready__', '__engine__',
+                '__schema_version__', '__n_chains__')
+ORDER BY param;
+----
+__engine__	2.0
+__n_chains__	4.0
+__n_groups__	14.0
+__n_groups_unready__	0.0
+__n_obs__	280.0
+__schema_version__	1.0
+
+# `__engine__` is 2 -- NUTS. A hierarchical pooling scale has no closed form and no
+# usable joint mode, so this family is sampled rather than approximated, and the
+# table says which.
+
+# NUTS is a Markov chain, so R-hat is a real statistic here rather than NULL, and both
+# gates have to pass for every parameter.
+query I
+SELECT count(*) FROM (
+    SELECT group_id, param
+    FROM draws WHERE draw >= 0 AND param NOT LIKE '\_\_%' ESCAPE '\'
+    GROUP BY group_id, param
+    HAVING NOT anofox_bayes_ess_gate(value, chain, draw, 400)
+        OR NOT anofox_bayes_rhat_gate(value, chain, draw, 1.01)
+);
+----
+0
+
+# A divergent trajectory means the sampler left the region it was exploring, so the
+# draws around it are not from the posterior. There is no acceptable budget.
+query I
+SELECT coalesce(sum(value), 0) FROM draws WHERE param = '__divergent__';
+----
+0.0
+
+# The process the table was drawn from, recovered. Ranges rather than pinned
+# quantiles: the exact numbers are pinned in the Rust suite where they can be
+# regenerated, and what belongs here is that the fit found the process it was given.
+query III
+SELECT median(value) FILTER (WHERE param = 'intercept') BETWEEN 1.3 AND 2.3,
+       median(value) FILTER (WHERE param = 'tau')       BETWEEN 0.4 AND 1.3,
+       median(value) FILTER (WHERE param = 'phi')       BETWEEN 1.2 AND 5.0
+FROM draws WHERE draw >= 0;
+----
+true	true	true
+
+#######################################
+# Partial pooling, visible
+#######################################
+
+# The five-week seals are shrunk toward the catalogue; the forty-week bearings are
+# not. Compare each part's posterior median rate against its own sample mean: the
+# thin parts move, the thick ones stay.
+statement ok
+CREATE TABLE shrinkage AS
+SELECT d.group_id AS part,
+       median(d.value) AS posterior_rate,
+       any_value(s.sample_mean) AS sample_mean,
+       any_value(s.n) AS weeks
+FROM draws d
+JOIN (SELECT part, avg(units) AS sample_mean, count(*) AS n FROM issues GROUP BY part) s
+  ON s.part = d.group_id
+WHERE d.param = 'rate' AND d.draw >= 0
+GROUP BY d.group_id;
+
+query I
+SELECT count(*) FROM shrinkage;
+----
+14
+
+# Thin parts are pulled a long way; thick parts are barely touched. `abs(log ratio)`
+# rather than a difference, because the parts differ by an order of magnitude in level
+# and a difference would only measure that.
+query II
+SELECT avg(abs(ln(posterior_rate / sample_mean))) FILTER (WHERE weeks = 5)  > 0.05,
+       avg(abs(ln(posterior_rate / sample_mean))) FILTER (WHERE weeks = 40) < 0.05
+FROM shrinkage;
+----
+true	true
+
+#######################################
+# The decision: a reorder point at a stated service level
+#######################################
+
+# This is the query the agent runs, and it is pure SQL over the draws -- no re-fit,
+# and no random numbers.
+#
+# The posterior predictive for next week's demand on a part is a *mixture* of
+# negative binomials, one per posterior draw. Its probability mass function is
+# available in closed form, so the whole distribution can be summed rather than
+# simulated:
+#
+#   P(Y = k | rate, phi) = exp( lgamma(k + phi) - lgamma(phi) - lgamma(k + 1)
+#                               + phi * ln(phi / (phi + rate))
+#                               + k   * ln(rate / (phi + rate)) )
+#
+# Averaging that over the draws integrates out every parameter at once -- the level,
+# the part's own offset, the pooling scale and the dispersion -- which is precisely
+# what a plug-in estimate at a point cannot do, and precisely why a thin part's
+# interval comes out honest.
+statement ok
+CREATE TABLE predictive AS
+SELECT r.group_id AS part, k.k,
+       avg(exp(lgamma(k.k + p.value) - lgamma(p.value) - lgamma(k.k + 1)
+               + p.value * ln(p.value / (p.value + r.value))
+               + k.k * ln(r.value / (p.value + r.value)))) AS pmf
+FROM (SELECT group_id, chain, draw, value FROM draws WHERE param = 'rate' AND draw >= 0) r
+JOIN (SELECT chain, draw, value FROM draws WHERE param = 'phi' AND draw >= 0) p
+  USING (chain, draw)
+CROSS JOIN (SELECT range AS k FROM range(0, 201)) k
+GROUP BY r.group_id, k.k;
+
+# It is a distribution: the mass over 0..200 accounts for essentially everything.
+query I
+SELECT min(total) > 0.999 FROM (SELECT part, sum(pmf) AS total FROM predictive GROUP BY part);
+----
+true
+
+# The reorder point: the smallest whole number of units that covers next week's demand
+# with the stated probability.
+statement ok
+CREATE TABLE reorder AS
+SELECT part, service_level,
+       min(k) FILTER (WHERE cdf >= service_level) AS reorder_point
+FROM (
+    SELECT part, k, sum(pmf) OVER (PARTITION BY part ORDER BY k) AS cdf FROM predictive
+) CROSS JOIN (SELECT unnest([0.90, 0.95, 0.99]) AS service_level)
+GROUP BY part, service_level;
+
+query I
+SELECT count(*) = 42 AND count(*) FILTER (WHERE reorder_point IS NULL) = 0 FROM reorder;
+----
+true
+
+# A higher service level never asks for less stock.
+query I
+SELECT count(*) = 0 FROM (
+    SELECT part FROM reorder
+    GROUP BY part
+    HAVING max(reorder_point) FILTER (WHERE service_level = 0.90)
+         > min(reorder_point) FILTER (WHERE service_level = 0.99)
+);
+----
+true
+
+# **The headline, and the reason this family is native rather than bridged.**
+#
+# For a part with five weeks of history the reorder point has to carry three
+# uncertainties at once: how much this part moves, how much parts in general vary, and
+# how bursty demand is week to week. A plug-in estimate at a point drops the last two
+# and reports a reorder point that is too low -- the part stocks out more often than
+# the service level printed on the report, and nothing downstream can tell.
+#
+# Here the thin parts are stocked *more* deeply relative to what they have been seen
+# to use than the thick ones, which is what paying for uncertainty looks like.
+query I
+SELECT
+  avg(r.reorder_point / s.sample_mean) FILTER (WHERE s.weeks = 5)
+> avg(r.reorder_point / s.sample_mean) FILTER (WHERE s.weeks = 40)
+FROM reorder r JOIN shrinkage s ON s.part = r.part
+WHERE r.service_level = 0.95;
+----
+true
+
+# ...and every part's 95% reorder point is above its own observed average demand,
+# which a point forecast would not guarantee.
+query I
+SELECT count(*) = 0
+FROM reorder r JOIN shrinkage s ON s.part = r.part
+WHERE r.service_level = 0.95 AND r.reorder_point <= s.sample_mean;
+----
+true
+
+# The plan a planner would receive, for the seals -- the parts nobody has enough data
+# on. Those true rates were 25.2 a week for `SEA-210` and 3.2 for `SEA-212`, on five
+# weeks each, and the model separates them without being told which is which.
+query II
+SELECT part, reorder_point
+FROM reorder
+WHERE service_level = 0.95 AND part LIKE 'SEA-%'
+ORDER BY part;
+----
+SEA-206	23
+SEA-207	19
+SEA-208	12
+SEA-209	17
+SEA-210	51
+SEA-211	25
+SEA-212	10
+SEA-213	35
+
+# Each of those parts' posterior rate sits where its own history says it should,
+# having been pulled toward the catalogue by an amount the data chose. (The true rates
+# were 6.8, 6.9, 2.9, 3.3, 25.2, 7.0, 3.2 and 16.8.)
+query I
+SELECT count(*) = 0 FROM shrinkage
+WHERE weeks = 5 AND (posterior_rate < 0.6 * sample_mean OR posterior_rate > 1.6 * sample_mean);
+----
+true
+
+#######################################
+# Reproducibility
+#######################################
+
+query I
+SELECT count(*) = 0 FROM (
+    SELECT * FROM draws
+    EXCEPT ALL
+    SELECT * FROM anofox_bayes_fit(
+        (SELECT units, part FROM issues), 'hier_negbin',
+        {'y': 'units', 'group': 'part', 'draws': 1000, 'chains': 4, 'seed': 42})
+);
+----
+true
+
+#######################################
+# Refusal
+#######################################
+
+# A part list with two parts on it. A pooling scale estimated from two groups
+# describes the sample, not the catalogue, and every per-part interval inherits that.
+query I
+SELECT anofox_bayes_status_text(param, value) FROM anofox_bayes_fit(
+    (SELECT units, part FROM issues WHERE part IN ('BRG-100', 'BRG-101')),
+    'hier_negbin',
+    {'y': 'units', 'group': 'part', 'draws': 200, 'chains': 2, 'seed': 1});
+----
+insufficient_data
+
+# A part nobody has ever issued. There is no interior maximum -- the rate is
+# identified only in the limit of zero -- so the fit refuses and the draws are NULL.
+statement ok
+CREATE TABLE never_issued AS
+SELECT part, week, 0 AS units FROM issues WHERE week <= 5;
+
+# `param NOT LIKE '__%'` excludes the four NUTS sampler-statistic rows, which carry
+# real numbers on a refused fit -- they describe the sampler, not the model.
+query II
+SELECT anofox_bayes_status_text(param, value),
+       bool_and(value IS NULL) FILTER (WHERE draw >= 0 AND param NOT LIKE '\_\_%' ESCAPE '\')
+FROM anofox_bayes_fit(
+    (SELECT units, part FROM never_issued), 'hier_negbin',
+    {'y': 'units', 'group': 'part', 'draws': 200, 'chains': 2, 'seed': 1});
+----
+degenerate	true
+
+#######################################
+# Errors are precise and arrive before any computation
+#######################################
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT units, part FROM issues), 'hier_negbin', {'y': 'units'});
+----
+group
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT units, part FROM issues), 'hier_negbin', {'y': 'units', 'grp': 'part'});
+----
+did you mean 'group'
+
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT units, part FROM issues), 'hier_negbin', {'y': 'units', 'group': 'part', 'likelihood': 'gaussian'});
+----
+negbinomial
+
+# A prior mean with no spread is not a prior, and defaulting the spread would invent
+# one on the caller's behalf.
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT units, part FROM issues), 'hier_negbin', {'y': 'units', 'group': 'part', 'prior': {'phi': {'log_mean': 1.0}}});
+----
+prior.phi.log_sd
+
+# The Laplace engine is refused rather than served badly: a Gaussian at the joint mode
+# of a non-centred hierarchy is not a posterior, because the likelihood does not
+# depend on the pooling scale at all when every group offset is zero.
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT units, part FROM issues), 'hier_negbin', {'y': 'units', 'group': 'part', 'engine': 'laplace'});
+----
+NUTS only
+
+# A fractional response is a data-preparation mistake, not a count.
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT units + 0.5 AS units, part FROM issues), 'hier_negbin', {'y': 'units', 'group': 'part'});
+----
+whole count

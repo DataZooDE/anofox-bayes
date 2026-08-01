@@ -131,6 +131,8 @@ CREATE TABLE draws AS SELECT * FROM anofox_bayes_fit(...);
 | "How many claims per thousand shipments?" | `conjugate_anomaly`, `likelihood: 'poisson'` |
 | "Did the change I made have an effect?" | `pooled_gaussian` |
 | "What's the effect of price on volume, controlling for season?" | `pooled_gaussian` |
+| "How much of this spare part will be wanted next week, and how much should I stock?" | `hier_negbin` |
+| "Most of my catalogue has four weeks of history — can I forecast it at all?" | `hier_negbin` |
 | "Is this customer still a customer, or have they quietly gone?" | `payer_alive` |
 | "Which accounts on my dunning list are worth chasing?" | `payer_alive` |
 | "How much buffer does *this* segment need to cover 95 % of cases?" | `varying_variance_gaussian` |
@@ -702,6 +704,8 @@ than exhausting memory. See [Scalability](SCALABILITY.md).
 | `invalid config at 'grup'` | A typo — the message names the slot and suggests the intended one |
 | `singular or rank-deficient design matrix` | Two predictors carry the same information (e.g. a constant column beside an intercept) |
 | Effect estimate looks far too large | A before/after comparison with no control group absorbs the underlying trend |
+| `hier_negbin` says `degenerate` and every draw is `NULL` | Every count in the table is zero. There is no demand rate to estimate for a part nobody has ever issued |
+| `hier_negbin` rejects `engine: 'laplace'` | It is not a limitation to work around: a Gaussian at the joint mode of a non-centred hierarchy is not a posterior. Drop the slot and let it use NUTS ([Theory §4](THEORY.md)) |
 | `payer_alive` says `degenerate` and every draw is `NULL` | No repeat buyer in the base has ever gone quiet — usually `age` was taken as the last payment date instead of today. [What to do](#tell-which-customers-have-quietly-stopped-buying) |
 | Every `payer_alive` customer scores `P(alive) = 1` | `frequency` counted *all* purchases instead of repeats, so nobody has had an opportunity to churn |
 | A forecast changes between runs of the same fit | The recipe uses `random()`, which the fit's `seed` does not cover. Use `anofox_bayes_std_normal(seed, key, draw)` instead and record the seed alongside `model_id` |

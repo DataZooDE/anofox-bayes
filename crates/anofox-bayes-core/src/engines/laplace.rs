@@ -921,15 +921,23 @@ mod tests {
         }
     }
 
-    /// Every family is served by the Laplace engine, and every *conjugate* family is
-    /// additionally served by the exact one — which is what gives it the two-engine
-    /// cross-check, the strongest correctness gate in this crate.
+    /// Every family exposing a gradient is *mechanically* servable by the Laplace
+    /// engine, and every *conjugate* family is additionally served by the exact one —
+    /// which is what gives it the two-engine cross-check, the strongest correctness
+    /// gate in this crate.
     ///
     /// The list of families that decline `exact` is spelled out rather than derived,
     /// because declining it costs a warranty. `censored_aft` is on that list because
     /// its posterior genuinely has no closed form; a family added there without that
     /// justification fails review, and a family added to the catalog and to neither
     /// list fails here.
+    ///
+    /// **`hier_negbin` is the one family that declines `laplace` too**, and it does so
+    /// in `compile` rather than through `Engine::supports`, because the reason is a
+    /// property of its geometry rather than of the trait it implements: it exposes a
+    /// gradient because NUTS needs one, and a Gaussian at the joint mode of a
+    /// non-centred hierarchy is still not a posterior. See
+    /// `catalog::f1_hier_negbin::build`.
     #[test]
     fn every_family_is_served_by_laplace_and_every_conjugate_one_also_by_exact() {
         let n = 40;
@@ -955,10 +963,12 @@ mod tests {
             .numeric("freq", (0..n).map(|i| (i % 5) as f64).collect())
             .numeric("rec", (0..n).map(|i| ((i % 5) as f64) * 6.0).collect())
             .numeric("age", (0..n).map(|_| 40.0).collect())
+            .numeric("units", (0..n).map(|i| (i % 6) as f64).collect())
             .key(
                 "segment",
                 (0..n).map(|i| ["A", "B", "C", "D"][i % 4]).collect(),
-            );
+            )
+            .key("sku", (0..n).map(|i| ["A", "B", "C", "D"][i % 4]).collect());
         let refs = f.key_refs();
         let view = f.view(&refs);
 
@@ -978,10 +988,21 @@ mod tests {
             // that approximation as inadmissible here, and the family's default engine
             // is `nuts`. See `sbc::families::f8_under_laplace_is_measured_and_is_not_certified`.
             "varying_variance_gaussian",
+            // A hierarchical negative binomial has no conjugate prior either, and
+            // unlike the one above it has no *usable* Gaussian approximation at all:
+            // a non-centred hierarchy has no joint mode, because at z = 0 the
+            // likelihood does not depend on tau and the log-Jacobian rises without
+            // bound along a ridge carrying no mass. It is sampled, and `laplace` on it
+            // is refused rather than served badly.
+            "hier_negbin",
         ];
+
+        // Refuses `laplace` in `compile`, for a reason `Engine::supports` cannot see.
+        const NO_LAPLACE_POSTERIOR: &[&str] = &["hier_negbin"];
 
         let configs = [
             ("pooled_gaussian", r#"{"y": "y", "x": "x1"}"#),
+            ("hier_negbin", r#"{"y": "units", "group": "sku"}"#),
             ("conjugate_anomaly", r#"{"value": "cost"}"#),
             (
                 "censored_aft",
@@ -1011,6 +1032,18 @@ mod tests {
                 LaplaceEngine.supports(&*model),
                 "{family} must be servable by the Laplace engine"
             );
+            // ...and where a family nevertheless refuses it, the refusal is precise
+            // and arrives from the family rather than from the engine.
+            if NO_LAPLACE_POSTERIOR.contains(&family) {
+                let mut with_laplace: serde_json::Value = serde_json::from_str(cfg).unwrap();
+                with_laplace["engine"] = "laplace".into();
+                let e = crate::catalog::lookup(family)
+                    .unwrap()
+                    .compile(&Config::parse(&with_laplace.to_string()).unwrap(), &view)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("NUTS only"), "{family}: {e}");
+            }
             assert_eq!(
                 crate::engines::ExactEngine.supports(&*model),
                 !NO_EXACT_POSTERIOR.contains(&family),

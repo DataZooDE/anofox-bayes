@@ -193,7 +193,7 @@ byte-identical draws, whatever the chain count and whatever DuckDB's thread layo
 because chains are seeded from `(seed, chain)` and run sequentially.
 | `exact` | **Available**, and the default for `conjugate_anomaly` and `pooled_gaussian`. Samples the closed-form conjugate posterior directly — no approximation, so where it applies it is both faster and more accurate. `payer_alive` has no closed form and rejects it: *"the exact engine cannot serve family 'payer_alive'"*. |
 | `laplace` | **Available on `pooled_gaussian`, and the default and only engine for `payer_alive`.** Fits a Gaussian at the posterior mode on an unconstrained scale. `conjugate_anomaly` exposes no gradient and rejects it: *"the laplace engine cannot serve family 'conjugate_anomaly'"*. |
-| `nuts` | **Not available.** Errors with *"the NUTS engine arrives in 0.2. Until then use 'exact' … or 'laplace' …"*. |
+| `nuts` | **Available**, and the default and only engine for `hier_negbin`. Explores the posterior itself, so it needs no closed form and makes no Gaussian assumption. |
 
 Switching engines changes no caller SQL: same function, same output columns, same
 diagnostics. It does change `model_id`, because two posteriors carrying different
@@ -215,14 +215,10 @@ what an anomaly model is looking at. Both engines have their own calibration sui
 `__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. **Read it.** An
 `exact` posterior and a `laplace` one look identical in SQL and do not carry the same
 warranty: the first is the posterior, the second is a Gaussian approximation to it.
-The family that ran is on the table too, as `__family__`: `2` for `censored_aft`,
-`3` for `pooled_gaussian`, `7` for `conjugate_anomaly`, `8` for
-`varying_variance_gaussian` — the catalog F-numbers where one applies, decoded by
-`__engine__` in the metadata rows is `0` exact, `1` laplace, `2` nuts. The family that
-ran is on the table too, as `__family__`: `3` for `pooled_gaussian`, `5` for
-`payer_alive`, `7` for `conjugate_anomaly`, `8` for `varying_variance_gaussian` —
-decoded by
-`anofox_bayes_family_text(param, value)`. See
+The family that ran is on the table too, as `__family__`: `1` for `hier_negbin`, `2`
+for `censored_aft`, `3` for `pooled_gaussian`, `5` for `payer_alive`, `7` for
+`conjugate_anomaly` and `8` for `varying_variance_gaussian` — the catalog F-numbers
+where one applies — decoded by `anofox_bayes_family_text(param, value)`. See
 [the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
 ### 1.5 Null handling and grouping
@@ -629,6 +625,87 @@ how many groups the verdict is about. A refused group's draws are `NULL`, so it 
 appears in the table under its own name.
 
 **Worked example:** `test/sql/f2_delivery_promise.test`.
+### 2.5 `hier_negbin` (F1)
+
+> Hierarchical count GLM — Poisson or negative binomial with a partially pooled
+> per-group level, non-centred — for per-SKU demand and the reorder quantile a
+> safety-stock decision reads off it.
+
+One row per group per period. The response is a whole count.
+
+**Config slots**
+
+| Slot | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `y` | column | **yes** | — | The count. Non-negative whole numbers; a fraction is a request error, not a status. |
+| `group` | key column | **yes** | — | The SKU, part or item. A hierarchical model needs groups, so this is not optional. |
+| `x` | column or list | no | none | Population-level covariates — a promotion flag, a seasonal index. One coefficient each, shared across groups. |
+| `exposure` | column | no | none | Time or volume each row was observed over, entering as a `log` offset with coefficient one. Must be `> 0`. With it, `rate` is a count *per unit of exposure*. |
+| `likelihood` | `negbinomial` \| `poisson` | no | `negbinomial` | Poisson is the no-extra-burstiness special case. Prefer the default unless you know the data is Poisson: on overdispersed data a Poisson reorder point under-delivers measurably. |
+| `min_groups` | integer ≥ 2 | no | `3` | Below this many groups the fit is `insufficient_data`: a pooling scale estimated from fewer describes the sample rather than the catalogue. |
+| `prior.intercept.mean` / `.sd` | number / number > 0 | no | `0` / ∞ | Normal prior on the population log rate. Absent `sd` is flat — the scale-free default. |
+| `prior.beta.scale` | number > 0 | no | ∞ | Normal prior sd shared by every `x` coefficient. |
+| `prior.tau.scale` | number > 0 | no | ∞ | Half-normal scale for the pooling scale. Absent means the reference prior: **uniform on `tau`**, which is proper for three or more groups. |
+| `prior.phi.log_mean` / `.log_sd` | number / number > 0 | no | — | Lognormal prior on the dispersion. `log_sd` is what switches the prior on; supplying `log_mean` alone is a config error, because a prior mean with no spread is not a prior. Absent means the reference prior: **uniform on the overdispersion `1/phi`**, which is flat exactly at the Poisson limit. |
+
+**Parameters emitted**
+
+| Parameter | `group_id` | Meaning |
+|---|---|---|
+| `intercept` | `__global__` | Population log rate. |
+| `beta[<column>]` | `__global__` | One per `x` column. |
+| `tau` | `__global__` | Pooling scale: the standard deviation of group log rates about the population level. Small `tau` means the catalogue is homogeneous and thin items are shrunk hard. |
+| `phi` | `__global__` | Negative binomial dispersion. `Var(y) = mu + mu²/phi`, so **large `phi` is the Poisson limit**; read `1/phi` to talk about overdispersion. Absent under `likelihood: 'poisson'`. |
+| `u` | per group | That group's offset from the population level, on the log scale. |
+| `rate` | per group | `exp(intercept + u)` — the group's expected count per unit of exposure, with any covariates at zero. This is the number a reorder point is built from. |
+
+**Engine.** `nuts` only, and both alternatives refuse rather than approximate.
+`exact` has no closed form to sample. `laplace` is **inadmissible**, not merely worse:
+a Laplace posterior is a Gaussian at the joint mode, and a non-centred hierarchy has
+none — when every group offset is zero the likelihood does not depend on `tau` at all.
+Asking for it errors with *"'hier_negbin' is served by NUTS only…"*. Because NUTS is
+the engine, `chains` defaults to `4`, R̂ is a real statistic rather than `NULL`, the
+four sampler-statistic rows appear on the draws table, and a single divergence makes
+the fit `degenerate`.
+
+**The reorder point, in SQL.** The posterior predictive for the next period is a
+mixture of negative binomials — one per posterior draw — and its probability mass
+function is closed form, so a service level is a sum over the draws table with no
+re-fit and no simulation:
+
+```sql
+SELECT part, min(k) FILTER (WHERE cdf >= 0.95) AS reorder_point
+FROM (
+  SELECT part, k, sum(pmf) OVER (PARTITION BY part ORDER BY k) AS cdf
+  FROM (
+    SELECT r.group_id AS part, k.k,
+           avg(exp(lgamma(k.k + p.value) - lgamma(p.value) - lgamma(k.k + 1)
+                   + p.value * ln(p.value / (p.value + r.value))
+                   + k.k * ln(r.value / (p.value + r.value)))) AS pmf
+    FROM (SELECT group_id, chain, draw, value FROM draws WHERE param = 'rate' AND draw >= 0) r
+    JOIN (SELECT chain, draw, value FROM draws WHERE param = 'phi' AND draw >= 0) p
+      USING (chain, draw)
+    CROSS JOIN (SELECT range AS k FROM range(0, 201)) k
+    GROUP BY r.group_id, k.k
+  )
+) GROUP BY part;
+```
+
+Averaging over the draws integrates out the level, the group's own offset, the pooling
+scale and the dispersion at once, which is exactly what a plug-in estimate at a point
+cannot do and why a thin item's interval comes out honest.
+
+**Validation and refusal**
+
+| Situation | Outcome |
+|---|---|
+| Fewer than `min_groups` groups | `insufficient_data`, draws still emitted |
+| Every count zero | `degenerate`, every draw `NULL` — the rate is identified only in the limit |
+| R̂, ESS or a divergence fails | `degenerate` |
+| Fractional or negative `y`, non-positive `exposure` | **not a status** — a request error naming the column |
+
+**Worked example:** `test/sql/f1_hier_negbin.test`.
+
 ### 2.3 `payer_alive` (F5)
 
 > BG/NBD buy-till-you-die model over per-customer (frequency, recency, age)
