@@ -8,7 +8,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Rust targets (for local development)
-.PHONY: rust_release rust_debug test_rust test_sbc lint format_rust format_rust_fix clean_all
+.PHONY: rust_release rust_debug test_rust test_sbc test_scenario lint format_rust format_rust_fix clean_all
 
 rust_release:
 	cargo build --release
@@ -25,6 +25,13 @@ test_rust:
 # family per engine), so it is #[ignore]d and only run explicitly / in CI.
 test_sbc:
 	cargo test --workspace --release -- --ignored --nocapture
+
+# `test/sql/scenario_counterfactual.test` needs a second extension, so `make test`
+# reports it as skipped rather than failing. Install anofox-scenario once and it runs
+# with the rest; this target does both.
+test_scenario:
+	build/release/duckdb -unsigned -c "INSTALL anofox_scenario FROM community;"
+	build/release/test/unittest "test/sql/scenario_counterfactual.test"
 
 # What CI gates on, and therefore what to run before pushing. `-D warnings` is CI's
 # setting; running anything laxer locally just moves the failure to the pipeline.

@@ -1,0 +1,348 @@
+# name: test/sql/scenario_counterfactual.test
+# description: Counterfactual branches over a posterior, using anofox-scenario as the branch (BR-9)
+# group: [sql]
+#
+# BR-9 asks for scenarios to be first class: "a scenario branch is a counterfactual".
+# There is no extension code behind this file, and there is deliberately none to write.
+#
+# `anofox-bayes` publishes exactly one artefact -- a table of draws -- and
+# `anofox-scenario` branches exactly one thing -- a table. So the two already compose
+# through the catalog, with no registration API, no shared header and no coupled
+# release. The pattern is three rules:
+#
+#   1. Branch the ASSUMPTIONS, never the draws. A counterfactual changes what you
+#      plan to do, not what the data said. Editing a posterior is fabricating
+#      evidence, and this file asserts the draws are bit-identical inside every
+#      branch.
+#   2. Write the predictive step as VIEWS over the assumption table. `anofox-scenario`
+#      rebinds unqualified references inside a view to the scenario's tables, so
+#      `SELECT * FROM sc_discount.profit` re-runs the whole posterior-predictive
+#      chain against the branch's plan. Nothing is refitted; nothing is copied.
+#   3. Key the simulation noise on the ROW, not on anything the branch changes.
+#      `anofox_bayes_std_normal(seed, key, draw)` is a pure function of its
+#      coordinates, so every branch sees the same shock and the difference between
+#      two branches is the effect rather than the effect plus sampling jitter. The
+#      final section of this file shows that this is the difference between a
+#      decision and a shrug.
+#
+# The one-subquery-parameter constraint that killed `anofox_bayes_predict`
+# (ROADMAP §5) bites harder here, not less: a `scenario_compare(draws, a, b)` needs
+# three relations where DuckDB allows one.
+
+require anofox_bayes
+
+require anofox_scenario
+
+#######################################
+# Fit: weekly demand as a function of price and promotion
+#######################################
+
+# 120 weeks of trading history. The truth is
+#     units = 200 - 3.0*price + 25*promo + 0.5*week
+# with a small deterministic residual, so every number asserted below has a closed
+# form and the test is checking the answer rather than recording it.
+statement ok
+CREATE TABLE history AS
+SELECT w AS week,
+       (16.0 + ((w * 7) % 9))::DOUBLE          AS price,
+       ((w % 5) = 0)::INTEGER                  AS promo,
+       200.0 - 3.0 * (16.0 + ((w * 7) % 9))
+             + 25.0 * ((w % 5) = 0)::INTEGER
+             + 0.5 * w
+             + ((w % 11) - 5) * 0.3            AS units
+FROM generate_series(0, 119) AS g(w);
+
+statement ok
+CREATE TABLE draws AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT week, price, promo, units FROM history), 'pooled_gaussian',
+    {'y': 'units', 'x': ['price', 'promo', 'week'], 'draws': 2000, 'seed': 7});
+
+query I
+SELECT value = 0 FROM draws WHERE param = '__status__';
+----
+true
+
+# The price coefficient is the elasticity the whole decision rests on.
+query I
+SELECT round(median(value), 1) FROM draws WHERE param = 'beta[price]' AND draw >= 0;
+----
+-3.0
+
+#######################################
+# The plan: the one table a scenario will branch
+#######################################
+
+# Next quarter, as currently committed. It has a PRIMARY KEY, which is what lets a
+# scenario UPDATE it.
+statement ok
+CREATE TABLE plan (week INTEGER PRIMARY KEY, price DOUBLE, promo INTEGER, fixed_cost DOUBLE);
+
+statement ok
+INSERT INTO plan SELECT w, 20.0, 0, 0.0 FROM generate_series(120, 127) AS g(w);
+
+#######################################
+# The predictive chain, as views
+#######################################
+
+# Long format, one row per (week, predictor), with `param` matching the names the fit
+# emitted. Every reference below is UNQUALIFIED -- that is what makes the chain
+# re-bindable inside a scenario.
+statement ok
+CREATE VIEW plan_long AS
+SELECT week AS row_id, 'intercept' AS param, 1.0 AS x FROM plan
+UNION ALL SELECT week, 'beta[price]', price          FROM plan
+UNION ALL SELECT week, 'beta[promo]', promo::DOUBLE  FROM plan
+UNION ALL SELECT week, 'beta[week]',  week::DOUBLE   FROM plan;
+
+statement ok
+CREATE VIEW mu_pred AS
+SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+FROM draws d JOIN plan_long n USING (param)
+WHERE d.draw >= 0
+GROUP BY n.row_id, d.draw;
+
+# The posterior PREDICTIVE: parameter uncertainty plus the observation noise a real
+# week actually carries. The noise is keyed on (row, draw) -- never on price or promo,
+# which is exactly what a branch changes.
+statement ok
+CREATE VIEW units_pred AS
+SELECT m.row_id, m.draw,
+       m.mu + s.value * anofox_bayes_std_normal(4242, m.row_id::VARCHAR, m.draw) AS units
+FROM mu_pred m
+JOIN (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0) s USING (draw);
+
+# Quarterly gross profit per draw. This is the decision variable, and it is a
+# posterior distribution rather than a number.
+statement ok
+CREATE VIEW profit AS
+SELECT u.draw, sum(u.units * p.price - p.fixed_cost) AS profit
+FROM units_pred u JOIN plan p ON p.week = u.row_id
+GROUP BY u.draw;
+
+# Every predictor found its partner. A missing one silently drops a term and yields a
+# confident, wrong forecast in every branch at once.
+query I
+SELECT count(DISTINCT param) FROM draws d JOIN plan_long n USING (param);
+----
+4
+
+query I
+SELECT count(*) FROM profit;
+----
+2000
+
+#######################################
+# Three counterfactual branches
+#######################################
+
+# Branch 1: cut the list price by 10% for the quarter.
+statement ok
+CALL scenario_create('discount', 'list price 20.00 -> 18.00 for the quarter');
+
+statement ok
+ATTACH 'discount' AS sc_discount (TYPE scenario);
+
+statement ok
+UPDATE sc_discount.plan SET price = 18.0;
+
+# Branch 2: run the promotion every week instead, at 480/week of fixed cost.
+statement ok
+CALL scenario_create('promo_push', 'promotion every week, 480/week');
+
+statement ok
+ATTACH 'promo_push' AS sc_promo (TYPE scenario);
+
+statement ok
+UPDATE sc_promo.plan SET promo = 1, fixed_cost = 480.0;
+
+# Branch 3: branch OFF branch 1 -- the deeper cut, inheriting the first cut's changes.
+statement ok
+CALL scenario_create('deep_discount', 'price 18.00 -> 16.00', from_scenario := 'discount');
+
+statement ok
+ATTACH 'deep_discount' AS sc_deep (TYPE scenario);
+
+statement ok
+UPDATE sc_deep.plan SET price = 16.0;
+
+# The delta is the changelog: eight modified plan rows per branch, and nothing else
+# touched. This is the audit trail the hand-rolled `CREATE TABLE counterfactual AS`
+# recipe does not have.
+query III
+SELECT table_name, rows_modified, rows_added
+FROM scenario_diff_summary('promo_push')
+WHERE rows_modified > 0 OR rows_added > 0;
+----
+plan	8	0
+
+query IIII
+SELECT week, column_name, old_value, new_value
+FROM scenario_diff('discount', 'plan') WHERE week = 120;
+----
+120	price	20.0	18.0
+
+# The committed plan is untouched by any of the three.
+query II
+SELECT DISTINCT price, promo FROM plan;
+----
+20.0	0
+
+#######################################
+# The posterior is NOT branched
+#######################################
+
+# The counterfactual asks "what if we had done something else", not "what if the data
+# had said something else". Nothing was refitted, and the draws a branch reads are the
+# same draws to the last bit -- which is what makes three branches cost three joins.
+query I
+SELECT count(*) = 0 FROM (
+    SELECT * FROM draws
+    EXCEPT ALL
+    SELECT * FROM sc_promo.draws
+);
+----
+true
+
+#######################################
+# The decision, read off the posterior difference
+#######################################
+
+# Paired on `draw`: each branch is compared with the baseline under the same posterior
+# draw AND the same simulated shock, so the difference is the policy effect alone.
+#
+# Closed-form truths, from the coefficients above, summed over weeks 120..127:
+#   discount       18*(146 + 0.5w) - 20*(140 + 0.5w)  =  -2364
+#   deep_discount  16*(152 + 0.5w) - 20*(140 + 0.5w)  =  -4920
+#   promo_push     20*25 - 480 per week               =  +  160
+# Each median must land on its truth and each 95% interval must cover it. Both are
+# asserted as properties rather than as literals: the interval width is a function of
+# the residual variance, so pinning digits would make this brittle against changes
+# that are not regressions.
+query IIII
+SELECT abs(median(c.profit - b.profit) + 2364) < 120     AS median_on_truth,
+       quantile_cont(c.profit - b.profit, 0.025) < -2364 AS covers_below,
+       quantile_cont(c.profit - b.profit, 0.975) > -2364 AS covers_above,
+       quantile_cont(c.profit - b.profit, 0.975) < 0     AS confidently_worse
+FROM profit b JOIN sc_discount.profit c USING (draw);
+----
+true	true	true	true
+
+query III
+SELECT quantile_cont(c.profit - b.profit, 0.025) < -4920 AS covers_below,
+       quantile_cont(c.profit - b.profit, 0.975) > -4920 AS covers_above,
+       quantile_cont(c.profit - b.profit, 0.975) < 0     AS confidently_worse
+FROM profit b JOIN sc_deep.profit c USING (draw);
+----
+true	true	true
+
+query IIII
+SELECT abs(median(c.profit - b.profit) - 160) < 80      AS median_on_truth,
+       quantile_cont(c.profit - b.profit, 0.025) < 160  AS covers_below,
+       quantile_cont(c.profit - b.profit, 0.975) > 160  AS covers_above,
+       quantile_cont(c.profit - b.profit, 0.025) > 0    AS confidently_better
+FROM profit b JOIN sc_promo.profit c USING (draw);
+----
+true	true	true	true
+
+# The question a decision-maker actually asks, answered directly from the draws.
+query II
+SELECT round(avg(CASE WHEN c.profit > b.profit THEN 1.0 ELSE 0.0 END), 3) AS p_promo_better,
+       (SELECT round(avg(CASE WHEN c2.profit > b2.profit THEN 1.0 ELSE 0.0 END), 3)
+        FROM profit b2 JOIN sc_discount.profit c2 USING (draw))            AS p_discount_better
+FROM profit b JOIN sc_promo.profit c USING (draw);
+----
+1.0	0.0
+
+# Cutting price is monotonically worse here: demand is not elastic enough to pay for
+# the margin given up, and a deeper cut loses more. Ranking the branches is a query.
+query I
+SELECT list(branch ORDER BY med DESC) FROM (
+    SELECT 'promo_push' AS branch, median(c.profit - b.profit) AS med
+      FROM profit b JOIN sc_promo.profit c USING (draw)
+    UNION ALL
+    SELECT 'discount', median(c.profit - b.profit)
+      FROM profit b JOIN sc_discount.profit c USING (draw)
+    UNION ALL
+    SELECT 'deep_discount', median(c.profit - b.profit)
+      FROM profit b JOIN sc_deep.profit c USING (draw)
+);
+----
+[promo_push, discount, deep_discount]
+
+#######################################
+# Why the shared noise is load-bearing
+#######################################
+
+# Everything above holds because baseline and branch are evaluated at the same
+# `anofox_bayes_std_normal` coordinates, so the observation noise cancels out of the
+# difference. Below is the same comparison written the tempting way -- each side
+# drawing its own shock -- with nothing else changed.
+statement ok
+CREATE TABLE unpaired AS
+WITH sig AS (SELECT draw, value FROM draws WHERE param = 'sigma' AND draw >= 0),
+mu_base AS (
+    SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+    FROM draws d JOIN plan_long n USING (param) WHERE d.draw >= 0 GROUP BY 1, 2),
+mu_cf AS (
+    SELECT n.row_id, d.draw, sum(d.value * n.x) AS mu
+    FROM draws d JOIN sc_promo.plan_long n USING (param) WHERE d.draw >= 0 GROUP BY 1, 2),
+pb AS (
+    SELECT m.draw, sum((m.mu + s.value * anofox_bayes_std_normal(4242, 'base|' || m.row_id, m.draw)) * 20.0) AS profit
+    FROM mu_base m JOIN sig s USING (draw) GROUP BY 1),
+pc AS (
+    SELECT m.draw, sum((m.mu + s.value * anofox_bayes_std_normal(4242, 'cf|' || m.row_id, m.draw)) * 20.0 - 480.0) AS profit
+    FROM mu_cf m JOIN sig s USING (draw) GROUP BY 1)
+SELECT pc.profit - pb.profit AS diff FROM pb JOIN pc USING (draw);
+
+# Same model, same branch, the same estimate of the effect -- and no longer a
+# decision. The interval now straddles zero, because it carries the variance of two
+# independent quarters of weather that the paired comparison differences away.
+query III
+SELECT abs(median(diff)
+           - (SELECT median(c.profit - b.profit)
+              FROM profit b JOIN sc_promo.profit c USING (draw))) < 1.0 AS same_estimate,
+       quantile_cont(diff, 0.025) > 0                                   AS confidently_better,
+       avg(CASE WHEN diff > 0 THEN 1.0 ELSE 0.0 END)
+           BETWEEN 0.90 AND 0.99                                        AS p_better_but_not_enough
+FROM unpaired;
+----
+true	false	true
+
+# The two comparisons agree on the answer and disagree on whether you may act on it:
+# the paired interval is several times tighter for the identical counterfactual.
+query I
+SELECT (SELECT stddev_samp(diff) FROM unpaired)
+     > 2 * (SELECT stddev_samp(c.profit - b.profit)
+            FROM profit b JOIN sc_promo.profit c USING (draw));
+----
+true
+
+#######################################
+# Freezing the chosen branch
+#######################################
+
+# The branch that won the argument becomes the record of what was approved, and
+# further writes are rejected while reads keep working.
+statement ok
+CALL scenario_freeze('promo_push');
+
+statement error
+UPDATE sc_promo.plan SET fixed_cost = 0.0;
+----
+<REGEX>:.*frozen.*
+
+query I
+SELECT quantile_cont(c.profit - b.profit, 0.025) > 0
+FROM profit b JOIN sc_promo.profit c USING (draw);
+----
+true
+
+statement ok
+DETACH sc_deep;
+
+statement ok
+DETACH sc_discount;
+
+statement ok
+DETACH sc_promo;

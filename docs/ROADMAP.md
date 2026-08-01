@@ -33,7 +33,7 @@ all; *degradation* means it runs with a caveat someone has to carry.
 | 10 | ~~`conjugate_anomaly` has no `as_differentiable`~~ **done** | none | Correctness gate, not a feature | 2–3 | — |
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | Degradation, sharply worse at thousands of groups | 3–5 | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | Degradation; a pre-fit gate agents cannot run today | 4–6 | — |
-| 13 | No `anofox-scenario` integration (BR-9) | 01–07 | Degradation; branching a draws table is the agent's job | 5–8 | scenario's catalog API |
+| 13 | ~~No `anofox-scenario` integration (BR-9)~~ **closed, as documentation** | 01–07 | The two extensions already compose; see §5 | 0.5 | — |
 | 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | Degradation, only past the measured ceilings | 8–14 | — |
 
 Two ranking notes worth stating rather than leaving implicit.
@@ -136,7 +136,8 @@ the order.
 - **F4 native** (gap 8). A lognormal delay model is a Gaussian model on `log(delay)`,
   so `pooled_gaussian` already substitutes and the v0.3 family covers per-segment
   spread. A native Gamma-delay family buys the Gamma branch and little else.
-- **Prior-predictive checks** (gap 12) and **`anofox-scenario` integration** (gap 13).
+- **Prior-predictive checks** (gap 12). (Gap 13, the `anofox-scenario` integration,
+  turned out to need no code at all — see §5.)
 - **Scale work** (gap 14): rayon across groups for `conjugate_anomaly`, streaming
   sufficient statistics rather than buffering the input relation, lazy per-chunk draw
   emission. All three are recorded in `SCALABILITY.md`. None is hit by the workloads
@@ -438,6 +439,31 @@ them; `anofox-forecast` covers time-series intervals.
 at most one subquery parameter per table function, so a function taking both draws and
 new rows cannot bind. The join recipe is the design; its executable specification is
 `test/sql/posterior_predictive.test`.
+
+**An `anofox-scenario` integration surface (BR-9, gap 13).** Investigated and closed
+without code, which was the surprise. `anofox-scenario` has no registration or
+provider API to register against: its entire public surface is SQL — `scenario_create`,
+`ATTACH … (TYPE scenario)`, `scenario_diff` — and its only `extern "C"` symbols are the
+DuckDB extension entry points. Nor does it need one. This extension publishes exactly
+one artefact, a table of draws, and that extension branches exactly one thing, a table;
+they already meet in the catalog.
+
+The binding constraint from the `anofox_bayes_predict` entry above is worse here, not
+better: a `scenario_compare(draws, baseline, counterfactual)` needs *three* relations
+where DuckDB allows one subquery parameter. A string-argument variant that opened the
+tables by name would have to re-implement, inside a single-threaded table function, the
+join the caller can already write — and would have to hard-code knowledge of scenario
+catalogs to do it, coupling the release cycles of two separately licensed products for
+no gain.
+
+What actually needed writing was the *discipline*, because two of its three rules are
+easy to get wrong and neither fails loudly: branch the assumptions rather than the
+draws (editing a posterior is fabricating evidence), and key the simulation noise on
+the row rather than on anything the branch changes. Get the second wrong and the
+comparison still returns the right estimate with an interval several times too wide —
+measured in `test/sql/scenario_counterfactual.test`, `+149 [+81, +218]` becomes
+`+149 [−21, +318]`, which is the difference between a decision and a shrug. The
+pattern is documented in `GUIDE.md` and its executable specification is that test.
 
 **Autodiff.** The catalog is closed, so each gradient is written once and checked once
 against finite differences away from the mode. A general mechanism would cost more to
