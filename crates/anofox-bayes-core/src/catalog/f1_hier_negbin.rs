@@ -463,6 +463,29 @@ impl LogPosterior for CompiledHierNegbin {
         self.start.clone()
     }
 
+    /// A finer step than the engine default of 0.8.
+    ///
+    /// A hierarchical count model has curvature that varies sharply along `tau`, so a
+    /// step tuned to the bulk overshoots in the tail and is reported as a divergence.
+    /// This family sets `max_divergent = 0` -- one divergence grades the fit
+    /// `degenerate`, which is right, because draws around a divergent trajectory are
+    /// not from the posterior. The two together made a *correct* posterior get
+    /// refused.
+    ///
+    /// Measured on a 12-part, 6-week panel, the shape THEORY.md says a C-parts
+    /// catalogue actually has: at 0.8, 4 of 36 fits diverged across three
+    /// configurations and twelve seeds. It was worse than a seed lottery -- the
+    /// `test/sql/f1_hier_negbin.test` fixture converged on the author's machine and
+    /// came back `degenerate` on CI, on both DuckDB versions, because the margin was
+    /// thin enough for floating-point differences between machines to flip it. A
+    /// verdict that depends on which machine ran it is not a verdict.
+    ///
+    /// Stan's `adapt_delta` is the same dial, raised for the same models for the same
+    /// reason. It costs leapfrog steps, not correctness: the target distribution is
+    /// untouched.
+    fn target_accept(&self) -> f64 {
+        0.95
+    }
     fn constrain(&self, theta: &[f64], out: &mut [f64]) {
         if self.refuses() {
             out.fill(f64::NAN);
@@ -2220,7 +2243,7 @@ mod sql_fixture_check {
         let f = fit(
             "hier_negbin",
             &Config::parse(
-                r#"{"y": "units", "group": "part", "draws": 1000, "chains": 4, "seed": 42}"#,
+                r#"{"y": "units", "group": "part", "draws": 2000, "chains": 4, "seed": 42}"#,
             )
             .unwrap(),
             &view,
@@ -2366,5 +2389,117 @@ mod sql_fixture_check {
         .unwrap();
         println!("all zeros: {:?}", f.posterior.meta.status);
         assert_eq!(f.posterior.meta.status, crate::types::FitStatus::Degenerate);
+    }
+    //=== Divergences on thin parts ========================================//
+
+    /// **A correct posterior must not be refused.**
+    ///
+    /// Found by the PyMC parity suite. This family sets `max_divergent = 0` -- one
+    /// divergence is enough to grade a fit `degenerate`, which is right, because the
+    /// draws around a divergent trajectory are not from the posterior. But it left
+    /// `target_accept` at the engine default of 0.8, and a six-week thin part is
+    /// exactly the geometry that needs a smaller step: the curvature varies sharply
+    /// along `tau`, so a step tuned to the bulk overshoots in the tail.
+    ///
+    /// The result was a fit reporting `degenerate` while all 27 of its parameters
+    /// agreed with PyMC inside tolerance. Refusing a posterior that is right is worse
+    /// than the divergence it was refusing over, because it is the failure mode a
+    /// caller cannot work around.
+    ///
+    /// Six weeks per part is not an unlucky fixture: `THEORY.md` says that is the
+    /// shape a C-parts catalogue has, which is the catalogue this family exists for.
+    #[test]
+    fn a_thin_part_panel_converges_rather_than_reporting_divergences() {
+        let mut rng = crate::rng::BayesRng::for_chain(4242, 0);
+        let panel = testing::simulate(&mut rng, 24, 6, 1.1, 0.6, Some(2.0)).unwrap();
+
+        let frame = Frame::new(panel.y.len())
+            .numeric("units", panel.y.clone())
+            .key("sku", panel.sku.iter().map(String::as_str).collect());
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let cfg = crate::config::Config::parse(
+            r#"{"y": "units", "group": "sku", "draws": 1000, "chains": 4, "seed": 11}"#,
+        )
+        .unwrap();
+        let fit = crate::fit::fit("hier_negbin", &cfg, &view).unwrap();
+
+        assert_eq!(
+            fit.posterior.n_divergent(),
+            Some(0),
+            "a thin-part panel diverged: {:?}",
+            fit.reasons
+        );
+        assert_eq!(
+            fit.posterior.meta.status,
+            crate::types::FitStatus::Converged,
+            "{:?}",
+            fit.reasons
+        );
+    }
+
+    /// The dial that fixes it, pinned so it cannot drift back to the default.
+    #[test]
+    fn the_family_asks_for_a_finer_step_than_the_engine_default() {
+        let mut rng = crate::rng::BayesRng::for_chain(1, 0);
+        let panel = testing::simulate(&mut rng, 6, 8, 1.0, 0.5, Some(2.0)).unwrap();
+        let frame = Frame::new(panel.y.len())
+            .numeric("units", panel.y.clone())
+            .key("sku", panel.sku.iter().map(String::as_str).collect());
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let model = HierNegbin
+            .compile(
+                &crate::config::Config::parse(r#"{"y": "units", "group": "sku"}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        assert!(
+            model.as_differentiable().unwrap().target_accept() >= 0.95,
+            "a hierarchical count model needs a finer step than 0.8"
+        );
+    }
+
+    /// **A correct posterior must not be refused.**
+    ///
+    /// The regression this family shipped with. `max_divergent = 0` is right -- draws
+    /// around a divergent trajectory are not from the posterior -- but paired with the
+    /// engine's default step target of 0.8 it refused fits whose parameters agreed
+    /// with PyMC to within tolerance.
+    ///
+    /// Twelve parts over six weeks is the shape THEORY.md says a C-parts catalogue
+    /// has, which is the catalogue this family exists for. At 0.8 this measured
+    /// 2/12, 1/12 and 1/12 seeds diverging across the three configurations; at 0.95
+    /// all thirty-six converge. Written as a sweep rather than one seed because the
+    /// failure was a lottery: the SQL fixture converged locally and came back
+    /// `degenerate` on CI, the margin being thin enough for floating-point
+    /// differences between machines to decide it.
+    #[test]
+    #[ignore = "slow: thirty-six complete four-chain fits"]
+    fn thin_part_panels_converge_across_seeds_rather_than_by_luck() {
+        for (tau, intercept, n_per) in [(0.6, 1.1, 6usize), (0.8, 1.1, 6), (0.6, 1.5, 6)] {
+            for seed in 1u64..=12 {
+                let mut rng = crate::rng::BayesRng::for_chain(900 + seed, 0);
+                let panel =
+                    testing::simulate(&mut rng, 12, n_per, intercept, tau, Some(2.0)).unwrap();
+                let frame = Frame::new(panel.y.len())
+                    .numeric("units", panel.y.clone())
+                    .key("sku", panel.sku.iter().map(String::as_str).collect());
+                let refs = frame.key_refs();
+                let view = frame.view(&refs);
+                let cfg = crate::config::Config::parse(&format!(
+                    r#"{{"y": "units", "group": "sku", "draws": 800, "chains": 4, "seed": {seed}}}"#
+                ))
+                .unwrap();
+                let fit = crate::fit::fit("hier_negbin", &cfg, &view).unwrap();
+                assert_eq!(
+                    fit.posterior.n_divergent(),
+                    Some(0),
+                    "tau={tau} intercept={intercept} n_per={n_per} seed={seed} diverged: {:?}",
+                    fit.reasons
+                );
+            }
+        }
     }
 }
