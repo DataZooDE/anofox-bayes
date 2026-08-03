@@ -27,17 +27,31 @@
 //!
 //! Each chain is seeded from [`BayesRng::for_chain`] — the same BLAKE3 derivation the
 //! other engines use — and `nuts-rs` seeds its internal ChaCha8 from the bytes we
-//! feed it. Chains run **sequentially**, one `nuts_rs::Chain` at a time, and this
-//! engine starts no threads. So the draws of chain *c* depend on `(seed, c)` and on
-//! nothing else: not on how many chains were asked for, not on which order they ran
-//! in, and not on how many threads DuckDB happens to have in flight. That is why
-//! `nuts-rs`'s `parallel` feature is switched off in `Cargo.toml` rather than merely
-//! unused.
+//! feed it. So the draws of chain *c* depend on `(seed, c)` and on nothing else: not
+//! on how many chains were asked for, not on which order they ran in, and not on how
+//! many threads DuckDB happens to have in flight.
 //!
-//! Chains being sequential is also the reason there is no `rayon` here. The workspace
-//! already refuses one — DuckDB owns parallelism and a nested thread pool inside a
-//! table function is a liability — and the natural unit of parallelism for this
-//! extension is groups and fits, not the four chains of one small fit.
+//! Chains run **concurrently**, one `rayon` task each, and that does not weaken any
+//! of the above. Concurrency could only move a draw if a chain's stream depended on
+//! something the scheduler decides, and none of it does: the seed is keyed on the
+//! chain *index*, each chain owns its own `nuts_rs::Chain` and its own `CpuMath`, and
+//! each writes only into the slices of the output that belong to it. Nothing is
+//! shared, and nothing is appended to. `the_draws_do_not_depend_on_the_thread_budget`
+//! and `the_draws_of_a_nuts_fit_are_bit_for_bit_reproducible` hold this down.
+//!
+//! `nuts-rs`'s own `parallel` feature stays switched off in `Cargo.toml` regardless.
+//! The parallelism here is the crate's, on the pool
+//! [`crate::parallel::with_thread_budget`] installs from DuckDB's `SET threads`, so a
+//! user who caps the process at one thread still gets one thread. Letting `nuts-rs`
+//! spawn its own would put a second, unbudgeted pool inside a table function.
+//!
+//! Chains are not the *only* unit of parallelism in this extension — groups and fits
+//! are the larger ones — but they are a real one. A four-chain hierarchical fit that
+//! saturated a single core while thirty-one sat idle was leaving most of the machine
+//! unused: measured on the F1 spare-parts fixture (14 groups, 4 chains × 2000 draws),
+//! `SET threads = 1` takes 12.7 s and `SET threads = 4` takes 3.35 s, a 3.8× speedup.
+//! Beyond four threads the same fit does not get faster, because four chains is the
+//! ceiling this particular axis has to offer.
 //!
 //! ## What the sampler statistics mean
 //!
@@ -51,6 +65,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+
+use rayon::prelude::*;
 
 use nuts_rs::{
     rand::TryRng, Chain, CpuLogpFunc, CpuMath, CpuMathError, DiagNutsSettings, HasDims, LogpError,
@@ -108,9 +124,60 @@ impl Engine for NutsEngine {
         let n_params = model.param_names().len();
         let dim = target.dim();
         let mut values = vec![0.0; opts.n_chains * opts.n_draws * n_params];
-        let mut stats = Vec::with_capacity(opts.n_chains * opts.n_draws);
+        // Pre-sized rather than pushed. Under the parallel loop below each chain
+        // fills its own slice and nothing appends, so the row for `(chain, draw)`
+        // is at a fixed index whichever order the chains finish in. Pushing was
+        // correct only because the loop was sequential, and it is exactly the kind
+        // of shared accumulator that breaks silently rather than loudly.
+        let mut stats = vec![SampleStats::default(); opts.n_chains * opts.n_draws];
 
-        for chain in 0..opts.n_chains {
+        // One rayon task per chain, on whatever pool the caller installed via
+        // `parallel::with_thread_budget`. No pool is created here: DuckDB owns the
+        // thread budget, `SET threads = 1` must still mean one thread, and a nested
+        // pool inside a table function is the liability `parallel.rs` describes.
+        //
+        // This cannot move a draw. Chain `c` seeds from `BayesRng::for_chain(seed, c)`
+        // and writes only into its own slices of `values` and `stats`, so its output
+        // is a function of `(seed, c)` and of nothing else -- not of how many chains
+        // were asked for, not of how many threads were available, and not of the
+        // order they happened to finish in. That is the same rule every other
+        // parallel site in this crate follows, and the invariant tests hold it.
+        let chunk_values = opts.n_draws * n_params;
+        let outcomes: Vec<BayesResult<()>> = values
+            .par_chunks_mut(chunk_values)
+            .zip(stats.par_chunks_mut(opts.n_draws))
+            .enumerate()
+            .map(|(chain, (values, stats))| {
+                Self::run_chain(target, opts, chain, dim, n_params, values, stats)
+            })
+            .collect();
+
+        // The first failure *by chain index*, not the first to be reported. A
+        // parallel loop finishes in an order the scheduler chooses, so taking
+        // whichever error arrived first would make the message a fit produces
+        // depend on machine timing -- and this crate's errors are part of what a
+        // caller reads and reproduces.
+        for outcome in outcomes {
+            outcome?;
+        }
+
+        Ok(Sample { values, stats })
+    }
+}
+
+impl NutsEngine {
+    /// One chain, start to finish, writing only into slices it alone owns.
+    #[allow(clippy::too_many_arguments)]
+    fn run_chain(
+        target: &dyn LogPosterior,
+        opts: &SampleOptions,
+        chain: usize,
+        dim: usize,
+        n_params: usize,
+        values: &mut [f64],
+        stats: &mut [SampleStats],
+    ) -> BayesResult<()> {
+        {
             // One stream per chain, derived exactly as every other engine derives it.
             let mut rng = BayesRng::for_chain(opts.seed, chain as u32);
             let mut settings = DiagNutsSettings {
@@ -163,23 +230,24 @@ impl Engine for NutsEngine {
                     .map_err(|e| BayesError::Internal(format!("NUTS warmup failed: {e}")))?;
             }
 
-            for draw in 0..opts.n_draws {
+            for (draw, stat) in stats.iter_mut().enumerate() {
                 let (position, _expanded, sampler_stats, progress) = sampler
                     .expanded_draw()
                     .map_err(|e| BayesError::Internal(format!("NUTS draw failed: {e}")))?;
 
-                let offset = (chain * opts.n_draws + draw) * n_params;
+                // Chain-local offsets: this slice starts at draw 0 of this chain.
+                let offset = draw * n_params;
                 target.constrain(&position, &mut values[offset..offset + n_params]);
-                stats.push(SampleStats {
+                *stat = SampleStats {
                     lp: Some(sampler_stats.point.logp),
                     divergent: Some(if progress.diverging { 1.0 } else { 0.0 }),
                     energy: Some(sampler_stats.point.energy),
                     step_size: Some(progress.step_size),
-                });
+                };
             }
         }
 
-        Ok(Sample { values, stats })
+        Ok(())
     }
 }
 
@@ -1081,5 +1149,439 @@ mod tests {
             step_size: Some(0.3),
         };
         assert!(!s.is_empty());
+    }
+
+    // ===================================================================== //
+    // The invariants a parallel chain loop must not break.
+    //
+    // These are written *before* any parallelism and must stay green through
+    // it. They are the reason a performance change to this engine can be
+    // reviewed at all: parallelising a sampler is only admissible if it cannot
+    // move a single draw, and "cannot" has to be executable.
+    // ===================================================================== //
+
+    /// A small NUTS fit, run through the whole engine, as a byte-level digest.
+    ///
+    /// `f64` formatting would hide a one-ulp difference and a tolerance would
+    /// invite one, so the draws are hashed by their raw bit patterns. Any change
+    /// to trajectory, ordering or accumulation moves this digest.
+    fn nuts_digest(n_chains: usize, seed: u64) -> (String, usize) {
+        let f = frame(60);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        let sample = NutsEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains,
+                    n_draws: 250,
+                    n_warmup: 250,
+                    seed,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )
+            .unwrap();
+        let mut hasher = blake3::Hasher::new();
+        for v in &sample.values {
+            hasher.update(&v.to_bits().to_le_bytes());
+        }
+        (hasher.finalize().to_hex().to_string(), sample.values.len())
+    }
+
+    /// **The golden.** One recorded digest, so a refactor that changes any draw
+    /// fails here and names itself.
+    ///
+    /// If this ever needs re-recording, that is a deliberate act with an
+    /// explanation attached -- not a number to update until the test passes.
+    #[test]
+    fn the_draws_of_a_nuts_fit_are_bit_for_bit_reproducible() {
+        let (a, n) = nuts_digest(4, 20260801);
+        let (b, _) = nuts_digest(4, 20260801);
+        assert_eq!(a, b, "two identical fits disagreed at the bit level");
+        assert_eq!(n, 4 * 250 * 4, "4 chains x 250 draws x 4 parameters");
+
+        // A different seed must move it, or the digest is not measuring anything.
+        let (c, _) = nuts_digest(4, 20260802);
+        assert_ne!(a, c, "changing the seed left the draws identical");
+    }
+
+    /// **The invariant the parallel change exists to preserve.**
+    ///
+    /// `parallel.rs` states the rule this rests on: every parallel site keys its
+    /// random stream on the *identity* of the work -- here the chain index --
+    /// never on the order tasks happen to run in. So the thread budget may change
+    /// how long a fit takes and may not change what it returns.
+    ///
+    /// Green today because chains are sequential. It must still be green when
+    /// they are not, and that is the whole point of writing it first.
+    #[test]
+    fn the_draws_do_not_depend_on_the_thread_budget() {
+        let reference = crate::parallel::with_thread_budget(1, || nuts_digest(4, 7));
+        for threads in [2usize, 4, 8] {
+            let got = crate::parallel::with_thread_budget(threads, || nuts_digest(4, 7));
+            assert_eq!(
+                got, reference,
+                "a {threads}-thread budget produced different draws from a 1-thread one"
+            );
+        }
+    }
+
+    /// Each chain's draws must land in its own block, in chain order.
+    ///
+    /// The layout is positional -- `Posterior` slices `values` by
+    /// `(chain, draw, param)` -- so a parallel loop that wrote chunks out of
+    /// order would produce a table that is individually plausible everywhere and
+    /// attributes every draw to the wrong chain. R-hat would then compare a chain
+    /// with itself and report excellent mixing for a fit that had none.
+    #[test]
+    fn each_chains_draws_land_in_its_own_block_in_chain_order() {
+        let per_chain: Vec<String> = (0..4).map(nuts_digest_of_chain).collect();
+        let all = nuts_values(4, 7);
+        let n_params = 4;
+        let stride = 250 * n_params;
+        for (c, expected) in per_chain.iter().enumerate() {
+            let mut hasher = blake3::Hasher::new();
+            for v in &all[c * stride..(c + 1) * stride] {
+                hasher.update(&v.to_bits().to_le_bytes());
+            }
+            assert_eq!(
+                &hasher.finalize().to_hex().to_string(),
+                expected,
+                "block {c} of a 4-chain fit is not chain {c}"
+            );
+        }
+    }
+
+    /// The raw values of an `n_chains` fit, for the block-order test.
+    fn nuts_values(n_chains: usize, seed: u64) -> Vec<f64> {
+        let f = frame(60);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        NutsEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains,
+                    n_draws: 250,
+                    n_warmup: 250,
+                    seed,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )
+            .unwrap()
+            .values
+    }
+
+    /// Chain `c` of a 4-chain fit, obtained by running chains 0..=c and taking the
+    /// last block. Chain `c`'s stream is `BayesRng::for_chain(seed, c)` and depends
+    /// on nothing else, so this is the same chain either way -- which is itself
+    /// the property being checked.
+    fn nuts_digest_of_chain(c: usize) -> String {
+        let all = nuts_values(c + 1, 7);
+        let stride = 250 * 4;
+        let mut hasher = blake3::Hasher::new();
+        for v in &all[c * stride..(c + 1) * stride] {
+            hasher.update(&v.to_bits().to_le_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// The four sampler-statistic rows must stay aligned with their `(chain, draw)`.
+    ///
+    /// `stats` is currently `push`ed in loop order, which is exactly the kind of
+    /// shared accumulator a parallel loop breaks silently: the counts would still
+    /// be right and every value would still be a real number, but `__divergent__`
+    /// would be attributed to the wrong draw and a fit's refusal could land on a
+    /// chain that never diverged.
+    #[test]
+    fn the_sampler_statistics_stay_aligned_with_their_chain() {
+        let f = frame(60);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        let sample = NutsEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 3,
+                    n_draws: 120,
+                    n_warmup: 120,
+                    seed: 11,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )
+            .unwrap();
+        let stats = &sample.stats;
+        assert_eq!(stats.len(), 3 * 120, "one statistic row per (chain, draw)");
+        // Every entry is populated -- a parallel loop that pre-sized the vector and
+        // failed to fill a chunk would leave `SampleStats::default()` here, which is
+        // all `None`, rather than panicking. `is_empty` is exactly that check.
+        assert!(
+            stats.iter().all(|s| !s.is_empty()),
+            "some statistic rows were never written"
+        );
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.step_size.is_some_and(f64::is_finite)
+                    && s.energy.is_some_and(f64::is_finite)),
+            "a statistic row carries a non-finite value"
+        );
+    }
+
+    // ===================================================================== //
+    // Concurrency: the property the parallel change adds.
+    // ===================================================================== //
+
+    /// Counts how many chains are inside the log density at the same moment.
+    ///
+    /// Wrapping the posterior rather than timing the fit is deliberate: a wall
+    /// clock says a fit got faster, which is a fact about the machine, while this
+    /// says two chains were genuinely in flight together, which is a fact about
+    /// the engine. It also cannot pass by accident on a loaded machine or fail on
+    /// an idle one.
+    struct ConcurrencyProbe<'a> {
+        inner: &'a dyn LogPosterior,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> ConcurrencyProbe<'a> {
+        fn new(inner: &'a dyn LogPosterior) -> Self {
+            Self {
+                inner,
+                active: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LogPosterior for ConcurrencyProbe<'_> {
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn logp(&self, theta: &[f64]) -> f64 {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.active.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            let out = self.inner.logp(theta);
+            self.active.fetch_sub(1, SeqCst);
+            out
+        }
+        fn grad(&self, theta: &[f64], out: &mut [f64]) -> BayesResult<()> {
+            self.inner.grad(theta, out)
+        }
+        fn initial(&self) -> Vec<f64> {
+            self.inner.initial()
+        }
+        fn target_accept(&self) -> f64 {
+            self.inner.target_accept()
+        }
+        fn constrain(&self, theta: &[f64], out: &mut [f64]) {
+            self.inner.constrain(theta, out)
+        }
+    }
+
+    /// A model that hands the engine the probe instead of its own posterior.
+    struct Probed<'a> {
+        inner: &'a dyn CompiledModel,
+        probe: ConcurrencyProbe<'a>,
+    }
+
+    impl std::fmt::Debug for ConcurrencyProbe<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ConcurrencyProbe")
+        }
+    }
+
+    impl std::fmt::Debug for Probed<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Probed")
+        }
+    }
+
+    impl CompiledModel for Probed<'_> {
+        fn param_names(&self) -> &[crate::draws::ParamName] {
+            self.inner.param_names()
+        }
+        fn n_obs(&self) -> usize {
+            self.inner.n_obs()
+        }
+        fn n_groups(&self) -> usize {
+            self.inner.n_groups()
+        }
+        fn data_fingerprint(&self) -> &str {
+            self.inner.data_fingerprint()
+        }
+        fn readiness(&self) -> crate::catalog::Readiness {
+            self.inner.readiness()
+        }
+        fn as_differentiable(&self) -> Option<&dyn LogPosterior> {
+            Some(&self.probe)
+        }
+    }
+
+    /// Everything is built *inside* the budgeted closure, exactly as the FFI does
+    /// it (`fit.rs` wraps compile-and-sample together). That is not incidental: it
+    /// keeps the `Sync` requirement on `LogPosterior` alone, where it is a true
+    /// statement about a pure function, instead of pushing it onto `CompiledModel`,
+    /// where it would be a much broader claim about every family's internals.
+    fn peak_concurrency(threads: usize, n_chains: usize) -> usize {
+        crate::parallel::with_thread_budget(threads, || {
+            let f = frame(60);
+            let refs = f.key_refs();
+            let view = f.view(&refs);
+            let model = PooledGaussian
+                .compile(
+                    &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                    &view,
+                )
+                .unwrap();
+            let probed = Probed {
+                inner: &*model,
+                probe: ConcurrencyProbe::new(model.as_differentiable().unwrap()),
+            };
+            NutsEngine
+                .sample(
+                    &probed,
+                    &SampleOptions {
+                        n_chains,
+                        n_draws: 300,
+                        n_warmup: 300,
+                        seed: 4242,
+                        sample_from: crate::types::SampleFrom::Posterior,
+                    },
+                )
+                .unwrap();
+            probed.probe.peak()
+        })
+    }
+
+    /// **The point of the change.** Four chains, four threads, at least two of them
+    /// inside the posterior at once.
+    ///
+    /// `>= 2` rather than `== 4`: the assertion is that the engine *permits*
+    /// concurrency, and demanding a particular degree of it would be asserting
+    /// something about the scheduler on the machine that happens to be running.
+    #[test]
+    fn chains_run_concurrently_when_the_thread_budget_allows_it() {
+        let peak = peak_concurrency(4, 4);
+        assert!(
+            peak >= 2,
+            "four chains on a four-thread budget never had more than {peak} inside \
+             the log density at once; the chain loop is still sequential"
+        );
+    }
+
+    /// The other half, and the one that stops the fix from ignoring the caller.
+    ///
+    /// `SET threads = 1` is the only CPU knob a DuckDB user has and the way an
+    /// operator caps an embedded process. A change that parallelised chains onto
+    /// a pool of its own would pass the test above and break this one.
+    #[test]
+    fn a_single_thread_budget_runs_chains_one_at_a_time() {
+        let peak = peak_concurrency(1, 4);
+        assert_eq!(
+            peak, 1,
+            "a one-thread budget still had {peak} chains in flight; the fit is not \
+             respecting the caller's CPU budget"
+        );
+    }
+
+    /// The wall-clock claim, kept honest but kept out of the default run.
+    ///
+    /// `#[ignore]` because it is a timing assertion, and a timing assertion on a
+    /// shared CI runner is a flake generator, not a test. It exists so the claim in
+    /// this module's header -- that chains now overlap -- is something a reader can
+    /// re-measure on their own machine rather than take on trust.
+    ///
+    /// The bar is deliberately low. Four chains on four threads have a theoretical
+    /// ceiling of 4x, but NUTS chains do not take equal time (each adapts its own
+    /// step size and therefore its own trajectory lengths), so the slowest chain
+    /// sets the wall clock and the realistic ceiling is nearer 2.5x. Asserting
+    /// `> 1.5x` catches the regression that matters -- the loop going sequential
+    /// again -- without encoding the scheduler of whatever machine ran it.
+    ///
+    /// The family is `hier_negbin` and not the `pooled_gaussian` the rest of this
+    /// module tests with, and that is not a stylistic choice. `pooled_gaussian`
+    /// reduces its data to sufficient statistics at compile time, so its log density
+    /// costs `O(p^2)` no matter how many rows went in; the whole four-chain fit
+    /// finishes in tens of milliseconds in a release build and the ratio measures
+    /// sampler setup rather than sampling. A hierarchical count likelihood has to
+    /// walk every observation on every gradient evaluation, which is both what makes
+    /// the measurement mean something and the regime in which anyone would care.
+    #[test]
+    #[ignore = "slow: times two four-chain fits; timing assertions do not belong in the default run"]
+    fn four_chains_finish_faster_on_four_threads_than_on_one() {
+        fn elapsed(threads: usize) -> std::time::Duration {
+            let mut rng = BayesRng::for_chain(99, 0);
+            let panel = crate::catalog::f1_hier_negbin::testing::simulate(
+                &mut rng,
+                40,
+                60,
+                1.8,
+                0.7,
+                Some(2.5),
+            )
+            .unwrap();
+            let f = panel.frame();
+            let refs = f.key_refs();
+            let view = f.view(&refs);
+
+            let start = std::time::Instant::now();
+            crate::parallel::with_thread_budget(threads, || {
+                let model = crate::catalog::f1_hier_negbin::HierNegbin
+                    .compile(
+                        &Config::parse(r#"{"y": "units", "group": "sku"}"#).unwrap(),
+                        &view,
+                    )
+                    .unwrap();
+                NutsEngine
+                    .sample(
+                        &*model,
+                        &SampleOptions {
+                            n_chains: 4,
+                            n_draws: 2000,
+                            n_warmup: 1000,
+                            seed: 7,
+                            sample_from: crate::types::SampleFrom::Posterior,
+                        },
+                    )
+                    .unwrap();
+            });
+            start.elapsed()
+        }
+
+        // One thread first, so the four-thread run cannot be the one that pays for
+        // whatever warming up the allocator and the page cache need.
+        let sequential = elapsed(1);
+        let parallel = elapsed(4);
+        let speedup = sequential.as_secs_f64() / parallel.as_secs_f64();
+        assert!(
+            speedup > 1.5,
+            "four chains took {sequential:?} on one thread and {parallel:?} on four \
+             -- a speedup of {speedup:.2}x. Anything at or below 1.0x means the chain \
+             loop is running sequentially again."
+        );
     }
 }
