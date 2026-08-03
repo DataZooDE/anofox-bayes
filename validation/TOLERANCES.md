@@ -96,9 +96,9 @@ Measured worst case across the 15 F3 comparisons, excluding the two `xfail`ed
 ## Families whose extension side is also a Markov chain
 
 F7 and F3 draw i.i.d. from a closed form, so the extension's Monte Carlo error
-is `sd/sqrt(draws)` and 40 000 draws makes it negligible by construction. **F8
-and F1 are served by NUTS**, so that is no longer true: the extension side is
-autocorrelated and its error is `sd/sqrt(ESS)`.
+is `sd/sqrt(draws)` and 40 000 draws makes it negligible by construction. **F8,
+F1, F4 and F6 are served by NUTS**, so that is no longer true: the extension side
+is autocorrelated and its error is `sd/sqrt(ESS)`.
 
 ESS is therefore **measured, not assumed**, on both sides, and the measurement
 is itself asserted — `test_the_extension_side_is_well_enough_mixed_to_be_compared`
@@ -106,10 +106,30 @@ in each suite fails if the extension's ESS drops below the value the tolerance
 was derived from. A tolerance derived from an ESS nobody re-checks is a
 tolerance that silently becomes wrong the first time mixing regresses.
 
-Both use `EXTENSION_NUTS_DRAWS = 4_000` × 4 chains after 1 000 warmup, against
-the reference's 4 × 5 000 after 2 000. THEORY.md says 4 × 2 000 is what clears
-this extension's own R̂ gate; clearing the gate is the floor for a *usable* fit,
-not for one that is refereeing another implementation, so the budget is doubled.
+All four use `EXTENSION_NUTS_DRAWS = 4_000` × 4 chains, against the reference's
+4 × 5 000 after 2 000. THEORY.md says 4 × 2 000 is what clears this extension's
+own R̂ gate; clearing the gate is the floor for a *usable* fit, not for one that
+is refereeing another implementation, so the budget is doubled.
+
+**Warmup is not shared, and the exception is measured.** F8 and F1 use the
+common 1 000. F4 and F6 double it, and the reason is recorded in
+`test_parity_f4.py`: at 1 000 warmup the F4 fixture draws exactly **one**
+divergence out of 16 000 while every other diagnostic is healthy (worst
+`ess_bulk` 1 719, worst R̂ 1.005). Both families inherit `max_divergent = 0`, so
+that one divergence grades the fit `degenerate` and there is nothing left to
+compare — a step size that has not finished adapting, not a posterior that is
+wrong. Measured on the same seed and the same data:
+
+| warmup | divergences | verdict | worst ESS |
+|---:|---:|---|---:|
+| 1 000 | 1 | `degenerate` | 1 719 |
+| 2 000 | 0 | `converged` | 2 020 |
+| 3 000 | 0 | `converged` | 1 839 |
+
+The extra warmup buys the *verdict*; the draw budget was already ample. Raising
+it per family rather than raising the shared constant keeps F8 and F1
+bit-for-bit unaffected, since re-running them at a different budget would move
+the numbers their own tolerances were derived from.
 
 ### F8 `varying_variance_gaussian` — mean 0.09 sd, sd 6 %, quantiles 0.17 sd
 
@@ -148,6 +168,60 @@ Quadrature: **0.0301 sd**; `sd` 0.0213; quantiles 0.0602 sd. At 3.5× that is
 
 Measured worst case across the 27 comparisons: **54 % of tolerance**
 (`q95` of `tau`).
+
+### F4 `payment_delay` — mean 0.10 sd, sd 8 %, quantiles 0.20 sd
+
+Between F8 and F1, and for a legible reason. `tau` runs through the same
+intercept/offset ridge, but with six segments there are fewer coordinates in it
+than F1's twelve parts; and the Gamma dispersion is better conditioned than the
+negative binomial's, because `shape` enters the log-density through `lnGamma`
+rather than through a `(y + phi) log(phi + mu)` term that couples it to every
+mean at once.
+
+Worst parameter of the fifteen is `intercept` on the extension side and `tau` on
+the reference's — the two ends of the same ridge.
+
+| side | ESS (bulk) | MCSE(mean) |
+|---|---:|---|
+| extension, 4 × 4 000 after 2 000 warmup | 2 020 | `1/sqrt(2020)` = 0.0222 sd |
+| reference, 4 × 5 000 | 3 778 | `1/sqrt(3778)` = 0.0163 sd |
+
+In quadrature: **0.0275 sd**; `MCSE(sd) = MCSE(mean)/sqrt(2)` = 0.0195;
+quantiles roughly twice a mean's = 0.0551 sd. At the same 3.5× the rest of this
+file uses, that gives 0.096 / 0.068 / 0.193, rounded to **0.10 / 0.08 / 0.20**.
+
+Measured worst case across the 15 comparisons: **76 % of tolerance** (`sd` of
+`tau`). That is the tightest margin in this file and it is the right parameter
+to have it: `tau` is estimated from six numbers, so its own posterior sd is the
+least well determined quantity in the fit on either side.
+
+### F6 `hier_elasticity` — mean 0.13 sd, sd 10 %, quantiles 0.26 sd
+
+The loosest set here, deliberately. This family carries **two** pooling scales
+rather than one, so there are two ridges rather than one, and the per-segment
+elasticities are a `-exp` transform of coordinates that are themselves poorly
+conditioned — a nonlinearity that does not create error but does concentrate it
+where the coordinates mix worst.
+
+`intercept` is the worst parameter on both sides here — the unpenalised intercept
+is what both ridges run through.
+
+| side | ESS (bulk) | MCSE(mean) |
+|---|---:|---|
+| extension, 4 × 4 000 after 2 000 warmup | 1 428 | `1/sqrt(1428)` = 0.0265 sd |
+| reference, 4 × 5 000 | 3 946 | `1/sqrt(3946)` = 0.0159 sd |
+
+In quadrature: **0.0309 sd**; `sd` 0.0218; quantiles 0.0618 sd. At 3.5×: 0.108 /
+0.076 / 0.216. Rounded **up** to **0.13 / 0.10 / 0.26** rather than to the
+nearest value, because `tau_level` is a nuisance parameter with a deliberately
+loose prior and its `sd` margin sits well above every other coordinate's;
+tightening to the arithmetic would make this suite flake on that one number
+without making it detect anything more.
+
+Measured worst case across the 21 comparisons: **46 % of tolerance** (`sd` of
+`tau_level`, as expected). Every parameter the *decision* reads is far tighter —
+the worst `group_elasticity` margin across all four statistics is 19 %, and
+`tau`'s own worst is 7 %.
 
 ## Families served by an approximation, and why they need two tolerances each
 
@@ -331,6 +405,8 @@ solely to show that:
 | `test_an_inflated_group_spread_is_detected` (F8) | triple one segment's scatter, leaving its level alone | breach on that segment's `sigma` |
 | `test_the_group_labels_are_not_interchangeable` (F8) | rotate the segment labels | breach on the group effects |
 | `test_a_flattened_catalogue_is_detected` (F1) | permute demand across parts, totals intact | breach on the per-part rates |
+| `test_a_shuffled_ledger_is_detected` (F4) | permute delays across segments, ledger total intact | breach on the per-segment means |
+| `test_a_price_ladder_shuffled_within_each_segment_is_detected` (F6) | permute price *within* each segment | breach on the per-segment elasticities |
 
 Two of those are worth singling out, because they check something no
 per-parameter tolerance can. `test_the_full_covariance_is_used_and_not_just_its_diagonal`

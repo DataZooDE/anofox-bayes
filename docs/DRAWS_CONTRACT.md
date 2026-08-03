@@ -105,7 +105,9 @@ SELECT value = 0 AS safe_to_act_on FROM draws WHERE param = '__status__';
 | 1 | `hier_negbin` | F1 |
 | 2 | `censored_aft` | F2 |
 | 3 | `pooled_gaussian` | F3 |
+| 4 | `payment_delay` | F4 |
 | 5 | `payer_alive` | F5 |
+| 6 | `hier_elasticity` | F6 |
 | 7 | `conjugate_anomaly` | F7 |
 | 8 | `varying_variance_gaussian` | — (outside the F1–F7 grid) |
 
@@ -113,8 +115,8 @@ SELECT value = 0 AS safe_to_act_on FROM draws WHERE param = '__status__';
 **catalog F-number**, the numbering already fixed in [BRD §6](BRD.md) and used
 throughout [the API reference](API_REFERENCE.md) and [the HLD](HLD.md). Reusing that
 numbering rather than inventing a registration-ordered one means a family has a single
-identity: the gaps are the families this catalog does not ship yet, not accidents. A
-family outside the BRD's F1–F7 grid takes the next unused code.
+identity, and the BRD's F1–F7 grid is now complete. A family outside that grid takes
+the next unused code, which is how `varying_variance_gaussian` came to be 8.
 
 Like `FitStatus` and `EngineKind`, the numbering is **append-only** — these values sit
 in tables customers have already persisted, so renumbering one would change what a

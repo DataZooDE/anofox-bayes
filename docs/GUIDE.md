@@ -135,13 +135,26 @@ CREATE TABLE draws AS SELECT * FROM anofox_bayes_fit(...);
 | "Most of my catalogue has four weeks of history — can I forecast it at all?" | `hier_negbin` |
 | "Is this customer still a customer, or have they quietly gone?" | `payer_alive` |
 | "Which accounts on my dunning list are worth chasing?" | `payer_alive` |
+| "When will this invoice actually be paid — and will we be covered on the 28th?" | `payment_delay` |
+| "What does +5 % on the list price cost me in volume, per segment?" | `hier_elasticity` |
 | "How much buffer does *this* segment need to cover 95 % of cases?" | `varying_variance_gaussian` |
 | "Which segments are unpredictable, as opposed to merely worse?" | `varying_variance_gaussian` |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`. A response explained by
-predictors → `pooled_gaussian`. A repeat-purchase history and a churn question →
-`payer_alive`. A question about a group's *spread* rather than its level →
-`varying_variance_gaussian`.**
+predictors → `pooled_gaussian`. A duration that has finished, where the tail is the
+decision → `payment_delay`. A repeat-purchase history and a churn question →
+`payer_alive`. A price move and a volume response → `hier_elasticity`. A question about
+a group's *spread* rather than its level → `varying_variance_gaussian`.**
+
+Two pairs are easy to confuse. **`payment_delay` vs `censored_aft`:** if some of the
+items have not happened yet — open POs, unpaid invoices — you need `censored_aft`, which
+models the not-yet-happened as information rather than as a missing row. `payment_delay`
+is for durations that have all completed, and it refuses a non-positive one rather than
+guessing. **`hier_elasticity` vs `pooled_gaussian` + `random_slopes`:** both give you a
+per-segment elasticity. Use `pooled_gaussian` when the response is well-populated and
+you can take its log; use `hier_elasticity` when the volume is a count that is sometimes
+zero, or when a thin segment's interval keeps straddling zero and handing you a
+"raising the price might sell more" reading you know is an artefact of the width.
 
 The last row is the one people get wrong. `pooled_gaussian` will happily fit a panel by
 segment and give you an interval per segment — but it has a single residual scale for

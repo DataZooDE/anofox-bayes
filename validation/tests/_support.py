@@ -134,6 +134,20 @@ F3_TOL = Tolerance(mean=0.07, sd=0.07, quantile=0.12, label="F3 pooled_gaussian"
 F8_TOL = Tolerance(mean=0.09, sd=0.06, quantile=0.17, label="F8 varying_variance_gaussian")
 F1_TOL = Tolerance(mean=0.11, sd=0.08, quantile=0.23, label="F1 hier_negbin")
 
+# F4 sits between F8 and F1. Its `tau` runs through the same intercept/offset
+# ridge, but with only six segments there are fewer coordinates in it, and the
+# Gamma likelihood is better conditioned than the negative binomial's -- the
+# dispersion enters the log-density through `lnGamma` rather than through a
+# `(y + phi) log(phi + mu)` that couples it to every mean.
+F4_TOL = Tolerance(mean=0.10, sd=0.08, quantile=0.20, label="F4 payment_delay")
+
+# F6 is the loosest of the NUTS-served set, and deliberately. It carries *two*
+# pooling scales rather than one, so there are two ridges rather than one, and
+# the `-exp` transform on the elasticity means the per-segment coefficients are
+# a nonlinear function of coordinates that are themselves poorly conditioned.
+# Measured ESS on `tau` is the binding constraint; see TOLERANCES.md.
+F6_TOL = Tolerance(mean=0.13, sd=0.10, quantile=0.26, label="F6 hier_elasticity")
+
 # --- The Laplace-served families. These carry *two* tolerances each, because
 # there are two different questions and one number cannot answer both.
 #
@@ -161,6 +175,8 @@ ALL_TOLERANCES = (
     F3_TOL,
     F8_TOL,
     F1_TOL,
+    F4_TOL,
+    F6_TOL,
     F2_TOL,
     F2_EXACT_TOL,
     F5_TOL,
@@ -794,6 +810,91 @@ def f1_dataset() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["part", "week", "units"])
 
 
+F4_SEGMENTS = ["RETAIL", "WHOLESALE", "PUBLIC", "EXPORT", "OEM", "KEY_ACCOUNT"]
+
+F4_TRUTH = {"intercept": float(np.log(30.0)), "tau": 0.35, "shape": 6.0}
+
+
+def f4_dataset() -> pd.DataFrame:
+    """A cleared-invoice ledger: six customer segments, drawn from the model.
+
+    Forty invoices per segment, which is what a mid-sized ledger gives a segment
+    in a quarter. The delay is measured from the *invoice* date, so it is
+    strictly positive -- the family refuses a due-date clock, and it refuses it
+    as a request error rather than a status, so a fixture that violated it would
+    not reach a comparison at all.
+
+    Drawn at `shape = 6`: genuinely right-skewed, which is the regime the Gamma
+    branch exists for. A near-Gaussian shape would make the two `dist` branches
+    agree and the family's premise untestable.
+    """
+    rng = np.random.default_rng(40404)
+    z = rng.normal(0.0, 1.0, len(F4_SEGMENTS))
+    rows = []
+    for g, name in enumerate(F4_SEGMENTS):
+        mu = np.exp(F4_TRUTH["intercept"] + F4_TRUTH["tau"] * z[g])
+        # numpy parameterises Gamma by (shape, scale); scale = mu/shape gives
+        # mean mu and variance mu^2/shape, which is the extension's convention.
+        delay = rng.gamma(F4_TRUTH["shape"], mu / F4_TRUTH["shape"], 40)
+        rows.extend((name, float(d)) for d in delay)
+    return pd.DataFrame(rows, columns=["segment", "delay_days"])
+
+
+F6_TRUTH = {
+    "intercept": 5.0,
+    # psi = log |population elasticity|; exp(-0.11) is about 0.9.
+    "psi": float(np.log(0.9)),
+    "tau": 0.30,
+    "tau_level": 0.60,
+    "phi": 20.0,
+}
+
+F6_SEGMENTS = [
+    "COMMODITY",
+    "MIDMARKET",
+    "PREMIUM",
+    "OEM",
+    "SPARE_PARTS",
+    "EXPORT",
+    "PROJECT",
+    "AFTERMARKET",
+]
+
+
+def f6_dataset() -> pd.DataFrame:
+    """A billing panel: eight segments, eighteen months, drawn from the model.
+
+    Every segment's log price walks a deterministic ladder about its own mean.
+    **Within**-segment price variation is what identifies an elasticity, and a
+    fixture whose prices moved only *between* segments would be measuring
+    something else entirely -- so the ladder is the same in every segment and
+    only the response differs.
+
+    No segment here has a flat price column. The identification refusal is a
+    per-group verdict reached before any arithmetic and is exercised in
+    `test/sql/f6_price_elasticity.test` and the Rust suite; putting it in the
+    parity fixture would mean comparing a segment whose posterior is its prior,
+    which measures the prior rather than the likelihood.
+    """
+    rng = np.random.default_rng(60606)
+    z = rng.normal(0.0, 1.0, len(F6_SEGMENTS))
+    v = rng.normal(0.0, 1.0, len(F6_SEGMENTS))
+    months = 18
+    ladder = 0.6 * (np.arange(months) / (months - 1) - 0.5)
+    rows = []
+    for g, name in enumerate(F6_SEGMENTS):
+        b = -np.exp(F6_TRUTH["psi"] + F6_TRUTH["tau"] * z[g])
+        level = F6_TRUTH["tau_level"] * v[g]
+        mu = np.exp(F6_TRUTH["intercept"] + level + b * ladder)
+        units = rng.negative_binomial(
+            F6_TRUTH["phi"], F6_TRUTH["phi"] / (F6_TRUTH["phi"] + mu)
+        )
+        rows.extend(
+            (name, float(ladder[t]), int(units[t])) for t in range(months)
+        )
+    return pd.DataFrame(rows, columns=["segment", "log_price", "units"])
+
+
 def first_seen(values) -> list[str]:
     """Group keys in first-seen order, which is the order the extension uses.
 
@@ -1269,6 +1370,130 @@ def pymc_f8(frame: pd.DataFrame, y_col: str, group_col: str, x_names: list[str])
         # Rust and not reachable from SQL. Matching it keeps the reference from
         # being the noisier side for a reason that has nothing to do with the
         # model.
+        idata = pm.sample(**_sample_kwargs(target_accept=0.95))
+    return idata
+
+
+# --------------------------------------------------------------------------
+# F4 `payment_delay`
+# --------------------------------------------------------------------------
+
+
+def pymc_f4(frame: pd.DataFrame, y_col: str, group_col: str):
+    """The F4 reference: non-centred hierarchical Gamma duration model.
+
+        delay_ij ~ Gamma(shape, shape / mu_ij),   E = mu, Var = mu^2/shape
+        log mu_ij = intercept + tau * z_j
+        z_j ~ N(0, 1)
+
+    `pm.Gamma(alpha=, beta=)` is a rate parameterisation, so `beta = shape/mu`
+    is what makes `mu` the mean -- the same convention `f4_payment_delay.rs`
+    writes as `-k eta - k y e^{-eta}` plus `k log k - lnGamma(k)`.
+
+    **The prior on `tau` is the part nothing else can see.** The extension
+    declares a half-Normal on `tau` *itself*, not on `log tau`, and samples the
+    log -- so the density carries `+ log tau`. A half-Normal declared on the log
+    coordinate instead would be a different model, and one whose posterior is
+    improper at zero in the way `p(tau) ~ 1/tau` is. Writing it as `pm.Flat` plus
+    an explicit `Potential` rather than as `pm.HalfNormal` is deliberate: PyMC
+    would supply its own transform Jacobian and there would then be two, one of
+    them uninvited.
+
+    The dispersion prior is flat on `log shape`, which is the extension's default
+    and *is* the sampled coordinate, so there is no Jacobian to add. That
+    asymmetry with `tau` is the thing
+    `test_the_tau_jacobian_is_present_and_the_dispersion_one_is_not` asserts.
+    """
+    y = frame[y_col].to_numpy(dtype=float)
+    groups = first_seen(frame[group_col])
+    group_index = np.array([groups.index(g) for g in frame[group_col]])
+    # The family's own default: half-Normal(1) on tau, in log units.
+    tau_scale = 1.0
+
+    with pm.Model(coords={"group": groups}):
+        intercept = pm.Flat("intercept", initval=float(np.log(y.mean())))
+        log_tau = pm.Flat("log_tau", initval=-1.0)
+        tau = pm.Deterministic("tau", pt.exp(log_tau))
+        pm.Potential(
+            "tau_half_normal_on_the_natural_scale_plus_jacobian",
+            -0.5 * tau**2 / tau_scale**2 + log_tau,
+        )
+        log_shape = pm.Flat("log_shape", initval=1.5)
+        shape = pm.Deterministic("shape", pt.exp(log_shape))
+
+        z = pm.Normal("z", 0.0, 1.0, dims="group")
+        u = pm.Deterministic("u", tau * z, dims="group")
+        # `mu` is the segment's own mean delay with covariates at zero, which is
+        # exactly what the extension reports under that name.
+        pm.Deterministic("mu", pt.exp(intercept + u), dims="group")
+
+        mean = pt.exp(intercept + u[group_index])
+        pm.Gamma("obs", alpha=shape, beta=shape / mean, observed=y)
+        # The family declares target_accept = 0.95, so the reference matches it.
+        idata = pm.sample(**_sample_kwargs(target_accept=0.95))
+    return idata
+
+
+# --------------------------------------------------------------------------
+# F6 `hier_elasticity`
+# --------------------------------------------------------------------------
+
+
+def pymc_f6(frame: pd.DataFrame, y_col: str, price_col: str, group_col: str):
+    """The F6 reference: sign-constrained hierarchical elasticity.
+
+        units_ij ~ NegBin(mu_ij, phi),   Var = mu + mu^2/phi
+        log mu_ij = intercept + eta_j + b_j * logprice_ij
+        eta_j = tau_level * v_j,        v_j ~ N(0, 1)
+        b_j   = -exp(psi + tau * z_j),  z_j ~ N(0, 1)
+
+    **The `-exp` is the whole family and is where a Jacobian error would live.**
+    It is written here as an explicit transform of a `pm.Normal` on `psi` rather
+    than as a constrained variable, because the extension samples `psi` directly
+    and declares its prior there: a lognormal prior on the elasticity's magnitude
+    *is* a normal prior on the log of it, and there is no Jacobian. A reference
+    that reached for a `pm.Bound` or a negative-support distribution would
+    silently add one, and the only symptom would be this comparison drifting.
+
+    The two pooling scales are half-Normals declared on the natural scale with
+    their `+ log tau` Jacobians written out, same as F4's -- and this family has
+    two of them, which is two chances to lose one.
+    """
+    y = frame[y_col].to_numpy(dtype=float)
+    price = frame[price_col].to_numpy(dtype=float)
+    groups = first_seen(frame[group_col])
+    group_index = np.array([groups.index(g) for g in frame[group_col]])
+    # The family's own defaults.
+    elasticity_prior = (0.0, 1.0)
+    tau_scale, tau_level_scale = 0.5, 2.0
+
+    with pm.Model(coords={"group": groups}):
+        intercept = pm.Flat("intercept", initval=float(np.log(y.mean() + 0.5)))
+        psi = pm.Normal("psi", elasticity_prior[0], elasticity_prior[1], initval=0.0)
+        pm.Deterministic("elasticity", -pt.exp(psi))
+
+        log_tau = pm.Flat("log_tau", initval=float(np.log(0.3)))
+        tau = pm.Deterministic("tau", pt.exp(log_tau))
+        pm.Potential(
+            "tau_half_normal_plus_jacobian",
+            -0.5 * tau**2 / tau_scale**2 + log_tau,
+        )
+        log_tau_level = pm.Flat("log_tau_level", initval=float(np.log(0.6)))
+        tau_level = pm.Deterministic("tau_level", pt.exp(log_tau_level))
+        pm.Potential(
+            "tau_level_half_normal_plus_jacobian",
+            -0.5 * tau_level**2 / tau_level_scale**2 + log_tau_level,
+        )
+        log_phi = pm.Flat("log_phi", initval=float(np.log(20.0)))
+        phi = pm.Deterministic("phi", pt.exp(log_phi))
+
+        z = pm.Normal("z", 0.0, 1.0, dims="group")
+        v = pm.Normal("v", 0.0, 1.0, dims="group")
+        b = pm.Deterministic("group_elasticity", -pt.exp(psi + tau * z), dims="group")
+        eta = pm.Deterministic("group_effect", tau_level * v, dims="group")
+
+        mean = pt.exp(intercept + eta[group_index] + b[group_index] * price)
+        pm.NegativeBinomial("obs", mu=mean, alpha=phi, observed=y)
         idata = pm.sample(**_sample_kwargs(target_accept=0.95))
     return idata
 

@@ -345,7 +345,8 @@ mod families {
 
     use crate::catalog::{
         f1_hier_negbin::HierNegbin, f2_censored_aft::CensoredAft,
-        f3_pooled_gaussian::PooledGaussian, f5_btyd::PayerAlive, f7_conjugate::ConjugateAnomaly,
+        f3_pooled_gaussian::PooledGaussian, f4_payment_delay::PaymentDelay, f5_btyd::PayerAlive,
+        f6_hier_elasticity::HierElasticity, f7_conjugate::ConjugateAnomaly,
         f8_varying_variance::VaryingVarianceGaussian, ModelFamily,
     };
     use crate::config::Config;
@@ -1755,6 +1756,422 @@ mod families {
         for h in &hists {
             println!(
                 "f1/nuts/narrowed/{}: chi2 {:.1}, slope {:+.3}, counts {:?}",
+                h.param,
+                h.chi_squared(),
+                h.slope(),
+                h.counts
+            );
+            assert!(
+                !h.passes(CRITICAL_15_DF),
+                "{}: a posterior 40% too narrow passed the calibration gate \
+                 (chi-squared {:.1}); the gate is not a gate",
+                h.param,
+                h.chi_squared()
+            );
+        }
+    }
+
+    /// **F4, the hierarchical delay model, under NUTS.**
+    ///
+    /// Three population parameters are ranked and a fourth entry is **a function of
+    /// all three at once**, for the reason F1's suite gives: ranking marginals leaves a
+    /// wrong covariance entirely undetected, and `ROADMAP.md` §3.1 records a diagonal
+    /// posterior precision passing every marginal suite while a predictive spread was
+    /// wrong by 25x.
+    ///
+    /// The joint quantity is the **marginal standard deviation of one invoice's delay
+    /// for a randomly chosen segment**, which is the width a cash-cover probability is
+    /// computed from:
+    ///
+    /// ```text
+    ///   M  = exp(b0 + tau^2/2)                   E[mu]
+    ///   S  = exp(2 b0 + 2 tau^2)                 E[mu^2]
+    ///   sd = sqrt(S (1 + 1/k) - M^2)             mixing over segments and invoices
+    /// ```
+    ///
+    /// The per-group `z` are deliberately not ranked: under the non-centred
+    /// parameterisation they have an `N(0, 1)` prior by construction, so ranking them
+    /// would certify a standard normal rather than the model.
+    struct F4PaymentDelay {
+        n_groups: usize,
+        n_per: usize,
+        /// `N(mean, sd)` on the intercept — a log mean delay.
+        intercept: (f64, f64),
+        /// Half-normal scale on `tau`.
+        tau_scale: f64,
+        /// Lognormal `(log_mean, log_sd)` on the dispersion.
+        dispersion: (f64, f64),
+        /// Keep every `thin`-th draw; see [`F3Slopes::thin`].
+        thin: usize,
+    }
+
+    /// The joint quantity described on [`F4PaymentDelay`], for the Gamma branch.
+    fn delay_marginal_sd(intercept: f64, tau: f64, shape: f64) -> f64 {
+        let m = (intercept + 0.5 * tau * tau).exp();
+        let s = (2.0 * intercept + 2.0 * tau * tau).exp();
+        (s * (1.0 + 1.0 / shape) - m * m).max(0.0).sqrt()
+    }
+
+    impl SbcModel for F4PaymentDelay {
+        fn param_names(&self) -> Vec<String> {
+            vec![
+                "intercept".into(),
+                "tau".into(),
+                "shape".into(),
+                "delay_marginal_sd".into(),
+            ]
+        }
+
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            let intercept = self.intercept.0 + self.intercept.1 * rng.standard_normal();
+            // A half-normal is the absolute value of a normal, which is what the
+            // family's `prior.tau.scale` slot declares.
+            let tau = (self.tau_scale * rng.standard_normal()).abs();
+            let shape = (self.dispersion.0 + self.dispersion.1 * rng.standard_normal()).exp();
+            Ok(vec![
+                intercept,
+                tau,
+                shape,
+                delay_marginal_sd(intercept, tau, shape),
+            ])
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            let ledger = crate::catalog::f4_payment_delay::testing::simulate(
+                rng,
+                self.n_groups,
+                self.n_per,
+                truth[0],
+                truth[1],
+                crate::catalog::f4_payment_delay::Dist::Gamma,
+                truth[2],
+            )?;
+            let frame = ledger.frame();
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let cfg = format!(
+                r#"{{"y": "delay_days", "group": "segment", "min_groups": 2,
+                     "prior": {{"intercept": {{"mean": {}, "sd": {}}},
+                                "tau": {{"scale": {}}},
+                                "dispersion": {{"log_mean": {}, "log_sd": {}}}}}}}"#,
+                self.intercept.0,
+                self.intercept.1,
+                self.tau_scale,
+                self.dispersion.0,
+                self.dispersion.1
+            );
+            let model = PaymentDelay.compile(&Config::parse(&cfg).unwrap(), &view)?;
+
+            // A replication the family refused would contribute no ranks, and dropping
+            // it silently would certify only the replications that happened to be easy.
+            if !model.readiness().status.is_actionable() {
+                return Err(BayesError::Internal(format!(
+                    "an SBC replication was refused ({:?})",
+                    model.readiness().reasons
+                )));
+            }
+
+            let sample = NutsEngine.sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 1,
+                    n_draws: n_draws * self.thin,
+                    n_warmup: crate::engines::DEFAULT_WARMUP,
+                    seed: rng.uniform().to_bits(),
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )?;
+            let p = model.param_names().len();
+            let kept: Vec<&[f64]> = sample
+                .values
+                .chunks(p)
+                .skip(self.thin - 1)
+                .step_by(self.thin)
+                .collect();
+            // Column order is `intercept, tau, shape, then two per group`.
+            Ok(vec![
+                kept.iter().map(|c| c[0]).collect(),
+                kept.iter().map(|c| c[1]).collect(),
+                kept.iter().map(|c| c[2]).collect(),
+                kept.iter()
+                    .map(|c| delay_marginal_sd(c[0], c[1], c[2]))
+                    .collect(),
+            ])
+        }
+    }
+
+    fn f4_under_nuts() -> F4PaymentDelay {
+        F4PaymentDelay {
+            // Twelve segments of eight cleared invoices: the regime agent 04 is in, and
+            // thin enough that the pooling is doing real work rather than decorating a
+            // fit each segment could have had on its own.
+            n_groups: 12,
+            n_per: 8,
+            // exp(3.4) is about 30 days, and a factor of e either side of it covers
+            // every ledger this family is for.
+            intercept: (3.4, 0.5),
+            tau_scale: 0.4,
+            // exp(1.6) is a shape near 5: right-skewed, which is what a delay is.
+            dispersion: (1.6, 0.4),
+            thin: 5,
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn f4_is_calibrated_under_the_nuts_engine() {
+        let hists = run_sbc(&f4_under_nuts(), REPLICATIONS, BINS, 401).unwrap();
+        assert_calibrated(&hists, "f4/nuts");
+    }
+
+    /// **The suite above, proved to be a gate**, including on the joint quantity.
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn a_deliberately_overconfident_f4_posterior_is_rejected() {
+        let model = Narrowed {
+            inner: f4_under_nuts(),
+            factor: 0.6,
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 402).unwrap();
+        for h in &hists {
+            println!(
+                "f4/nuts/narrowed/{}: chi2 {:.1}, slope {:+.3}, counts {:?}",
+                h.param,
+                h.chi_squared(),
+                h.slope(),
+                h.counts
+            );
+            assert!(
+                !h.passes(CRITICAL_15_DF),
+                "{}: a posterior 40% too narrow passed the calibration gate \
+                 (chi-squared {:.1}); the gate is not a gate",
+                h.param,
+                h.chi_squared()
+            );
+        }
+    }
+
+    /// **F6, the sign-constrained elasticity model, under NUTS.**
+    ///
+    /// The coordinate that carries this family's whole claim is `elasticity`, and it is
+    /// the one SBC is most needed for: a `-exp` transform is where a missing or doubled
+    /// Jacobian would live, and a mis-signed one would still produce a plausible-looking
+    /// posterior. Ranking it under the prior it was drawn from is what turns the
+    /// transform from an assertion into a measurement.
+    ///
+    /// The fourth entry is again **a function of several parameters at once**, for the
+    /// reason F1's suite gives. Here it is the quantity the price meeting actually
+    /// reads: the **expected volume ratio under a 5 % price rise for a randomly chosen
+    /// segment**,
+    ///
+    /// ```text
+    ///   b_g = -exp(psi + tau z),  z ~ N(0, 1)
+    ///   E[exp(r b_g)] over segments, at r = log 1.05
+    /// ```
+    ///
+    /// evaluated by quadrature over `z` rather than in closed form, because
+    /// `E[exp(-r e^X)]` for Gaussian `X` has none. It reads `psi` and `tau` jointly, so
+    /// a posterior that got each marginal right and their correlation wrong fails here
+    /// and nowhere else.
+    struct F6HierElasticity {
+        n_groups: usize,
+        n_per: usize,
+        /// `N(mean, sd)` on the intercept — a log volume.
+        intercept: (f64, f64),
+        /// `N(log_mean, log_sd)` on `psi = log |population elasticity|`.
+        elasticity: (f64, f64),
+        /// Half-normal scale on `tau`, the spread of `log |elasticity|`.
+        tau_scale: f64,
+        /// Half-normal scale on `tau_level`.
+        tau_level_scale: f64,
+        /// Lognormal `(log_mean, log_sd)` on the dispersion.
+        dispersion: (f64, f64),
+        /// Width of the log-price ladder within a segment.
+        price_spread: f64,
+        /// Keep every `thin`-th draw; see [`F3Slopes::thin`].
+        thin: usize,
+    }
+
+    /// The joint quantity described on [`F6HierElasticity`].
+    ///
+    /// Gauss-Hermite over `z ~ N(0, 1)` with enough nodes that the quadrature error is
+    /// far below the Monte-Carlo error of the rank it feeds. A fixed grid rather than an
+    /// adaptive rule so that the same `(psi, tau)` always gives the same number — a
+    /// quantity whose value depended on how it was computed would put noise into the
+    /// ranks.
+    fn volume_ratio_at_five_percent(psi: f64, tau: f64) -> f64 {
+        const R: f64 = 0.048_790_164_169_432; // ln(1.05)
+        const NODES: usize = 64;
+        let mut acc = 0.0;
+        let mut weight = 0.0;
+        for k in 0..NODES {
+            // A trapezoid over +/- 6 sd of the standard normal, which is a plain and
+            // perfectly adequate rule for a smooth bounded integrand.
+            let z = -6.0 + 12.0 * (k as f64) / ((NODES - 1) as f64);
+            let w = (-0.5 * z * z).exp();
+            let b = -(psi + tau * z).exp();
+            acc += w * (R * b).exp();
+            weight += w;
+        }
+        acc / weight
+    }
+
+    impl SbcModel for F6HierElasticity {
+        fn param_names(&self) -> Vec<String> {
+            vec![
+                "intercept".into(),
+                "elasticity".into(),
+                "tau".into(),
+                "volume_ratio_at_5pct".into(),
+            ]
+        }
+
+        fn draw_prior(&self, rng: &mut BayesRng) -> BayesResult<Vec<f64>> {
+            let intercept = self.intercept.0 + self.intercept.1 * rng.standard_normal();
+            let psi = self.elasticity.0 + self.elasticity.1 * rng.standard_normal();
+            let tau = (self.tau_scale * rng.standard_normal()).abs();
+            Ok(vec![
+                intercept,
+                // The family reports the elasticity itself, so that is what a rank has
+                // to be taken of -- not the `psi` it is sampled on.
+                -psi.exp(),
+                tau,
+                volume_ratio_at_five_percent(psi, tau),
+            ])
+        }
+
+        fn simulate_and_fit(
+            &self,
+            truth: &[f64],
+            rng: &mut BayesRng,
+            n_draws: usize,
+        ) -> BayesResult<Vec<Vec<f64>>> {
+            // `truth[1]` is the elasticity; the simulator takes its log magnitude.
+            let psi = (-truth[1]).ln();
+            let tau_level = (self.tau_level_scale * rng.standard_normal()).abs();
+            let dispersion = (self.dispersion.0 + self.dispersion.1 * rng.standard_normal()).exp();
+            let panel = crate::catalog::f6_hier_elasticity::testing::simulate(
+                rng,
+                self.n_groups,
+                self.n_per,
+                truth[0],
+                psi,
+                truth[2],
+                tau_level,
+                crate::catalog::f6_hier_elasticity::Likelihood::NegBinomial,
+                dispersion,
+                self.price_spread,
+            )?;
+            let frame = panel.frame();
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let cfg = format!(
+                r#"{{"y": "units", "price": "log_price", "group": "segment",
+                     "min_groups": 2,
+                     "prior": {{"intercept": {{"mean": {}, "sd": {}}},
+                                "elasticity": {{"log_mean": {}, "log_sd": {}}},
+                                "tau": {{"scale": {}}},
+                                "tau_level": {{"scale": {}}},
+                                "dispersion": {{"log_mean": {}, "log_sd": {}}}}}}}"#,
+                self.intercept.0,
+                self.intercept.1,
+                self.elasticity.0,
+                self.elasticity.1,
+                self.tau_scale,
+                self.tau_level_scale,
+                self.dispersion.0,
+                self.dispersion.1
+            );
+            let model = HierElasticity.compile(&Config::parse(&cfg).unwrap(), &view)?;
+
+            // A replication the family refused would contribute no ranks, and dropping
+            // it silently would certify only the replications that happened to be easy.
+            if !model.readiness().status.is_actionable() {
+                return Err(BayesError::Internal(format!(
+                    "an SBC replication was refused ({:?})",
+                    model.readiness().reasons
+                )));
+            }
+
+            let sample = NutsEngine.sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 1,
+                    n_draws: n_draws * self.thin,
+                    n_warmup: crate::engines::DEFAULT_WARMUP,
+                    seed: rng.uniform().to_bits(),
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )?;
+            let p = model.param_names().len();
+            let kept: Vec<&[f64]> = sample
+                .values
+                .chunks(p)
+                .skip(self.thin - 1)
+                .step_by(self.thin)
+                .collect();
+            // Column order is `intercept, elasticity, tau, tau_level, phi, then two per
+            // group`. Resolved by position here and asserted by the parameter-order test
+            // in the family module.
+            Ok(vec![
+                kept.iter().map(|c| c[0]).collect(),
+                kept.iter().map(|c| c[1]).collect(),
+                kept.iter().map(|c| c[2]).collect(),
+                kept.iter()
+                    .map(|c| volume_ratio_at_five_percent((-c[1]).ln(), c[2]))
+                    .collect(),
+            ])
+        }
+    }
+
+    fn f6_under_nuts() -> F6HierElasticity {
+        F6HierElasticity {
+            // Eight segments of twelve months: the shape of a real price round, and thin
+            // enough that the pooling is doing the work rather than decorating a fit each
+            // segment could have had alone.
+            n_groups: 8,
+            n_per: 12,
+            // exp(5) is about 150 units a month.
+            intercept: (5.0, 0.5),
+            // Centred at a unit elasticity, which is the family's own default centre.
+            elasticity: (0.0, 0.5),
+            tau_scale: 0.3,
+            tau_level_scale: 0.6,
+            // exp(3) is a dispersion near 20: overdispersed, but not so much that a
+            // twelve-month segment says nothing.
+            dispersion: (3.0, 0.3),
+            // A 60 % spread of log price within a segment. Realistic for a discount
+            // ladder, and wide enough that every replication identifies something --
+            // a refused replication would abort the suite rather than be dropped.
+            price_spread: 0.6,
+            thin: 5,
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn f6_is_calibrated_under_the_nuts_engine() {
+        let hists = run_sbc(&f6_under_nuts(), REPLICATIONS, BINS, 601).unwrap();
+        assert_calibrated(&hists, "f6/nuts");
+    }
+
+    /// **The suite above, proved to be a gate**, including on the joint quantity.
+    #[test]
+    #[ignore = "slow: hundreds of complete NUTS fits"]
+    fn a_deliberately_overconfident_f6_posterior_is_rejected() {
+        let model = Narrowed {
+            inner: f6_under_nuts(),
+            factor: 0.6,
+        };
+        let hists = run_sbc(&model, REPLICATIONS, BINS, 602).unwrap();
+        for h in &hists {
+            println!(
+                "f6/nuts/narrowed/{}: chi2 {:.1}, slope {:+.3}, counts {:?}",
                 h.param,
                 h.chi_squared(),
                 h.slope(),

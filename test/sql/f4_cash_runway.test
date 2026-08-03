@@ -1,0 +1,446 @@
+# name: test/sql/f4_cash_runway.test
+# description: payment_delay, exercised as the cash-runway agent would use it
+# group: [sql]
+#
+# The question this file answers is a CFO's, not a forecaster's. It is not "when will
+# this invoice be paid" but "what is the probability we are covered on the 28th", and
+# that is a statement about the **right tail** of a payment-delay distribution.
+#
+# A payment delay is positive and right-skewed: most invoices land near the segment's
+# habit and a few land very late, and it is the few that decide whether payroll clears.
+# `pooled_gaussian` on `log(delay)` is a lognormal model of exactly this, and it is a
+# perfectly good one -- so this family offers it as `dist: 'lognormal'`. What it cannot
+# offer is the **Gamma** branch, whose tail is materially lighter at the same mean and
+# the same coefficient of variation. Which of the two a ledger actually follows is an
+# empirical question, and the last section fits both and shows how far apart their
+# answers are.
+
+require anofox_bayes
+
+#######################################
+# Setup: 240 cleared invoices across six segments
+#######################################
+
+# Six customer segments, 40 cleared invoices each. The delay is measured from the
+# **invoice** date rather than the due date, which is the clock this family requires:
+# a delay measured from the due date is negative whenever a customer pays early, and
+# the family refuses that rather than silently fitting only the late payers.
+#
+# The scatter is a genuine Gamma sample, produced deterministically. Wilson-Hilferty
+# maps a standard normal onto a Gamma of shape k:
+#
+#     y = mu * (1 - 1/(9k) + z/sqrt(9k))^3
+#
+# and `anofox_bayes_std_normal` is a keyed, pure function of `(seed, key, draw)`, so
+# the fixture is a function of this file's own text -- no `setseed()`, no `random()`,
+# the same 240 numbers on every machine. The same identity appears again at the bottom
+# of this file as the decision query's predictive, which is deliberate: the fixture and
+# the answer are the same arithmetic run in opposite directions.
+statement ok
+CREATE TABLE cleared AS
+SELECT
+    seg.name       AS segment,
+    i              AS invoice_no,
+    seg.mu * pow(1.0 - 1.0 / 54.0
+                     + anofox_bayes_std_normal(2026, seg.name, i) / sqrt(54.0), 3)
+                   AS delay_days
+FROM (VALUES
+        ('RETAIL',     22.0),
+        ('WHOLESALE',  34.0),
+        ('PUBLIC',     58.0),
+        ('EXPORT',     41.0),
+        ('OEM',        27.0),
+        ('KEY_ACCOUNT',31.0)
+     ) AS seg(name, mu),
+     generate_series(1, 40) AS g(i);
+
+query I
+SELECT count(*) FROM cleared;
+----
+240
+
+# Every delay is a strictly positive duration, which is what the family requires.
+query I
+SELECT min(delay_days) > 0 FROM cleared;
+----
+true
+
+# And the ledger is genuinely right-skewed rather than symmetric, which is the premise
+# the whole file rests on: the mean sits above the median.
+query I
+SELECT avg(delay_days) > quantile_cont(delay_days, 0.5) FROM cleared;
+----
+true
+
+#######################################
+# Fit
+#######################################
+
+# No `pool_scale` slot and no `engine` slot: the amount of pooling is a parameter with
+# a posterior, and NUTS is the family's default because a non-centred hierarchy has no
+# usable joint mode for a Laplace approximation to sit at.
+#
+# `draws` is 2000 and `warmup` 2000 rather than the defaults. `tau` is estimated from
+# as many numbers as there are segments -- six -- so it is the coordinate that mixes
+# slowest, and this is the budget at which its R-hat clears the 1.01 gate. The gate is
+# what makes the interval mean anything, so the budget moves rather than the gate.
+statement ok
+CREATE TABLE delay_fit AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days',
+     'group': 'segment',
+     'draws': 2000,
+     'chains': 4,
+     'warmup': 2000,
+     'seed': 404}
+);
+
+# Actionable, and the table says which model and which engine produced it.
+query III
+SELECT anofox_bayes_status_text(param, value),
+       anofox_bayes_family_text(param, value),
+       max(CASE WHEN param = '__engine__' THEN value END)
+FROM delay_fit;
+----
+converged	payment_delay	2.0
+
+# Six distinct parameter names: `intercept`, `tau` and `shape` once, and `u` and `mu`
+# once per segment.
+query I
+SELECT count(DISTINCT param) FROM delay_fit
+WHERE draw >= 0 AND param NOT IN ('__lp__', '__divergent__', '__energy__', '__step_size__');
+----
+5
+
+# NUTS is the first engine that can diverge, and a divergence is a refusal rather than
+# a warning. Zero is the bar.
+query I
+SELECT sum(value) = 0 FROM delay_fit WHERE param = '__divergent__';
+----
+true
+
+# Every segment was estimated from its own data; none fell back to the pooled prior.
+query I
+SELECT count(*) FROM delay_fit WHERE param = '__group_status__';
+----
+0
+
+#######################################
+# Recovery: the segments come out in the order they went in
+#######################################
+
+# `mu` is the segment's own mean delay, reported whole rather than as an offset a
+# caller has to exponentiate. The generating means were 22, 27, 31, 34, 41, 58.
+query I
+SELECT group_id FROM delay_fit
+WHERE param = 'mu' AND draw >= 0
+GROUP BY group_id
+ORDER BY median(value);
+----
+RETAIL
+OEM
+KEY_ACCOUNT
+WHOLESALE
+EXPORT
+PUBLIC
+
+# **`mu` really is the mean.** For every segment the posterior mean of `mu` is within
+# 5 % of that segment's own observed average delay. This is the assertion that would
+# fail if the `- disp * eta` term or the mean parameterisation were wrong — under a
+# median parameterisation, or with the lognormal branch's `- sigma^2/2` correction
+# missing, every one of these would sit systematically low, and the ordering above
+# would survive it.
+query I
+SELECT count(*) FROM (
+    SELECT d.group_id, avg(d.value) AS posterior_mean, max(o.m) AS observed_mean
+    FROM delay_fit d
+    JOIN (SELECT segment, avg(delay_days) AS m FROM cleared GROUP BY segment) o
+      ON o.segment = d.group_id
+    WHERE d.param = 'mu' AND d.draw >= 0
+    GROUP BY d.group_id
+) WHERE abs(posterior_mean / observed_mean - 1.0) < 0.05;
+----
+6
+
+# ...and the intervals cover the numbers the fixture was *generated* from — five of the
+# six, which is the honest bar rather than six.
+#
+# Two things stand between a generating mean and a 95 % interval here, and both are
+# supposed to. Forty draws from a Gamma of shape 6 have a sample mean with a standard
+# error near 6 % of the mean, so a segment can genuinely land low; KEY_ACCOUNT was
+# generated at 31.0 and its forty invoices average 26.4. On top of that the hierarchy
+# shrinks each segment toward the others, which is the entire point of partial pooling.
+# Demanding six of six would be demanding that the posterior see through the sampling
+# noise in its own fixture, and the test would then be tuned rather than true.
+query I
+SELECT count(*) >= 5 FROM (
+    SELECT d.group_id,
+           anofox_bayes_credible_lower(d.value, 0.95) AS lo,
+           anofox_bayes_credible_upper(d.value, 0.95) AS hi,
+           max(t.mu) AS truth
+    FROM delay_fit d
+    JOIN (VALUES ('RETAIL', 22.0), ('WHOLESALE', 34.0), ('PUBLIC', 58.0),
+                 ('EXPORT', 41.0), ('OEM', 27.0), ('KEY_ACCOUNT', 31.0))
+         AS t(name, mu) ON t.name = d.group_id
+    WHERE d.param = 'mu' AND d.draw >= 0
+    GROUP BY d.group_id
+) WHERE truth BETWEEN lo AND hi;
+----
+true
+
+# The dispersion is found rather than assumed. The fixture was generated at shape 6,
+# and a fit that had quietly imposed an exponential (shape 1) or a near-Gaussian
+# (shape 100) would not land here.
+query I
+SELECT anofox_bayes_credible_lower(value, 0.95) < 6.0
+   AND anofox_bayes_credible_upper(value, 0.95) > 6.0
+FROM delay_fit WHERE param = 'shape' AND draw >= 0;
+----
+true
+
+#######################################
+# The answer: P(cash has landed by day X)
+#######################################
+
+# The posterior predictive for one more invoice in a segment, drawn once per posterior
+# draw so that the parameter uncertainty propagates rather than being conditioned away.
+# Wilson-Hilferty again, now with the *posterior* mean and shape rather than the
+# fixture's:
+#
+#     delay* = mu[segment] * (1 - 1/(9k) + z/sqrt(9k))^3
+#
+# `z` is keyed on `(segment, chain*2000 + draw)`, so this table is reproducible without
+# `setseed()` and is a pure function of the fit it reads.
+statement ok
+CREATE TABLE predictive AS
+WITH shape AS (
+    SELECT chain, draw, value AS k FROM delay_fit
+    WHERE param = 'shape' AND draw >= 0
+),
+level AS (
+    SELECT chain, draw, group_id AS segment, value AS mu FROM delay_fit
+    WHERE param = 'mu' AND draw >= 0
+)
+SELECT l.segment, l.mu, s.k,
+       l.mu * pow(1.0 - 1.0 / (9.0 * s.k)
+                      + anofox_bayes_std_normal(404, l.segment, (l.chain * 2000 + l.draw)::BIGINT)
+                        / sqrt(9.0 * s.k), 3) AS delay_star
+FROM level l JOIN shape s USING (chain, draw);
+
+# **The decision an agent puts in front of a treasurer.** For each segment, the
+# probability that an invoice raised today has been paid within 45 days -- which is the
+# number a covenant date is tested against, not the average.
+#
+# PUBLIC is the slow payer and is the only segment below even odds at 45 days; RETAIL
+# is the fast one and is nearly certain.
+query II
+SELECT segment,
+       anofox_bayes_prob_less(delay_star, 45.0) > 0.5
+FROM predictive
+GROUP BY segment
+ORDER BY segment;
+----
+EXPORT	true
+KEY_ACCOUNT	true
+OEM	true
+PUBLIC	false
+RETAIL	true
+WHOLESALE	true
+
+# The buffer each segment needs at a 95 % service level, ordered. This is the same
+# quantity `varying_variance_gaussian` reports for a Gaussian panel, and the ordering
+# here follows the *level* because this family pools one dispersion across segments --
+# a ledger whose segments differ in spread rather than in level is F8's, and the
+# family description says so.
+query I
+SELECT segment FROM predictive
+GROUP BY segment
+ORDER BY anofox_bayes_service_level_quantile(delay_star, 0.95) DESC;
+----
+PUBLIC
+EXPORT
+WHOLESALE
+KEY_ACCOUNT
+OEM
+RETAIL
+
+# **A second question costs no second fit.** The 90 %, 95 % and 99 % buffers for the
+# slowest segment are three aggregations over one table, and each is strictly wider
+# than the last.
+query I
+SELECT anofox_bayes_service_level_quantile(delay_star, 0.90)
+     < anofox_bayes_service_level_quantile(delay_star, 0.95)
+   AND anofox_bayes_service_level_quantile(delay_star, 0.95)
+     < anofox_bayes_service_level_quantile(delay_star, 0.99)
+FROM predictive WHERE segment = 'PUBLIC';
+----
+true
+
+#######################################
+# The two branches, and why both are offered
+#######################################
+
+# The same ledger under the lognormal branch. Nothing changes but the `dist` slot: the
+# mean is parameterised the same way in both, so the coefficients keep their meaning
+# and the two fits are directly comparable.
+statement ok
+CREATE TABLE lognormal_fit AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days',
+     'group': 'segment',
+     'dist': 'lognormal',
+     'draws': 2000,
+     'chains': 4,
+     'warmup': 2000,
+     'seed': 404}
+);
+
+query II
+SELECT anofox_bayes_status_text(param, value),
+       count(*) FILTER (WHERE param = 'sigma' AND draw >= 0) > 0
+FROM lognormal_fit;
+----
+converged	true
+
+# **They agree about the centre.** Each segment's posterior mean delay is within 5 % of
+# the other branch's, which is what makes the comparison below a statement about tails
+# rather than about levels.
+query I
+SELECT count(*) FROM (
+    SELECT g.group_id,
+           max(CASE WHEN g.src = 'gamma' THEN g.m END) AS a,
+           max(CASE WHEN g.src = 'lognormal' THEN g.m END) AS b
+    FROM (
+        SELECT 'gamma' AS src, group_id, avg(value) AS m FROM delay_fit
+        WHERE param = 'mu' AND draw >= 0 GROUP BY group_id
+        UNION ALL
+        SELECT 'lognormal', group_id, avg(value) FROM lognormal_fit
+        WHERE param = 'mu' AND draw >= 0 GROUP BY group_id
+    ) g GROUP BY g.group_id
+) WHERE abs(a / b - 1.0) < 0.05;
+----
+6
+
+# **And they disagree about the tail, which is the decision.** The lognormal predictive
+# for the slowest segment, exact rather than approximated -- `mu * exp(-s^2/2 + s z)`
+# is the branch's own definition, so no Wilson-Hilferty is needed here.
+#
+# On a ledger that is genuinely Gamma, the lognormal's 99th percentile overshoots by
+# more than a tenth. On a thirty-day cycle that is days of working capital, and a
+# family offering only one of the two would have answered the question by assumption.
+statement ok
+CREATE TABLE lognormal_predictive AS
+WITH s AS (
+    SELECT chain, draw, value AS sigma FROM lognormal_fit
+    WHERE param = 'sigma' AND draw >= 0
+),
+level AS (
+    SELECT chain, draw, group_id AS segment, value AS mu FROM lognormal_fit
+    WHERE param = 'mu' AND draw >= 0
+)
+SELECT l.segment,
+       l.mu * exp(-0.5 * s.sigma * s.sigma
+                  + s.sigma * anofox_bayes_std_normal(404, l.segment,
+                                                      (l.chain * 2000 + l.draw)::BIGINT))
+       AS delay_star
+FROM level l JOIN s USING (chain, draw);
+
+query I
+SELECT (SELECT anofox_bayes_service_level_quantile(delay_star, 0.99)
+        FROM lognormal_predictive WHERE segment = 'PUBLIC')
+     / (SELECT anofox_bayes_service_level_quantile(delay_star, 0.99)
+        FROM predictive WHERE segment = 'PUBLIC') > 1.10;
+----
+true
+
+#######################################
+# Refusals
+#######################################
+
+# **The clock, named.** A delay measured from the due date goes negative whenever a
+# customer pays early. Fitting the positive rows only would keep exactly the late
+# payers and bias a cash forecast in the direction that matters most, so this is a
+# request error rather than a filter.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, delay_days - 30.0 AS delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'draws': 100, 'seed': 1}
+);
+----
+strictly positive duration
+
+# An open item that has not been paid at all is right-censored, not a zero-length
+# delay, and the error says which family owns that.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, 0.0 AS delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'draws': 100, 'seed': 1}
+);
+----
+censored_aft
+
+# Two segments cannot identify a pooling scale. The verdict is `insufficient_data`
+# rather than an error -- the draws are real, and it is the status that refuses.
+query I
+SELECT anofox_bayes_status_text(param, value) FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM cleared WHERE segment IN ('RETAIL', 'PUBLIC')),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'draws': 200, 'chains': 2,
+     'warmup': 400, 'seed': 1}
+);
+----
+insufficient_data
+
+# A ledger whose invoices all cleared on the same day has no dispersion to estimate,
+# and the parameters that cannot be estimated are NULL rather than a plausible number.
+query II
+SELECT anofox_bayes_status_text(param, value),
+       count(*) FILTER (WHERE draw >= 0 AND param = 'shape' AND value IS NOT NULL)
+FROM anofox_bayes_fit(
+    (SELECT segment, 30.0 AS delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'draws': 200, 'chains': 2,
+     'warmup': 200, 'seed': 1}
+);
+----
+degenerate	0
+
+# The Laplace engine is refused with a reason rather than served badly: a Gaussian at
+# the joint mode of a non-centred hierarchy is not a posterior.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'engine': 'laplace', 'draws': 100}
+);
+----
+NUTS only
+
+# An unknown slot is rejected rather than ignored, and the error lists what the family
+# does accept. `distribution` is too far from `dist` for the edit-distance suggestion to
+# fire — eight characters — so the catalog of slots is what the caller gets, which is
+# the more useful answer at that distance anyway.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'distribution': 'gamma'}
+);
+----
+this family accepts: y, group, x, dist,
+
+# A *near* miss does fire the suggestion.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, delay_days FROM cleared),
+    'payment_delay',
+    {'y': 'delay_days', 'group': 'segment', 'dists': 'gamma'}
+);
+----
+did you mean 'dist'
