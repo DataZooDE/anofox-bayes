@@ -49,6 +49,108 @@ structurally-fixed parameter that the crate does not currently have, and either 
 something a SQL consumer joins on. Until then, `weibull` with a `sigma` near 1 is the
 working alternative.
 
+### Added — F4 `payment_delay`, the hierarchical duration GLM (roadmap gap 8)
+
+Agent 04, cash runway, is unblocked. `docs/THEORY.md` has the model and
+`test/sql/f4_cash_runway.test` the run a treasury team would make.
+
+- **The roadmap's own objection was right about the facts and wrong about their
+  weight.** Gap 8 read: *"a native Gamma-delay family buys the Gamma branch and little
+  else."* True — and the Gamma branch is the whole question. A CFO asks
+  `P(cash ≥ obligation on date X)`, which is a tail, and a lognormal and a Gamma with
+  the same mean and the same coefficient of variation diverge there without bound.
+  Measured on the shipped fixture: the two branches' posterior mean delays agree to
+  within **5 %** on all six segments, and the lognormal's **99th percentile** for the
+  slowest segment overshoots the Gamma's by **more than 10 %**. `ROADMAP.md` §3.5.
+- **`log mu = intercept + x'beta + tau·z_g`, `z ~ N(0,1)`**, with
+  `delay ~ Gamma(shape, shape/mu)` or a mean-preserving lognormal under `dist`. Both
+  branches parameterise the *mean*, so a `dist` switch leaves the coefficients meaning
+  the same thing and the two fits directly comparable.
+- **NUTS only**, non-centred, `target_accept` 0.95 — the same geometry `hier_negbin`
+  refuses `laplace` on, with the same explanation rather than a silently worse answer.
+- **`prior.tau.scale` carries a concrete default (half-normal 1.0)**, unlike
+  `hier_negbin`'s flat one, and `THEORY.md` §3's objection does not bite: `tau` is the
+  spread of a *log* mean and is dimensionless, so one log unit means the same thing in
+  euros, days and kilograms. Flat is proper and measurably worse — the upper tail is
+  where the sampler diverges and every divergence is a refusal.
+- **Two deliberate non-features, both documented in the family description and the
+  refusal table.** Dispersion is *pooled*: a ledger whose segments differ in spread
+  rather than level is `varying_variance_gaussian`'s. And there is no censoring: an
+  unpaid open item is a right-censored duration belonging to `censored_aft`.
+- **The clock is named in the error.** A delay measured from the *due* date goes
+  negative whenever a customer pays early; fitting the positive rows only would keep
+  exactly the late payers and bias a cash forecast in the direction that matters most.
+  A non-positive `y` is therefore a request error that names the invoice-date clock and
+  both alternative families, not a filter.
+- **Both log-densities pinned against a hand-written closed form**, and both analytic
+  gradients against finite differences *away from the mode* — including on a dataset the
+  family refuses, where a refusing model exposes a standard normal and the check would
+  otherwise be vacuous. The `+ log tau` Jacobian is isolated and asserted to be
+  detectable; the dispersion prior is asserted to carry **no** Jacobian, since it is
+  declared on the coordinate it is sampled on.
+- **SBC under NUTS**, 1024 replications, against a gate of 37.7: chi-squared **23.3**
+  (`intercept`), **24.9** (`tau`), **19.9** (`shape`) and **16.6** on
+  `delay_marginal_sd` — a function of all three at once, which is the assertion a
+  per-parameter suite structurally cannot make. The same pipeline with every draw
+  pulled 40 % toward its posterior mean scores 485/691/371/891 and is rejected.
+- **`FamilyCode` 4** is now `payment_delay`, with the matching
+  `anofox_bayes_family_text` arm. The BRD's F1–F7 grid is one family from complete.
+
+### Added — F6 `hier_elasticity`, sign-constrained price elasticity (roadmap gap 9)
+
+Agent 06, the price-increase simulator, is unblocked. **This gap had been closed
+without building it**, and was reopened on the trigger the closure itself named.
+`ROADMAP.md` §3.4 keeps both halves of that argument, because the case for closing it is
+still the right case against the family that was *not* built.
+
+- **What changed.** §3.4 closed gap 9 on the grounds that `pooled_gaussian` with
+  `random_slopes` *is* hierarchical elasticity — which is true — and ended: *"what would
+  change this: a customer needing elasticity on a likelihood `pooled_gaussian` does not
+  have — count data with a log link, say, where the response cannot be logged because it
+  is sometimes zero."* Agent 06's brief requires exactly that, plus a per-segment
+  refusal `pooled_gaussian` has no verdict to report.
+- **`log mu = intercept + eta_g + b_g·logprice + x'beta`**, with
+  `b_g = -exp(psi + tau·z_g)` and `eta_g = tau_level·v_g`. Two non-centred hierarchies;
+  negative binomial or Gamma likelihood; NUTS only, `target_accept` 0.95.
+- **The sign is a constraint, not a tail probability.** Across every segment and all
+  8 000 draws of the shipped fixture, **zero** non-negative elasticities — a property of
+  the transform, so one would be a bug. And it does not hide a genuine disagreement: on
+  data generated with volume *rising* in price the posterior piles against zero (mean
+  above −0.25) rather than reporting a confident wrong magnitude.
+- **There is no `unconstrained` slot**, deliberately. A switch turning the constraint
+  off would make this family and `pooled_gaussian` + `random_slopes` the same model
+  under two names, which is the `model_id`-splitting objection §3.4 was right about.
+  The two remain genuinely distinct models, and each family's description points at the
+  other.
+- **`group_elasticity` is reported whole, not as an offset.** `pooled_gaussian`'s
+  equivalent requires joining `beta[log_price]` to `group_slope[log_price]` on
+  `(chain, draw)` and returns a wrong answer if that join is forgotten.
+- **A segment whose prices never moved is named, not quietly pooled.** It is still
+  fitted — its elasticity is the pooled prior, with a visibly wider interval — and it
+  appears on its own `__group_status__` row with `__n_groups_unready__` counting it, so
+  an agent quarantines one row rather than the whole table. That is the *"keine Aussage
+  möglich, die Preise waren konstant"* PARTIAL the Entscheidungsvorlage has to carry.
+  A panel where *no* segment's price moved is `degenerate` with `NULL` draws.
+- **A concrete prior default on the elasticity magnitude** — lognormal, centred at unit
+  elasticity, one log unit of spread. Admissible for the same reason as F4's `tau`: an
+  elasticity is dimensionless. The resulting 95 % prior interval of roughly `[0.14, 7]`
+  contains every published elasticity and excludes where a three-price-point segment
+  would otherwise wander.
+- **Both log-densities pinned against a hand-written closed form; both gradients against
+  finite differences away from the mode.** *Both* `+ log tau` Jacobians are isolated and
+  asserted detectable — this family has two chances to lose one — and the elasticity
+  prior is asserted to carry **none**, since it is declared on `psi` directly.
+- **SBC under NUTS**, 1024 replications, against a gate of 37.7: chi-squared
+  **25.6** (`intercept`), **21.3** (`elasticity`), **20.4** (`tau`) and **22.9** on
+  `volume_ratio_at_5pct` — the expected volume response to a +5 % move for a
+  randomly chosen segment, evaluated by quadrature over the segment distribution.
+  That fourth entry reads `psi` and `tau` jointly, so a posterior with the right
+  marginals and the wrong correlation fails there and nowhere else. The same
+  pipeline with every draw pulled 40 % toward its posterior mean scores
+  498/401/871/395 and is rejected, so the gate is a gate.
+- **`FamilyCode` 6** is now `hier_elasticity`, with the matching
+  `anofox_bayes_family_text` arm. **The BRD's F1–F7 grid is complete.**
+
 ### Added — F1 `hier_negbin`, the hierarchical count GLM (roadmap gap 7)
 
 Agent 01, C-parts safety stock, is unblocked. `docs/THEORY.md` has the model and

@@ -394,6 +394,105 @@ Two consequences worth knowing:
 > them reports `degenerate` with `NULL` draws rather than a confident number derived
 > from curvature that is not a posterior.
 
+### `payment_delay` — when will this invoice actually be paid?
+
+*Use it for:* the right tail of a payment habit, per customer segment. The question is
+not "what is the average delay" but `P(cash ≥ obligation on the 28th)`, and that is a
+statement about how far the late invoices reach.
+
+The model is a hierarchical GLM on a positive duration:
+
+```text
+  log mu_i = intercept + x_i'beta + tau · z_{g(i)},        z_g ~ N(0, 1)
+
+  gamma:      delay_i ~ Gamma(shape, shape / mu_i)
+  lognormal:  log delay_i ~ N(log mu_i − sigma²/2, sigma²)
+```
+
+Both branches parameterise the **mean**, which is why the coefficients keep their
+meaning across a `dist` switch — the lognormal's `− sigma²/2` is exactly the correction
+that makes `mu` the mean rather than the median.
+
+**Why two branches rather than one.** A lognormal delay model *is* a Gaussian model on
+`log(delay)`, so `pooled_gaussian` already fits it. What it cannot fit is the Gamma,
+and the two disagree precisely where the decision lives: at the same mean and the same
+coefficient of variation their far right tails diverge without bound. Which one a
+ledger follows is empirical, and a family offering only one answers that by assumption.
+Measured on the `test/sql/f4_cash_runway.test` fixture, the two agree within 5 % on
+every segment's mean and the lognormal's 99th percentile for the slowest segment
+overshoots the Gamma's by more than 10 % — days of working capital on a thirty-day
+cycle.
+
+**What it does not model.** One dispersion, pooled across segments: a ledger whose
+segments differ in *spread* rather than in *level* is `varying_variance_gaussian`'s.
+And no censoring: an unpaid open item is a right-censored duration and belongs to
+`censored_aft`. Treating it as a delay of zero, or dropping it, biases a cash forecast
+downward by exactly the amount that matters, so a non-positive delay is a request error
+naming both the clock to use and the alternative family — not a filter.
+
+**The prior on `tau` has a concrete default**, unlike `hier_negbin`'s. §3's objection to
+concrete defaults is that they are claims about scale, and a claim about scale is wrong
+for every customer whose units differ from the author's. Here `tau` is the spread of a
+*log* mean and is therefore dimensionless: one log unit is a factor of `e`, which means
+the same thing in euros, days and kilograms. What the default half-normal(1) does assert
+— that the slowest-paying segment's mean is not more than about seven times the
+fastest's — is true of every ledger this family is for. Leaving it flat is proper
+(Gelman 2006) and measurably worse: the upper tail is where the sampler diverges, and
+every divergence is a refusal.
+
+### `hier_elasticity` — what does a price rise cost in volume?
+
+*Use it for:* the annual price round. The decision is a **band** per segment — "list
++5 % in this segment costs this much volume, with this much uncertainty" — and the
+segments that most need it are the sparse ones.
+
+```text
+  log mu_i = intercept + eta_{g(i)} + b_{g(i)} · logprice_i + x_i'beta
+
+  eta_g = tau_level · v_g,            v_g ~ N(0, 1)
+  b_g   = −exp(psi + tau · z_g),      z_g ~ N(0, 1)
+
+  y_i ~ NegBinomial(mu_i, phi)   or   Gamma(shape, shape / mu_i)
+```
+
+**Two things here, and only two, are beyond `pooled_gaussian` with `random_slopes`** —
+which is otherwise the same model and, on a well-populated segment with the sign not in
+doubt, the better and faster tool. `docs/ROADMAP.md` §3.4 has the full argument; the
+short version:
+
+*The sign is a constraint.* `b_g = −exp(...)` makes every draw of every segment's
+elasticity negative by construction. A Gaussian random slope on a thin segment puts
+real mass above zero — not because the data says volume rises with price, but because
+the posterior is wide and symmetric — and a price meeting handed an interval saying
+that raising the price might sell *more* stops reading the interval. Those are two
+different failures wearing the same face, and constraining the sign removes the second
+while leaving the first fully visible: on a product whose volume genuinely does rise
+with price, this family piles the posterior against zero rather than reporting a
+confident wrong magnitude.
+
+*The response is a count.* `log(units)` is undefined at zero and badly behaved near it,
+and a Gaussian model on logs asserts a constant residual spread in log units — so a
+segment selling four units a month and one selling forty thousand are claimed to be
+equally noisy on a relative scale. That is exactly where the shrinkage is doing the
+work.
+
+**The hierarchy is on the log magnitude**, not on the elasticity itself, so that the
+constraint and the pooling are the same transform rather than two that have to be
+reconciled. The prior on that magnitude is lognormal centred at unit elasticity with
+one log unit of spread — again a dimensionless quantity, so again a concrete default is
+admissible, and a 95 % interval of roughly `[0.14, 7]` contains every published
+elasticity in every industry while excluding the region a segment with three price
+points would otherwise wander into.
+
+**Identification is checked per segment, before any arithmetic.** A segment whose
+log-price column never moved multiplies its elasticity by a constant, so nothing in the
+data speaks to that coefficient and the posterior is the prior. Those segments are
+named individually on `__group_status__` rather than collapsed into the model-level
+verdict, so an agent holding forty segments quarantines the three that were on a fixed
+price list rather than the whole table. That is the *"keine Aussage möglich, die Preise
+waren konstant"* PARTIAL a price round has to carry, and it is a per-group verdict
+`pooled_gaussian` has no way to report.
+
 ### `varying_variance_gaussian` — a spread per group, and the pooling decided by the data
 
 *Use it for:* "how much buffer does **this** segment need?" — a service level, a
@@ -494,12 +593,20 @@ on the `__engine__` row so a reviewer can see which one ran.
 
 | Engine | What it does | Status |
 |---|---|---|
-| `exact` | Samples the closed-form posterior directly. No approximation. | default for the two conjugate families |
-| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on every family; **the** engine for `censored_aft` |
-| `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | available wherever a gradient is; **the only** engine for `hier_negbin` |
-| `exact` | Samples the closed-form posterior directly. No approximation. | default for `conjugate_anomaly` and `pooled_gaussian` |
-| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | available on `pooled_gaussian`; the only engine for `payer_alive` |
-| `nuts` | General-purpose sampler for models with no closed form. | default for `varying_variance_gaussian`; available wherever a gradient is |
+| `exact` | Samples the closed-form posterior directly. No approximation. | default for the two conjugate families, `conjugate_anomaly` and `pooled_gaussian` |
+| `laplace` | Fits a Gaussian at the posterior's peak and samples that. | **the only** engine for `censored_aft` and `payer_alive`; also available on `pooled_gaussian` |
+| `nuts` | Explores the posterior itself with Hamiltonian dynamics. No closed form needed. | default for `varying_variance_gaussian`; **the only** engine for `hier_negbin`, `payment_delay` and `hier_elasticity` |
+
+Four families refuse everything but `nuts`, and three of them refuse `laplace` for one
+shared reason rather than three: they are **non-centred hierarchies**, and a Laplace
+posterior is a Gaussian at the joint mode, which such a model does not have. When every
+group offset is zero the likelihood does not depend on the pooling scale at all, so the
+density has a ridge along `{z = 0, tau → ∞}` that the `+ log tau` Jacobian makes rise
+without bound. The ridge carries no posterior *mass* — the region where the likelihood
+is any good shrinks like `tau^-G` — which is why a sampler is untroubled by it and a
+mode search walks straight up it. Asking for `laplace` on `hier_negbin`,
+`payment_delay` or `hier_elasticity` is a config error naming that reason, not a
+silently worse answer.
 
 Where a closed form exists, `exact` is both faster and more accurate, so it is the
 default. `laplace` and `nuts` exist because they generalise to families that have no

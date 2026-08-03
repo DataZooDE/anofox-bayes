@@ -72,8 +72,9 @@ catalog of model families and tune documented options; you cannot write your own
 likelihood. That restriction is what lets each family ship with fixed parameterisation
 decisions, a validated config schema and its own calibration suite.
 
-Today the catalog is five families — enough for anomaly detection, intervention
-measurement, censored durations, customer-churn scoring and per-segment service levels.
+Today the catalog is eight families — enough for anomaly detection, intervention
+measurement, censored durations, safety stock across a thin catalogue, payment-delay
+tails, customer-churn scoring, price elasticity and per-segment service levels.
 See [the roadmap](#roadmap).
 
 ## Install
@@ -112,27 +113,35 @@ setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 | `pooled_gaussian` | Effect measurement; diff-in-diff, interrupted time series | `intercept`, `beta[…]`, `sigma`, per-group effects |
 | `censored_aft` | Time until something happens, when some of it has not happened yet — delivery promises, time-to-pay | `intercept`, `beta[…]`, `sigma` (accelerated failure time) |
 | `hier_negbin` | How much of this part will be wanted? Safety stock and reorder points across a catalogue where most items are thin | `intercept`, `tau`, `phi` (population); `u`, `rate` per group |
+| `payment_delay` | When will this invoice actually be paid? Cash runway, covenant cover, the right tail of a payment habit | `intercept`, `tau`, `shape`/`sigma` (population); `u`, `mu` per segment |
 | `payer_alive` | Has this customer churned? Collections, dunning, retention | `r`, `alpha`, `a`, `b` (population level; `P(alive)` per customer is SQL over them) |
+| `hier_elasticity` | What does a price rise cost in volume? A per-segment elasticity that is negative by construction, on a count response | `intercept`, `elasticity`, `tau`, `tau_level`, `phi`/`shape`; `group_effect`, `group_elasticity` per segment |
 | `varying_variance_gaussian` | A *spread* per group: service levels, buffers, "which segments are unpredictable" | `intercept`, `beta[…]`, `pool_scale`, `sigma_pop`, `sigma_spread`, plus `group_effect` and `sigma` per group |
 
 Rule of thumb: **one number per group → `conjugate_anomaly`; a response explained by
 predictors → `pooled_gaussian`; a duration where some cases have not finished →
-`censored_aft`; a repeat-purchase history and a churn question → `payer_alive`; a
-question about a group's *spread* rather than its level → `varying_variance_gaussian`.**
+`censored_aft`; a duration that has finished, and it is the tail you care about →
+`payment_delay`; a repeat-purchase history and a churn question → `payer_alive`; a
+price move and a volume response → `hier_elasticity`; a question about a group's
+*spread* rather than its level → `varying_variance_gaussian`.**
 
 `pooled_gaussian` also does **random slopes**: each group gets its own coefficient on a
 predictor, pooled toward the population value rather than estimated in isolation. That
-is what a per-store price elasticity actually is.
+is one way to get a per-store price elasticity, and where the response is
+well-populated and the sign is not in doubt it is the faster one. `hier_elasticity` is
+the other: it constrains every segment's elasticity to be negative and puts a count
+likelihood under it, which is what a thin segment in a price round needs.
 
 Three engines: `exact` (closed-form, the default), `laplace` (a Gaussian at the mode)
 and `nuts` (the No-U-Turn Sampler, via [`nuts-rs`](https://github.com/pymc-devs/nuts-rs)).
 Switching between them changes no caller SQL.
 
-Planned, and *not* present today: hierarchical negative-binomial (F1) and a native
-payment-delay model (F4). A native elasticity family is a **decided non-goal** — random
-slopes above are what elasticity is, and a second family id for the same mathematics
-would split `model_id`, the cache and the calibration evidence to save a `log()`. See
-[the roadmap](docs/ROADMAP.md).
+The BRD's F1–F7 grid is complete. What remains a **decided non-goal** is an
+elasticity family for a *Gaussian* response: random slopes above already are that, and
+a second family id for the same mathematics would split `model_id`, the cache and the
+calibration evidence to save a `log()`. `hier_elasticity` exists alongside it rather
+than replacing it, because a sign constraint and a count likelihood are a different
+model rather than the same one renamed. See [the roadmap](docs/ROADMAP.md) §3.4.
 
 There is deliberately **no `predict` function** — posterior prediction is a join over
 the draws table, which is both simpler and faster. See
@@ -173,9 +182,9 @@ test suite, so they cannot drift from the implementation.
 
 | | |
 |---|---|
-| **now** | Four families — `conjugate_anomaly`, `pooled_gaussian` (with random slopes), `censored_aft`, `payer_alive`. All three engines: exact, Laplace, NUTS. Diagnostics, SBC and PyMC parity, prior-predictive checks, deterministic predictive draws |
-| next | Hierarchical negative-binomial (F1); per-group variance with a learned pooling scale |
-| later | Payment delay (F4), native elasticity (F6), streaming sufficient statistics |
+| **now** | Eight families — the BRD's F1–F7 grid complete, plus `varying_variance_gaussian`. All three engines: exact, Laplace, NUTS. Diagnostics, SBC and PyMC parity, prior-predictive checks, deterministic predictive draws |
+| next | Streaming sufficient statistics; `anofox_scenario` catalog registration |
+| later | Censored durations under a hierarchical delay model; a second predictive surface |
 
 Breaking changes are expected at v0.x. Use the
 [issues page](https://github.com/DataZooDE/anofox-bayes/issues) to report a bug or ask
