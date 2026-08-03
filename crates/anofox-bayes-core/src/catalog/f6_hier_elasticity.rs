@@ -2053,14 +2053,22 @@ mod tests {
 
 #[cfg(test)]
 mod sql_fixture_check {
-    //! The fit `test/sql/f6_price_elasticity.test` runs, reproduced here.
+    //! The fits `test/sql/f6_price_elasticity.test` runs, reproduced here.
     //!
-    //! That file asserts `sum(__divergent__) = 0`, and a divergence is not a
-    //! stylistic complaint: this crate refuses any fit that produces one, so the
-    //! assertion is the difference between the scenario table meaning something and
-    //! the family being unusable. `make test` builds DuckDB, which takes the better
-    //! part of an hour, so the property is checked against the same core the
-    //! extension links rather than by running the query.
+    //! That file gates `sum(__divergent__) = 0` on `identified_fit` -- the six
+    //! segments whose prices moved, which is `converged` and actionable. A divergence
+    //! there is not a stylistic complaint: this crate refuses any fit that produces
+    //! one, so on that fixture the assertion is the difference between the scenario
+    //! table meaning something and the family being unusable.
+    //!
+    //! It deliberately does *not* gate an exact count on the seven-segment
+    //! `elasticity_fit`, which is already refused whatever the sampler did. See
+    //! `the_refused_fixtures_divergence_count_is_a_property_of_the_toolchain` for the
+    //! measurements behind that split.
+    //!
+    //! `make test` builds DuckDB, which takes the better part of an hour, so these
+    //! properties are checked against the same core the extension links rather than
+    //! by running the query.
 
     use super::*;
     use crate::data::testing::Frame;

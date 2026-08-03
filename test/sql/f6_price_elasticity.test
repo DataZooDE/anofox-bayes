@@ -187,9 +187,12 @@ true
 # on a GitHub `linux_amd64` runner, and failed -- reproducibly, five runs out of five --
 # on the same source built inside the manylinux release container.
 #
-# **The cause is named, not guessed at.** The difference is the C library the log
-# density's `exp` and `ln` resolve to -- same source, same `rustc 1.97.1`, same CPU
-# family. Reproduced by running the fit inside the release container:
+# **The difference was isolated, not guessed at.** It is not the model, the seed, the
+# data, the row order, the CPU or the compiler: same source, same `rustc 1.97.1`, same
+# CPU family. What is left is the C library the log density's `exp` and `ln` resolve to.
+# That narrows it to libm-sensitive sampler arithmetic; the exact rounding event was not
+# traced, and this file does not claim it was. Reproduced by running the fit inside the
+# release container:
 #
 #   glibc 2.44  zero divergences at 24 seeds, at five input perturbations up to 1e-9
 #               relative, and at five row orders
@@ -200,9 +203,15 @@ true
 # A divergence is a *thresholded* diagnostic layered on path-dependent warmup
 # adaptation: one accept/reject comparison landing on the other side of its uniform
 # gives the rest of that run a different step size, so a last-ulp difference in `exp`
-# moves the count without moving the posterior. `crates/anofox-bayes-core/src/catalog/
+# can move the count while every posterior summary this file asserts stays inside its
+# stated bounds -- which is what was measured, rather than a claim that the posterior is
+# mathematically unchanged. `crates/anofox-bayes-core/src/catalog/
 # f6_hier_elasticity.rs`'s `sql_fixture_check` holds the measurements and
 # `.github/workflows/sampler-probe.yml` re-runs them on a runner on demand.
+#
+# What a consumer sees on such a build: `__status__` is `insufficient_data` and
+# `anofox_bayes_is_actionable` is false either way, so a consumer gating on status
+# reads the same decision. One reading `__divergent__` directly sees the one draw.
 #
 # So the gate moves to a fit that is expected to converge and be acted on -- where a
 # divergence would mean the extension is refusing an answer a user is owed, which is a
