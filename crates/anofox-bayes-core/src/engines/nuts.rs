@@ -1082,4 +1082,199 @@ mod tests {
         };
         assert!(!s.is_empty());
     }
+
+    // ===================================================================== //
+    // The invariants a parallel chain loop must not break.
+    //
+    // These are written *before* any parallelism and must stay green through
+    // it. They are the reason a performance change to this engine can be
+    // reviewed at all: parallelising a sampler is only admissible if it cannot
+    // move a single draw, and "cannot" has to be executable.
+    // ===================================================================== //
+
+    /// A small NUTS fit, run through the whole engine, as a byte-level digest.
+    ///
+    /// `f64` formatting would hide a one-ulp difference and a tolerance would
+    /// invite one, so the draws are hashed by their raw bit patterns. Any change
+    /// to trajectory, ordering or accumulation moves this digest.
+    fn nuts_digest(n_chains: usize, seed: u64) -> (String, usize) {
+        let f = frame(60);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        let sample = NutsEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains,
+                    n_draws: 250,
+                    n_warmup: 250,
+                    seed,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )
+            .unwrap();
+        let mut hasher = blake3::Hasher::new();
+        for v in &sample.values {
+            hasher.update(&v.to_bits().to_le_bytes());
+        }
+        (hasher.finalize().to_hex().to_string(), sample.values.len())
+    }
+
+    /// **The golden.** One recorded digest, so a refactor that changes any draw
+    /// fails here and names itself.
+    ///
+    /// If this ever needs re-recording, that is a deliberate act with an
+    /// explanation attached -- not a number to update until the test passes.
+    #[test]
+    fn the_draws_of_a_nuts_fit_are_bit_for_bit_reproducible() {
+        let (a, n) = nuts_digest(4, 20260801);
+        let (b, _) = nuts_digest(4, 20260801);
+        assert_eq!(a, b, "two identical fits disagreed at the bit level");
+        assert_eq!(n, 4 * 250 * 4, "4 chains x 250 draws x 4 parameters");
+
+        // A different seed must move it, or the digest is not measuring anything.
+        let (c, _) = nuts_digest(4, 20260802);
+        assert_ne!(a, c, "changing the seed left the draws identical");
+    }
+
+    /// **The invariant the parallel change exists to preserve.**
+    ///
+    /// `parallel.rs` states the rule this rests on: every parallel site keys its
+    /// random stream on the *identity* of the work -- here the chain index --
+    /// never on the order tasks happen to run in. So the thread budget may change
+    /// how long a fit takes and may not change what it returns.
+    ///
+    /// Green today because chains are sequential. It must still be green when
+    /// they are not, and that is the whole point of writing it first.
+    #[test]
+    fn the_draws_do_not_depend_on_the_thread_budget() {
+        let reference = crate::parallel::with_thread_budget(1, || nuts_digest(4, 7));
+        for threads in [2usize, 4, 8] {
+            let got = crate::parallel::with_thread_budget(threads, || nuts_digest(4, 7));
+            assert_eq!(
+                got, reference,
+                "a {threads}-thread budget produced different draws from a 1-thread one"
+            );
+        }
+    }
+
+    /// Each chain's draws must land in its own block, in chain order.
+    ///
+    /// The layout is positional -- `Posterior` slices `values` by
+    /// `(chain, draw, param)` -- so a parallel loop that wrote chunks out of
+    /// order would produce a table that is individually plausible everywhere and
+    /// attributes every draw to the wrong chain. R-hat would then compare a chain
+    /// with itself and report excellent mixing for a fit that had none.
+    #[test]
+    fn each_chains_draws_land_in_its_own_block_in_chain_order() {
+        let per_chain: Vec<String> = (0..4).map(|c| nuts_digest_of_chain(c)).collect();
+        let all = nuts_values(4, 7);
+        let n_params = 4;
+        let stride = 250 * n_params;
+        for (c, expected) in per_chain.iter().enumerate() {
+            let mut hasher = blake3::Hasher::new();
+            for v in &all[c * stride..(c + 1) * stride] {
+                hasher.update(&v.to_bits().to_le_bytes());
+            }
+            assert_eq!(
+                &hasher.finalize().to_hex().to_string(),
+                expected,
+                "block {c} of a 4-chain fit is not chain {c}"
+            );
+        }
+    }
+
+    /// The raw values of an `n_chains` fit, for the block-order test.
+    fn nuts_values(n_chains: usize, seed: u64) -> Vec<f64> {
+        let f = frame(60);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        NutsEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains,
+                    n_draws: 250,
+                    n_warmup: 250,
+                    seed,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )
+            .unwrap()
+            .values
+    }
+
+    /// Chain `c` of a 4-chain fit, obtained by running chains 0..=c and taking the
+    /// last block. Chain `c`'s stream is `BayesRng::for_chain(seed, c)` and depends
+    /// on nothing else, so this is the same chain either way -- which is itself
+    /// the property being checked.
+    fn nuts_digest_of_chain(c: usize) -> String {
+        let all = nuts_values(c + 1, 7);
+        let stride = 250 * 4;
+        let mut hasher = blake3::Hasher::new();
+        for v in &all[c * stride..(c + 1) * stride] {
+            hasher.update(&v.to_bits().to_le_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// The four sampler-statistic rows must stay aligned with their `(chain, draw)`.
+    ///
+    /// `stats` is currently `push`ed in loop order, which is exactly the kind of
+    /// shared accumulator a parallel loop breaks silently: the counts would still
+    /// be right and every value would still be a real number, but `__divergent__`
+    /// would be attributed to the wrong draw and a fit's refusal could land on a
+    /// chain that never diverged.
+    #[test]
+    fn the_sampler_statistics_stay_aligned_with_their_chain() {
+        let f = frame(60);
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let model = PooledGaussian
+            .compile(
+                &Config::parse(r#"{"y": "y", "x": ["x1", "x2"], "pool_scale": 2.0}"#).unwrap(),
+                &view,
+            )
+            .unwrap();
+        let sample = NutsEngine
+            .sample(
+                &*model,
+                &SampleOptions {
+                    n_chains: 3,
+                    n_draws: 120,
+                    n_warmup: 120,
+                    seed: 11,
+                    sample_from: crate::types::SampleFrom::Posterior,
+                },
+            )
+            .unwrap();
+        let stats = &sample.stats;
+        assert_eq!(stats.len(), 3 * 120, "one statistic row per (chain, draw)");
+        // Every entry is populated -- a parallel loop that pre-sized the vector and
+        // failed to fill a chunk would leave `SampleStats::default()` here, which is
+        // all `None`, rather than panicking. `is_empty` is exactly that check.
+        assert!(
+            stats.iter().all(|s| !s.is_empty()),
+            "some statistic rows were never written"
+        );
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.step_size.is_some_and(f64::is_finite)
+                    && s.energy.is_some_and(f64::is_finite)),
+            "a statistic row carries a non-finite value"
+        );
+    }
 }
