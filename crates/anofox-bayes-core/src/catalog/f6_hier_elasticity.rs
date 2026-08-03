@@ -2140,23 +2140,6 @@ mod sql_fixture_check {
         )
     }
 
-    fn divergences_at(seed: u64) -> f64 {
-        let (units, log_price, segment) = billing();
-        assert_eq!(units.len(), 168, "the fixture in the .test file has moved");
-        let frame = Frame::new(units.len())
-            .numeric("units", units)
-            .numeric("log_price", log_price)
-            .key("segment", segment.iter().map(String::as_str).collect());
-        let refs = frame.key_refs();
-        let view = frame.view(&refs);
-        let cfg = format!(
-            r#"{{"y": "units", "price": "log_price", "group": "segment",
-                 "draws": 2000, "chains": 4, "warmup": 2000, "seed": {seed}}}"#
-        );
-        let f = fit("hier_elasticity", &Config::parse(&cfg).unwrap(), &view).unwrap();
-        f.posterior.n_divergent().unwrap_or(0) as f64
-    }
-
     /// **The contract: the fit a price round acts on does not diverge.**
     ///
     /// `test/sql/f6_price_elasticity.test` gates `sum(__divergent__) = 0` on
