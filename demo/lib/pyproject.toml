@@ -1,0 +1,28 @@
+[project]
+name = "anofox-bayes-demo"
+version = "0.1.0"
+description = "Shared Textual shell for the anofox-bayes demo TUIs"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=8.2.8",
+    # The one place these demos differ from the anofox-evolve ones: they talk to
+    # DuckDB in-process rather than shelling out to a Rust binary, because
+    # `anofox_bayes_fit` *is* the product surface and putting a subprocess in
+    # front of it would hide the thing being demonstrated.
+    # Pinned exactly, not `>=`. The extension is built against a specific DuckDB
+    # and refuses at LOAD time on any other -- "built specifically for DuckDB
+    # version v1.5.5 and can only be loaded with that version". A floating lower
+    # bound means the demos break the day duckdb ships 1.6, with an error about
+    # versions rather than about anything the reader did. `validation/` pins for
+    # the same reason and says so.
+    "duckdb==1.5.5",
+    "rich>=13.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "anofox_bayes_demo"
+module-root = "src"

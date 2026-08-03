@@ -1,0 +1,20 @@
+[project]
+name = "intervention"
+version = "0.1.0"
+description = "Agent 03 — intervention evaluation on anofox-bayes F3 (pooled_gaussian)"
+requires-python = ">=3.12"
+dependencies = ["anofox-bayes-demo"]
+
+[project.scripts]
+intervention = "intervention:run"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "intervention"
+module-root = "src"
+
+[tool.uv.sources]
+anofox-bayes-demo = { workspace = true }

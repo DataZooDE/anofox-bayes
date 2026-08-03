@@ -1,0 +1,20 @@
+[project]
+name = "delivery-promise"
+version = "0.1.0"
+description = "Agent 02 — delivery promise dates on anofox-bayes F2 (censored_aft)"
+requires-python = ">=3.12"
+dependencies = ["anofox-bayes-demo"]
+
+[project.scripts]
+delivery-promise = "delivery_promise:run"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "delivery_promise"
+module-root = "src"
+
+[tool.uv.sources]
+anofox-bayes-demo = { workspace = true }
