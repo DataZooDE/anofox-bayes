@@ -530,6 +530,31 @@ impl CompiledVaryingVariance {
         self.intercept
     }
 
+    /// Whether the compile-time verdict was that there is no posterior here.
+    ///
+    /// **Without this the family breaks its own refusal contract.** `assess`
+    /// already detects a constant response and returns `Readiness::degenerate`
+    /// — but a verdict only decides the `__status__` row, and the engine still
+    /// runs. On a likelihood with no interior maximum NUTS cannot find a usable
+    /// starting point at all, and the fit came back as
+    /// `internal error: NUTS could not find a usable starting point` instead of
+    /// as the `degenerate` row with NULL draws the caller is promised. An agent
+    /// branching on `__status__` never saw it, because there was no table.
+    ///
+    /// The fix is the one `hier_negbin` documents and `payment_delay` and
+    /// `hier_elasticity` inherit: expose a trivially-explorable standard normal
+    /// whose `constrain` yields NaN, so the refusal travels as data.
+    ///
+    /// `InsufficientData` is deliberately not one of these — that verdict says
+    /// the data is weak, not that the surface is unusable, so the draws are real
+    /// and it is the status that refuses.
+    fn refuses(&self) -> bool {
+        matches!(
+            self.readiness.status,
+            crate::types::FitStatus::Degenerate | crate::types::FitStatus::Failed
+        )
+    }
+
     fn dim_of(&self) -> usize {
         self.n_fixed + 2 * self.n_groups + 3
     }
@@ -585,6 +610,12 @@ impl LogPosterior for CompiledVaryingVariance {
     /// dropped throughout, uniformly, which is what the trait permits and what makes
     /// the closed-form tests compare *differences*.
     fn logp(&self, theta: &[f64]) -> f64 {
+        if self.refuses() {
+            // See `refuses`: a trivially-explorable surface, so the refusal
+            // reaches SQL as a `degenerate` row with NULL draws instead of as an
+            // engine failure.
+            return -0.5 * theta.iter().map(|v| v * v).sum::<f64>();
+        }
         let l = self.layout();
         let p = self.n_fixed;
         let tau = theta[l.lt].exp();
@@ -649,6 +680,12 @@ impl LogPosterior for CompiledVaryingVariance {
                 out.len()
             )));
         }
+        if self.refuses() {
+            for (slot, v) in out.iter_mut().zip(theta) {
+                *slot = -v;
+            }
+            return Ok(());
+        }
         let l = self.layout();
         let p = self.n_fixed;
         let tau = theta[l.lt].exp();
@@ -710,6 +747,9 @@ impl LogPosterior for CompiledVaryingVariance {
     }
 
     fn initial(&self) -> Vec<f64> {
+        if self.refuses() {
+            return vec![0.0; self.dim_of()];
+        }
         self.start.clone()
     }
 
@@ -722,6 +762,10 @@ impl LogPosterior for CompiledVaryingVariance {
     }
 
     fn constrain(&self, theta: &[f64], out: &mut [f64]) {
+        if self.refuses() {
+            out.fill(f64::NAN);
+            return;
+        }
         let l = self.layout();
         let p = self.n_fixed;
         out[..p].copy_from_slice(&theta[l.fixed..l.fixed + p]);
@@ -1613,6 +1657,64 @@ pub(crate) mod tests {
             compile(r#"{"y": "y", "group": "segment"}"#, &view).unwrap_err(),
             BayesError::InsufficientData { .. }
         ));
+    }
+
+    /// **A degenerate dataset must reach SQL as a `degenerate` row, not as an error.**
+    ///
+    /// Found by running the demo suite against the shipped build: on a constant
+    /// response `assess` correctly returns `Readiness::degenerate`, but the
+    /// verdict only decides the `__status__` row — the engine still ran, NUTS
+    /// could not find a usable starting point on a likelihood with no interior
+    /// maximum, and the whole call failed with
+    /// `internal error: NUTS could not find a usable starting point for chain 0`.
+    ///
+    /// That is the one thing the refusal contract exists to prevent. An agent
+    /// branching on `__status__` never saw the refusal, because there was no
+    /// table to branch on. `hier_negbin` had solved this before this family was
+    /// written; the fix is its `refuses()` short-circuit, and this test is what
+    /// keeps it.
+    #[test]
+    fn a_constant_response_is_refused_through_the_status_row_rather_than_an_error() {
+        let frame = Frame::new(12)
+            .numeric("y", vec![30.0; 12])
+            .numeric("x", (0..12).map(|i| (i % 4) as f64).collect())
+            .key(
+                "segment",
+                vec!["A", "A", "A", "A", "B", "B", "B", "B", "C", "C", "C", "C"],
+            );
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        // The whole fit completes -- this is the assertion, and it is what used
+        // to raise.
+        let fit = crate::fit::fit(
+            "varying_variance_gaussian",
+            &Config::parse(
+                r#"{"y": "y", "x": "x", "group": "segment",
+                    "draws": 200, "chains": 2, "warmup": 200, "seed": 1}"#,
+            )
+            .unwrap(),
+            &view,
+        )
+        .expect("a degenerate dataset must return a refused fit, not an error");
+
+        assert_eq!(
+            fit.posterior.meta.status,
+            crate::types::FitStatus::Degenerate
+        );
+        // ...and every parameter it could not estimate is NULL rather than a
+        // plausible-looking number.
+        for c in 0..fit.posterior.n_chains {
+            for j in 0..fit.posterior.params.len() {
+                for v in fit.posterior.chain_values(c, j) {
+                    assert!(
+                        v.is_nan(),
+                        "parameter {} of a degenerate fit came back as {v}",
+                        fit.posterior.params[j].name
+                    );
+                }
+            }
+        }
     }
 
     /// The constrained draw is what reaches SQL, so every positive quantity must be

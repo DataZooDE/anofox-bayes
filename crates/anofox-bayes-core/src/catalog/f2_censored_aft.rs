@@ -269,7 +269,24 @@ impl ModelFamily for CensoredAft {
             }
         }
 
-        let readiness = Readiness::worst(verdicts.iter().cloned());
+        // **The empty case has to be spelled out.** `Readiness::worst` folds from
+        // `Converged`, so the worst of *no* verdicts is `converged` -- and a
+        // dataset whose every row was dropped by null filtering produces no
+        // verdicts at all. Found by probing the shipped build: a `time` column
+        // of NaN left `__n_obs__ = 0`, `__n_groups__ = 0` and
+        // `anofox_bayes_is_actionable` reporting **true**, which is precisely
+        // the outcome the refusal machinery exists to prevent. Every other
+        // family in the catalog raises `InsufficientData` here;
+        // `conjugate_anomaly` guards the same fold the same way.
+        let readiness = if verdicts.is_empty() {
+            Readiness::insufficient(format!(
+                "no usable rows: all {n_obs} observation(s) were dropped before \
+                 fitting, so there is no group to estimate anything for. The usual \
+                 cause is a non-finite value in the time, event or predictor columns"
+            ))
+        } else {
+            Readiness::worst(verdicts.iter().cloned())
+        };
         let n_groups_unready = verdicts
             .iter()
             .filter(|v| !v.status.is_actionable())
@@ -542,6 +559,47 @@ mod tests {
     /// `sigma` is drawn as the exponential of a Gaussian coordinate, so every draw is
     /// positive by construction. A Gaussian fitted to `sigma` directly would put mass
     /// below zero, which is not a scale.
+    /// **A fit over no usable rows must refuse, not report `converged`.**
+    ///
+    /// Found by probing the shipped build with the demo suite: a `time` column of
+    /// NaN leaves every row unusable, so the per-group loop produces no verdicts
+    /// at all — and `Readiness::worst` folds from `Converged`, so the worst of
+    /// nothing *was* `converged`. The draws table came back with
+    /// `__n_obs__ = 0`, `__n_groups__ = 0` and `anofox_bayes_is_actionable`
+    /// reporting **true**, which is exactly the outcome the refusal machinery
+    /// exists to prevent: an agent would have acted on a fit of nothing.
+    ///
+    /// Every other family in the catalog raises `InsufficientData` on this input.
+    #[test]
+    fn a_fit_over_no_usable_rows_refuses_rather_than_reporting_converged() {
+        let n = 40;
+        let frame = Frame::new(n)
+            .numeric("days", vec![f64::NAN; n])
+            .numeric("event", (0..n).map(|i| (i % 2) as f64).collect())
+            .key("lane", (0..n).map(|i| ["A", "B"][i % 2]).collect());
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+
+        let model = CensoredAft
+            .compile(
+                &Config::parse(r#"{"time": "days", "event": "event", "group": "lane"}"#).unwrap(),
+                &view,
+            )
+            .expect("an all-NaN column filters to zero rows rather than erroring");
+
+        assert_eq!(model.n_obs(), 0);
+        assert_eq!(
+            model.readiness().status,
+            crate::types::FitStatus::InsufficientData,
+            "a fit over zero usable rows reported {:?}",
+            model.readiness().status
+        );
+        assert!(
+            !model.readiness().status.is_actionable(),
+            "a fit over zero usable rows must never be actionable"
+        );
+    }
+
     #[test]
     fn the_scale_stays_positive_because_it_is_sampled_on_the_log_scale() {
         let f = frame(200, 0.0, Some(40.0));

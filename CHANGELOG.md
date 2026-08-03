@@ -7,6 +7,48 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Fixed — two refusal-contract violations
+
+Both were found by driving the extension with realistic data and probing its own
+documented guarantees. They are the same class of failure, and it is the one the
+refusal machinery exists to prevent: a fit that cannot answer must say so **on a
+`__status__` row**, not by raising and not by claiming success.
+
+- **`varying_variance_gaussian` raised an internal error instead of refusing.** On a
+  constant response `assess` correctly returned `Readiness::degenerate` — but a verdict
+  only decides the status row, and the engine still ran. NUTS cannot find a usable
+  starting point on a likelihood with no interior maximum, so the call failed with
+  *"internal error: NUTS could not find a usable starting point for chain 0"* and there
+  was no table for an agent to branch on. Fixed with the `refuses()` short-circuit
+  `hier_negbin` documents: a refusing model exposes a trivially-explorable standard
+  normal whose `constrain` yields NaN, so the refusal travels as data. Pinned by
+  `a_constant_response_is_refused_through_the_status_row_rather_than_an_error`.
+
+- **`censored_aft` reported `converged` on a fit over zero rows.** A non-finite value in
+  the `time` column leaves every row unusable, so the per-group loop produced no
+  verdicts — and `Readiness::worst` folds from `Converged`, making the worst of *nothing*
+  a pass. The draws table came back with `__n_obs__ = 0`, `__n_groups__ = 0` and
+  **`anofox_bayes_is_actionable` reporting `true`**: an agent would have acted on a fit
+  of nothing. Every other family in the catalog raises `InsufficientData` on the same
+  input. Fixed by spelling out the empty case, as `conjugate_anomaly` already does.
+  Pinned by `a_fit_over_no_usable_rows_refuses_rather_than_reporting_converged`.
+
+### Known — `dist: 'exponential'` is graded `degenerate` on a good fit
+
+Reported rather than fixed, because the fix is a contract decision rather than a patch.
+Under `exponential` the AFT scale is **held at 1 by the definition of the
+distribution**, so its posterior has a standard deviation of exactly zero. `ess` returns
+`0.0` for a parameter that never moves — deliberately, so that a genuinely stuck sampler
+cannot sail through an `ess >= 400` gate — and the fit is then graded `degenerate` even
+though every coefficient is estimated correctly and the other three distributions
+converge on the same data.
+
+Distinguishing "fixed by construction" from "did not move" needs a notion of a
+structurally-fixed parameter that the crate does not currently have, and either answer
+(omit `sigma` from the draws for this `dist`, or exempt it from the gate) changes
+something a SQL consumer joins on. Until then, `weibull` with a `sigma` near 1 is the
+working alternative.
+
 ### Added — F1 `hier_negbin`, the hierarchical count GLM (roadmap gap 7)
 
 Agent 01, C-parts safety stock, is unblocked. `docs/THEORY.md` has the model and
