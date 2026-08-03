@@ -1,0 +1,51 @@
+[project]
+name = "anofox-bayes-demos"
+version = "0.1.0"
+description = "Seven Textual TUIs showing what anofox-bayes is for, one per model family"
+readme = "README.md"
+authors = [{ name = "Joachim Rosskopf", email = "jr@data-zoo.de" }]
+requires-python = ">=3.12"
+
+# The root package exists to pull every demo into one environment, so that
+# `uv sync` once makes all seven console scripts runnable. Each demo is a real
+# workspace member with its own pyproject and its own entry point.
+dependencies = [
+    "anofox-bayes-demo",
+    "safety-stock",
+    "delivery-promise",
+    "intervention",
+    "cash-runway",
+    "dunning",
+    "price-increase",
+    "freight-audit",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "anofox_bayes_demos"
+module-root = "src"
+
+[tool.uv.workspace]
+members = ["lib", "agents/*"]
+
+[tool.uv.sources]
+anofox-bayes-demo = { workspace = true }
+safety-stock = { workspace = true }
+delivery-promise = { workspace = true }
+intervention = { workspace = true }
+cash-runway = { workspace = true }
+dunning = { workspace = true }
+price-increase = { workspace = true }
+freight-audit = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "agents"]

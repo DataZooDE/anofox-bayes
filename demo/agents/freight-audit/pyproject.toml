@@ -1,0 +1,20 @@
+[project]
+name = "freight-audit"
+version = "0.1.0"
+description = "Agent 07 — freight cost audit on anofox-bayes F7 (conjugate_anomaly)"
+requires-python = ">=3.12"
+dependencies = ["anofox-bayes-demo"]
+
+[project.scripts]
+freight-audit = "freight_audit:run"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "freight_audit"
+module-root = "src"
+
+[tool.uv.sources]
+anofox-bayes-demo = { workspace = true }

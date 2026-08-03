@@ -1,0 +1,7 @@
+# uv creates one venv for the whole workspace; it is a build artefact of
+# `uv sync` and is reproducible from uv.lock, which *is* committed.
+.venv/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/

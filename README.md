@@ -105,6 +105,21 @@ make release -j$(nproc)      # the first build compiles DuckDB: 30-60 minutes
 Needs a stable Rust toolchain, CMake 3.15+, and a C++ compiler. Full development
 setup in [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## See it work
+
+Seven Textual TUIs, one per model family, each stepping through a real pipeline
+with the SQL on screen — reorder points, delivery promises, causal effects, cash
+runway, dunning, a price round, a freight audit.
+
+```sh
+make release -j$(nproc)
+cd demo && uv sync && uv run safety-stock
+```
+
+No API key and no network: the whole computation is this extension and SQL. Add
+`--headless` to print a run instead of opening the TUI. See
+[`demo/README.md`](demo/README.md).
+
 ## The catalog
 
 | Family | Use it for | Parameters |

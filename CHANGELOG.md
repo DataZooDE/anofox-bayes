@@ -7,6 +7,36 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Added — seven demo TUIs, one per model family
+
+`demo/` — a uv workspace with a shared Textual shell and one runnable demo per agent
+concept. Each opens a real DuckDB, loads this extension, generates a deterministic
+fixture and runs real fits; `--headless` prints the whole run instead.
+
+- **The screen is an SQL pipeline you step through.** Every step shows the prose that
+  says why it exists, the SQL verbatim, the real result rows and a plain-language
+  verdict. Exactly one step per pipeline calls `anofox_bayes_fit`; everything after it
+  re-reads the same draws table, and the activity log timestamps each statement so the
+  "a second question costs no second fit" claim is checkable rather than asserted.
+- **Refusal is on screen in four of the seven.** The intervention demo refuses a donor
+  pool with no parallel pre-trend, the price round names the segment whose prices never
+  moved, dunning quarantines a segment with too little churn to model, and cash runway
+  refuses a ledger that does not reconcile.
+- **Fixtures are deterministic and drawn from the model.** Built in SQL from
+  `anofox_bayes_uniform` / `anofox_bayes_std_normal`, which are pure functions of
+  `(seed, key, draw)` — no `setseed()`, no `random()`, the same rows on every machine,
+  and several drawn from the family's own likelihood by inverse CDF so the data really
+  is from the model the fit inverts.
+- **Long fits report progress.** The F1 fit in the safety-stock demo takes about three
+  and a half minutes; steps announce themselves before running, a ticker shows a spinner
+  and live elapsed, and the fit step says what the sampler is doing — read out of the
+  SQL rather than duplicated in prose.
+- Tested three ways: every pipeline step executes, the claims hold (one fit, questions
+  cheaper than fitting, the advertised family matches the draws table, every what-if
+  moves an answer, every fixture reproducible, every rendered string valid markup), and
+  seven pilot-driven journeys drive the real app through its real bindings, workers and
+  modals.
+
 ### Fixed — two refusal-contract violations
 
 Both were found by driving the extension with realistic data and probing its own
