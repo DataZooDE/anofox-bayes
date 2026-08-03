@@ -48,6 +48,35 @@ structurally-fixed parameter that the crate does not currently have, and either 
 (omit `sigma` from the draws for this `dist`, or exempt it from the gate) changes
 something a SQL consumer joins on. Until then, `weibull` with a `sigma` near 1 is the
 working alternative.
+### Changed — NUTS runs its chains in parallel
+
+A four-chain fit used one core and left the rest of the machine idle. Chains are
+independent by construction, so this was pure waste — and `parallel.rs` already
+described "chains under NUTS" as one of this crate's parallel sites, which it was not.
+
+- **Measured, end to end, on the same binary.** `test/sql/f1_hier_negbin.test`'s
+  spare-parts fixture (14 SKUs, 4 chains × 2000 draws) takes **12.71 s** under
+  `SET threads = 1` and **3.35 s** under `SET threads = 4` — a **3.8× speedup**. Eight
+  threads buys nothing further: four chains is the ceiling this axis has, and the
+  larger units of parallelism remain groups and fits.
+- **Not a new thread pool.** The chains run on the rayon pool
+  `parallel::with_thread_budget` already sizes from DuckDB's `SET threads` /
+  `SET anofox_bayes_threads`, so an operator who caps the process at one thread still
+  gets one thread — asserted by `a_single_thread_budget_runs_chains_one_at_a_time`.
+  `nuts-rs`'s own `parallel` feature stays off.
+- **Draws are unchanged, bit for bit.** Chain *c* seeds from
+  `BayesRng::for_chain(seed, c)` and writes only into slices it alone owns, so its
+  output is a function of `(seed, c)` and of nothing the scheduler decides. The
+  invariants were committed as failing-if-broken tests *before* the change: identical
+  digests across thread budgets and across repeated runs, each chain's draws in its own
+  block in chain order, and statistics still aligned with their chain. `stats` is now
+  pre-sized and indexed rather than pushed, which is what makes the last of those true.
+- **Errors are reported by chain index, not by whichever failed first**, so the message
+  a failing fit produces does not depend on machine timing.
+- **A note for anyone timing this.** `pooled_gaussian` reduces to sufficient statistics
+  at compile time, so its log density costs the same at 400 rows as at 60 000 and its
+  fits are too fast to show any of this. The speedup is real only where the likelihood
+  walks the data on every gradient evaluation, which is every hierarchical family.
 
 ### Added — F4 `payment_delay`, the hierarchical duration GLM (roadmap gap 8)
 

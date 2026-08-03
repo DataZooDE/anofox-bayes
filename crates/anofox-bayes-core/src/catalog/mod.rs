@@ -353,7 +353,21 @@ pub trait ExactPosterior {
 /// is unit-tested against finite differences. There is no autodiff dependency: the
 /// catalog is closed, so the derivatives are written once and checked once, and the
 /// check is cheaper and more auditable than a general mechanism would be.
-pub trait LogPosterior {
+///
+/// # `Sync`, and why it is a supertrait
+///
+/// The NUTS engine runs one chain per rayon task and every task reads this same
+/// posterior, so it has to be shareable across threads. That is not a new constraint
+/// discovered late: a log density is a *pure function* of its coordinates — every
+/// implementation in this catalog is a struct of data read immutably and none of them
+/// has ever had interior mutability — so the bound records a property the families
+/// already had rather than imposing one on them.
+///
+/// It is also the property that makes parallel chains admissible at all. A posterior
+/// that mutated per evaluation would make a chain's draws depend on what other chains
+/// were doing, and `nuts.rs`'s reproducibility contract would be unenforceable rather
+/// than merely broken.
+pub trait LogPosterior: Sync {
     /// Number of unconstrained coordinates.
     fn dim(&self) -> usize;
 
