@@ -1552,8 +1552,7 @@ mod tests {
             crate::parallel::with_thread_budget(threads, || {
                 let model = crate::catalog::f1_hier_negbin::HierNegbin
                     .compile(
-                        &Config::parse(r#"{"y": "units", "group": "sku"}"#)
-                            .unwrap(),
+                        &Config::parse(r#"{"y": "units", "group": "sku"}"#).unwrap(),
                         &view,
                     )
                     .unwrap();
