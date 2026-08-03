@@ -19,7 +19,9 @@
 pub mod f1_hier_negbin;
 pub mod f2_censored_aft;
 pub mod f3_pooled_gaussian;
+pub mod f4_payment_delay;
 pub mod f5_btyd;
+pub mod f6_hier_elasticity;
 pub mod f7_conjugate;
 pub mod f8_varying_variance;
 
@@ -414,7 +416,9 @@ pub fn all() -> &'static [&'static dyn ModelFamily] {
         &f1_hier_negbin::HierNegbin,
         &f2_censored_aft::CensoredAft,
         &f3_pooled_gaussian::PooledGaussian,
+        &f4_payment_delay::PaymentDelay,
         &f5_btyd::PayerAlive,
+        &f6_hier_elasticity::HierElasticity,
         &f7_conjugate::ConjugateAnomaly,
         &f8_varying_variance::VaryingVarianceGaussian,
     ];

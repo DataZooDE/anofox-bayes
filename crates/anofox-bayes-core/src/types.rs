@@ -102,8 +102,12 @@ pub enum FamilyCode {
     CensoredAft = 2,
     /// F3 — pooled Gaussian linear model.
     PooledGaussian = 3,
+    /// F4 — hierarchical positive-duration GLM (Gamma / lognormal), non-centred.
+    PaymentDelay = 4,
     /// F5 — payer-alive / BTYD (BG/NBD).
     PayerAlive = 5,
+    /// F6 — hierarchical price elasticity, sign-constrained, count or Gamma response.
+    HierElasticity = 6,
     /// F7 — conjugate anomaly (Normal / Poisson closed forms).
     ConjugateAnomaly = 7,
     /// Gaussian linear model with a **per-group** residual variance and a **learned**
@@ -126,7 +130,9 @@ impl FamilyCode {
             FamilyCode::HierNegbin => "hier_negbin",
             FamilyCode::CensoredAft => "censored_aft",
             FamilyCode::PooledGaussian => "pooled_gaussian",
+            FamilyCode::PaymentDelay => "payment_delay",
             FamilyCode::PayerAlive => "payer_alive",
+            FamilyCode::HierElasticity => "hier_elasticity",
             FamilyCode::ConjugateAnomaly => "conjugate_anomaly",
             FamilyCode::VaryingVarianceGaussian => "varying_variance_gaussian",
         }
@@ -138,7 +144,9 @@ impl FamilyCode {
             1 => Some(FamilyCode::HierNegbin),
             2 => Some(FamilyCode::CensoredAft),
             3 => Some(FamilyCode::PooledGaussian),
+            4 => Some(FamilyCode::PaymentDelay),
             5 => Some(FamilyCode::PayerAlive),
+            6 => Some(FamilyCode::HierElasticity),
             7 => Some(FamilyCode::ConjugateAnomaly),
             8 => Some(FamilyCode::VaryingVarianceGaussian),
             _ => None,
@@ -299,19 +307,25 @@ mod tests {
         assert_eq!(FamilyCode::HierNegbin as i32, 1);
         assert_eq!(FamilyCode::CensoredAft as i32, 2);
         assert_eq!(FamilyCode::PooledGaussian as i32, 3);
+        assert_eq!(FamilyCode::PaymentDelay as i32, 4);
         assert_eq!(FamilyCode::PayerAlive as i32, 5);
+        assert_eq!(FamilyCode::HierElasticity as i32, 6);
         assert_eq!(FamilyCode::ConjugateAnomaly as i32, 7);
         for code in [
             FamilyCode::HierNegbin,
             FamilyCode::CensoredAft,
             FamilyCode::PooledGaussian,
+            FamilyCode::PaymentDelay,
             FamilyCode::PayerAlive,
+            FamilyCode::HierElasticity,
             FamilyCode::ConjugateAnomaly,
             FamilyCode::VaryingVarianceGaussian,
         ] {
             assert_eq!(FamilyCode::from_code(code as i32), Some(code));
         }
         assert_eq!(FamilyCode::PayerAlive.as_str(), "payer_alive");
+        assert_eq!(FamilyCode::PaymentDelay.as_str(), "payment_delay");
+        assert_eq!(FamilyCode::HierElasticity.as_str(), "hier_elasticity");
         // Outside the BRD's F1-F7 planning grid, so it takes the next unused code
         // rather than borrowing an F-number that names a different likelihood.
         assert_eq!(FamilyCode::VaryingVarianceGaussian as i32, 8);
@@ -323,10 +337,11 @@ mod tests {
             FamilyCode::VaryingVarianceGaussian.as_str(),
             "varying_variance_gaussian"
         );
-        // The gaps are families the catalog does not ship, not aliases for one it
-        // does -- decoding one must fail rather than pick a neighbour.
-        assert_eq!(FamilyCode::from_code(4), None);
-        assert_eq!(FamilyCode::from_code(6), None);
+        // The BRD's grid is now complete, so the only codes left to reject are the ones
+        // beyond it: decoding an unshipped family must fail rather than pick a
+        // neighbour.
+        assert_eq!(FamilyCode::from_code(0), None);
+        assert_eq!(FamilyCode::from_code(9), None);
     }
 
     #[test]

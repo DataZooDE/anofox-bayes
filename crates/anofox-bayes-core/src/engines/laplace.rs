@@ -964,6 +964,20 @@ mod tests {
             .numeric("rec", (0..n).map(|i| ((i % 5) as f64) * 6.0).collect())
             .numeric("age", (0..n).map(|_| 40.0).collect())
             .numeric("units", (0..n).map(|i| (i % 6) as f64).collect())
+            // Strictly positive, as `payment_delay` requires, and not constant, so the
+            // family does not decline the fixture as degenerate before the engine
+            // questions are reached.
+            .numeric(
+                "delay",
+                (0..n).map(|i| 10.0 + ((i * 7) % 23) as f64).collect(),
+            )
+            // A log-price column that varies *within* each segment, which is what
+            // identifies an elasticity and therefore what keeps `hier_elasticity` from
+            // declining the fixture before the engine questions are reached.
+            .numeric(
+                "logp",
+                (0..n).map(|i| ((i / 4) % 5) as f64 * 0.1 - 0.2).collect(),
+            )
             .key(
                 "segment",
                 (0..n).map(|i| ["A", "B", "C", "D"][i % 4]).collect(),
@@ -995,10 +1009,17 @@ mod tests {
             // bound along a ridge carrying no mass. It is sampled, and `laplace` on it
             // is refused rather than served badly.
             "hier_negbin",
+            // The same geometry as `hier_negbin`, one likelihood over: a Gamma or
+            // lognormal duration under a non-centred hierarchy. No conjugate prior, and
+            // no usable joint mode either.
+            "payment_delay",
+            // Two non-centred hierarchies rather than one, and a `-exp` transform on the
+            // elasticity that is not conjugate to anything either.
+            "hier_elasticity",
         ];
 
         // Refuses `laplace` in `compile`, for a reason `Engine::supports` cannot see.
-        const NO_LAPLACE_POSTERIOR: &[&str] = &["hier_negbin"];
+        const NO_LAPLACE_POSTERIOR: &[&str] = &["hier_negbin", "payment_delay", "hier_elasticity"];
 
         let configs = [
             ("pooled_gaussian", r#"{"y": "y", "x": "x1"}"#),
@@ -1008,6 +1029,7 @@ mod tests {
                 "censored_aft",
                 r#"{"time": "days", "event": "delivered", "x": "distance"}"#,
             ),
+            ("payment_delay", r#"{"y": "delay", "group": "segment"}"#),
             (
                 "payer_alive",
                 r#"{"frequency": "freq", "recency": "rec", "age": "age", "min_customers": 1}"#,
@@ -1015,6 +1037,10 @@ mod tests {
             (
                 "varying_variance_gaussian",
                 r#"{"y": "y", "x": "x1", "group": "segment"}"#,
+            ),
+            (
+                "hier_elasticity",
+                r#"{"y": "units", "price": "logp", "group": "segment"}"#,
             ),
         ];
         assert_eq!(

@@ -29,8 +29,8 @@ them down was to find out.
 | 5 | Per-group variance + learned pooling scale | 04, 06 | **Done.** `varying_variance_gaussian`, non-centred on both hierarchies. SBC says Laplace is inadmissible here — NUTS is the default | — |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | **Done.** Pinned `=0.18.3`; byte-identical across thread counts | — |
 | 7 | F1 hierarchical negative binomial | 01 | **Done, natively.** The bridge was built and measured first and cannot cover a thin SKU — its plug-in dispersion error propagates into the pooling scale (§3.5) | PyMC parity test |
-| 8 | F4 payment delay, native | 04 | Not started, and the same question as §3.4 applies: `pooled_gaussian` on log-delay is already a lognormal model, and `censored_aft` covers the case where some invoices have not been paid yet | Decide before building; 8–12 d if built |
-| 9 | F6 hierarchical elasticity, native | 06 | **Closed without building it** — random slopes on a log-log model *are* hierarchical elasticity. Reasoning in §3.4 | — |
+| 8 | F4 payment delay, native | 04 | **Shipped** as `payment_delay`. The Gamma branch is the thing `pooled_gaussian` on log-delay structurally cannot offer, and a covenant test reads the tail where the two disagree. Reasoning in §3.5 | — |
+| 9 | F6 hierarchical elasticity, native | 06 | **Reopened and shipped** as `hier_elasticity`, on the trigger §3.4 itself named: a count likelihood, plus a sign constraint. Reasoning in §3.4 | — |
 | 10 | `conjugate_anomaly` has no `as_differentiable` | none | **Done.** All three engines now serve it, so a closed form has three independent derivations | — |
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | **Done.** `__group_status__` names the refused groups; the collapsed verdict is deliberately unchanged | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | **Done.** `sample_from: 'prior'`, refused unless the prior is proper | — |
@@ -149,9 +149,15 @@ the order.
   does not hold: the interval on a thin SKU's own demand rate covers 0.76 where 0.90 is
   nominal, and 0.41 at a higher demand level. §3.4 has the measurement and the three
   upstream facts behind it. The native family is `hier_negbin`, NUTS only, non-centred.
-- **F4 native** (gap 8). A lognormal delay model is a Gaussian model on `log(delay)`,
-  so `pooled_gaussian` already substitutes and the v0.3 family covers per-segment
-  spread. A native Gamma-delay family buys the Gamma branch and little else.
+- ~~**F4 native** (gap 8)~~ **shipped.** The prediction recorded here — "a native
+  Gamma-delay family buys the Gamma branch and little else" — turned out to be true and
+  to be the point: the Gamma branch is what a cash-cover probability needs, because a
+  lognormal and a Gamma with the same mean and the same coefficient of variation
+  disagree about the far right tail, and the far right tail is the decision. Measured on
+  the `test/sql/f4_cash_runway.test` fixture, the lognormal's 99th percentile for the
+  slowest segment overshoots the Gamma's by more than 10 %. The family is
+  `payment_delay`, NUTS only, non-centred, with both branches offered under `dist` so
+  the comparison is one config slot rather than a rewrite. §3.5 has the reasoning.
 - **Prior-predictive checks** (gap 12). (Gap 13, the `anofox-scenario` integration,
   turned out to need no code at all — see §5.)
 - **Scale work** (gap 14): rayon across groups for `conjugate_anomaly`, streaming
@@ -544,6 +550,15 @@ did the rest. Both are worth trying first for any future hierarchical family.
 
 ### 3.4 Is a native elasticity family (F6) worth building, now that random slopes ship?
 
+**Asked and answered no. Reopened on the trigger this section itself named, and
+shipped. Both halves are kept below, because the second only makes sense against the
+first — and because the argument for closing it is still the right argument against the
+family that was *not* built.**
+
+---
+
+#### The original answer, which stands
+
 **Recommendation: no. Close it, and say why loudly enough that it is not reopened by
 default.**
 
@@ -577,6 +592,104 @@ instead of fixing the data.
 `pooled_gaussian` does not have — count data with a log link, say, where the response
 cannot be logged because it is sometimes zero. That is a different likelihood rather
 than a different family for the same one, and it would be scoped as such.
+
+---
+
+#### The reopening, and what changed
+
+**That last paragraph is the trigger, and agent 06 pulled it.** The price-round brief
+requires a per-segment recommendation *band* on segments too sparse to estimate alone,
+and an explicit refusal for segments whose prices never moved. Against `pooled_gaussian`
+neither is deliverable:
+
+*The likelihood is wrong where it matters most.* A price round covers the long tail of
+the catalogue as well as the head, and a segment selling four units a month has a
+`log(units)` that is undefined at zero and badly behaved near it. A Gaussian model on
+logs also assumes a constant residual spread in log units, so the sparse segment and
+the forty-thousand-unit segment are asserted to be equally noisy on a relative scale.
+That is exactly the segment shrinkage exists for, and exactly where the assumption
+fails. This is the count-data-with-a-log-link case named above, arriving as predicted.
+
+*And the sign objection was answered by the same brief.* The original text argues that
+constraining the sign "hides the diagnostic instead of fixing the data", and for a
+**measurement** that is right — a positive fitted elasticity usually means confounding.
+But an unconstrained Gaussian slope on a thin segment does not report a positive
+elasticity because the data says so; it reports one because the posterior is wide and
+symmetric and half of it sits above zero. Those are different failures with the same
+appearance, and only one of them is a diagnostic. Constraining the sign removes the
+second and leaves the first fully visible: `hier_elasticity` on a genuinely
+price-rising product does not hide the disagreement, it piles the posterior against
+zero, which is legible on the interval. `a_product_whose_volume_rises_with_price_is_pushed_against_the_bound`
+pins that behaviour.
+
+*The `model_id`-splitting objection survives, and is respected.* This is why there is
+**no `unconstrained` slot**. A switch turning the constraint off would make
+`hier_elasticity` and `pooled_gaussian` + `random_slopes` the same model under two
+names, which is the thing this section was right to refuse. The two families are kept
+genuinely distinct: one is Gaussian-on-logs with a free slope, the other is
+count-with-a-log-link and a bounded one. `test/sql/f3_price_elasticity.test` and
+`test/sql/f6_price_elasticity.test` are the executable specifications of each, and the
+family descriptions point at one another.
+
+**What shipped:** `hier_elasticity`, code 6, NUTS only. Two non-centred hierarchies —
+one on the segment level, one on `log |elasticity|` — with `b_g = -exp(psi + tau·z_g)`
+so every draw of every segment's elasticity is negative by construction rather than by
+tail probability. The prior on the magnitude is lognormal centred at unit elasticity,
+which is a concrete default and admissible because an elasticity is dimensionless.
+Per-segment identification is checked before any arithmetic: a segment whose log-price
+column spans less than `min_price_variation` is named in a `__group_status__` row and
+served the pooled prior, which is the *"keine Aussage möglich"* PARTIAL the brief asks
+for and the thing `pooled_gaussian` has no per-group verdict to report.
+
+**What was still not built:** an elasticity family for a Gaussian response. That one
+remains closed, for the reasons above, and is listed under non-goals.
+
+### 3.5 Was a native payment-delay family (F4) worth building?
+
+**Asked with a prediction already on the record, and the prediction was right — it just
+was not the objection it looked like.**
+
+The entry in §1 read: *"a lognormal delay model is a Gaussian model on `log(delay)`, so
+`pooled_gaussian` already substitutes and the v0.3 family covers per-segment spread. A
+native Gamma-delay family buys the Gamma branch and little else."* Every clause of that
+is true. What it got wrong is the weight: **the Gamma branch is not "little else", it is
+the whole question.**
+
+*The decision is a tail, not a level.* A CFO does not ask "what is the average payment
+delay", they ask `P(cash ≥ obligation on the 28th)`. A lognormal and a Gamma with the
+same mean and the same coefficient of variation agree closely about the centre and
+diverge without bound in the far right tail. On the `test/sql/f4_cash_runway.test`
+fixture — a ledger genuinely generated from a Gamma — the two branches' posterior mean
+delays agree to within 5 % for all six segments, and the lognormal's 99th percentile
+for the slowest segment overshoots the Gamma's by more than 10 %. On a thirty-day cycle
+that gap is days of working capital, and a family offering only one of the two would
+have answered an empirical question by assumption.
+
+*So both are offered, under one `dist` slot.* This is the opposite of the §3.3 mistake
+(one family, two warranties): both branches are NUTS-served, both are Gaussian in
+neither sense, both carry the same refusals and the same SBC machinery, and the mean is
+parameterised identically in each — the lognormal branch carries the `- σ²/2` correction
+precisely so that `mu` means the same thing in both and a caller can switch without the
+coefficients changing meaning. What differs is a likelihood, which is what a config slot
+may legitimately choose.
+
+**Two things it deliberately does not do.** *A residual scale per segment* is
+`varying_variance_gaussian`'s subject; adding a second answer here would give a caller
+two families to choose between on a question neither would then own, so `dispersion` is
+pooled and the description says where to go instead. *Censoring* — an open item that has
+not been paid at all — belongs to `censored_aft`; treating it as a delay of zero, or
+dropping it, biases a cash forecast in the direction that matters most, so a non-positive
+delay is a request error that names the clock and the alternative family rather than a
+filter.
+
+**One design note worth carrying forward.** `prior.tau.scale` has a *concrete* default
+here (half-normal at 1.0), where `hier_negbin` leaves it flat. THEORY §3's objection to
+concrete defaults is that they are claims about units — but `tau` is the spread of a
+**log** mean and is therefore dimensionless, so the objection does not bite, and the
+F8 finding does: a flat prior on a hierarchical scale is proper but its upper tail is
+where the sampler diverges, and every divergence is a refusal under
+`max_divergent = 0`. Any future hierarchical family whose pooling scale is on a log
+quantity should do the same.
 
 ### Known gap: the counterfactual suite does not run in CI
 
@@ -657,9 +770,12 @@ nutpie. We write the adapter and nothing below it.
 **Gaussian processes, state-space models, time-varying parameters.** No agent needs
 them; `anofox-forecast` covers time-series intervals.
 
-**A native elasticity family.** See §3.4 — random slopes on a log-log model are
-hierarchical elasticity, and a second family id for the same mathematics splits
-`model_id`, the cache and the calibration evidence to save a `log()`.
+**A native elasticity family for a Gaussian response.** See §3.4 — random slopes on a
+log-log model *are* hierarchical elasticity, and a second family id for the same
+mathematics would split `model_id`, the cache and the calibration evidence to save a
+`log()`. `hier_elasticity` ships alongside it rather than replacing it, and is a
+different model rather than the same one renamed: a count likelihood and a sign
+constraint, neither of which `pooled_gaussian` can express.
 
 **An `anofox_bayes_predict` table function.** Not a scheduling decision: DuckDB permits
 at most one subquery parameter per table function, so a function taking both draws and

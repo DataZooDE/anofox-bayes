@@ -216,9 +216,10 @@ what an anomaly model is looking at. Both engines have their own calibration sui
 `exact` posterior and a `laplace` one look identical in SQL and do not carry the same
 warranty: the first is the posterior, the second is a Gaussian approximation to it.
 The family that ran is on the table too, as `__family__`: `1` for `hier_negbin`, `2`
-for `censored_aft`, `3` for `pooled_gaussian`, `5` for `payer_alive`, `7` for
-`conjugate_anomaly` and `8` for `varying_variance_gaussian` — the catalog F-numbers
-where one applies — decoded by `anofox_bayes_family_text(param, value)`. See
+for `censored_aft`, `3` for `pooled_gaussian`, `4` for `payment_delay`, `5` for
+`payer_alive`, `6` for `hier_elasticity`, `7` for `conjugate_anomaly` and `8` for
+`varying_variance_gaussian` — the catalog F-numbers where one applies — decoded by
+`anofox_bayes_family_text(param, value)`. See
 [the draws contract](DRAWS_CONTRACT.md#__family__--which-model-was-fitted).
 
 ### 1.5 Null handling and grouping
@@ -625,7 +626,7 @@ how many groups the verdict is about. A refused group's draws are `NULL`, so it 
 appears in the table under its own name.
 
 **Worked example:** `test/sql/f2_delivery_promise.test`.
-### 2.5 `hier_negbin` (F1)
+### 2.4 `hier_negbin` (F1)
 
 > Hierarchical count GLM — Poisson or negative binomial with a partially pooled
 > per-group level, non-centred — for per-SKU demand and the reorder quantile a
@@ -706,7 +707,82 @@ cannot do and why a thin item's interval comes out honest.
 
 **Worked example:** `test/sql/f1_hier_negbin.test`.
 
-### 2.3 `payer_alive` (F5)
+### 2.5 `payment_delay` (F4)
+
+> Hierarchical positive-duration GLM — Gamma or lognormal delays with a partially
+> pooled per-group log-mean, non-centred — for payment behaviour per customer segment
+> and the cash-cover probability a liquidity decision reads off its right tail.
+
+One row per cleared item. The response is a strictly positive duration.
+
+**Config slots**
+
+| Slot | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `y` | column | **yes** | — | The delay. Strictly positive; zero or negative is a request error, not a status — see the refusal table. |
+| `group` | key column | **yes** | — | The customer segment. A family whose subject is per-segment behaviour has nothing to say about a ledger with no segments. |
+| `x` | column or list | no | none | Population-level covariates — an amount band, an invoice-month index. One coefficient each, shared across segments, acting on the **log** mean. |
+| `dist` | `gamma` \| `lognormal` | no | `gamma` | Both parameterise the *mean*, so the coefficients keep their meaning across a switch and the two fits are directly comparable. They agree about the centre and differ in the tail, which is the decision. |
+| `min_groups` | integer ≥ 2 | no | `3` | Below this many segments the fit is `insufficient_data`: a pooling scale estimated from fewer describes the sample rather than the ledger. |
+| `prior.intercept.mean` / `.sd` | number / number > 0 | no | `0` / ∞ | Normal prior on the population log mean delay. Absent `sd` is flat. |
+| `prior.beta.scale` | number > 0 | no | ∞ | Normal prior sd shared by every `x` coefficient. |
+| `prior.tau.scale` | number > 0 | no | `1.0` | Half-normal scale for the pooling scale. **Has a concrete default, unlike `hier_negbin`'s**: `tau` is the spread of a *log* mean and is therefore dimensionless, so one log unit asserts nothing about the caller's currency. Flat here is measurably worse than uninformative — the upper tail is where the sampler diverges, and every divergence is a refusal. |
+| `prior.dispersion.log_mean` / `.log_sd` | number / number > 0 | no | `0` / ∞ | Normal prior on `log shape` (or `log sigma`). Declared on the log scale, which *is* the sampled coordinate, so no Jacobian applies. |
+
+**Parameters emitted**
+
+| Parameter | `group_id` | Meaning |
+|---|---|---|
+| `intercept` | `__global__` | Population log mean delay. |
+| `beta[<column>]` | `__global__` | One per `x` column, acting on the log mean. |
+| `tau` | `__global__` | Pooling scale: the standard deviation of segment log means about the population level. |
+| `shape` | `__global__` | Gamma dispersion, under `dist: 'gamma'`. `Var(delay) = mu²/shape`, so **large `shape` is tight**. |
+| `sigma` | `__global__` | Lognormal log-scale sd, under `dist: 'lognormal'`. **Large `sigma` is wide** — the opposite direction to `shape`, which is why the two carry different names. |
+| `u` | per group | That segment's offset from the population level, on the log scale. |
+| `mu` | per group | `exp(intercept + u)` — the segment's **mean** delay with any covariates at zero. Reported whole, so a decision query needs no exponentiation. |
+
+**Engine.** `nuts` only, and both alternatives refuse rather than approximate — the
+same geometry `hier_negbin` refuses on, one likelihood over. Asking for `laplace`
+errors with *"'payment_delay' is served by NUTS only…"*. `chains` therefore defaults to
+`4`, R̂ is a real statistic, the four sampler-statistic rows appear, and a single
+divergence makes the fit `degenerate`.
+
+**The cash-cover probability, in SQL.** There is no Gamma quantile in DuckDB, and none
+is needed: the predictive is a draw per posterior draw, and Wilson–Hilferty maps a
+standard normal onto a Gamma of shape `k` accurately enough for a service level.
+`anofox_bayes_std_normal` keys the noise on `(segment, draw)`, so the answer is
+reproducible without `setseed()`.
+
+```sql
+WITH shape AS (SELECT chain, draw, value AS k FROM draws WHERE param = 'shape' AND draw >= 0),
+     level AS (SELECT chain, draw, group_id AS segment, value AS mu
+               FROM draws WHERE param = 'mu' AND draw >= 0)
+SELECT l.segment,
+       anofox_bayes_prob_less(
+         l.mu * pow(1.0 - 1.0 / (9.0 * s.k)
+                    + anofox_bayes_std_normal(404, l.segment, (l.chain * 2000 + l.draw)::BIGINT)
+                      / sqrt(9.0 * s.k), 3), 45.0) AS p_paid_within_45_days
+FROM level l JOIN shape s USING (chain, draw)
+GROUP BY l.segment;
+```
+
+Under `dist: 'lognormal'` the predictive is exact rather than approximated —
+`mu * exp(-sigma²/2 + sigma·z)` is the branch's own definition.
+
+**Validation and refusal**
+
+| Situation | Outcome |
+|---|---|
+| Fewer than `min_groups` segments | `insufficient_data`, draws still emitted |
+| Every delay identical | `degenerate`, every draw `NULL` — no interior maximum for the dispersion |
+| R̂, ESS or a divergence fails | `degenerate` |
+| Zero or negative `y` | **not a status** — a request error naming the clock. A delay measured from the *due* date goes negative whenever a customer pays early; fitting the positive rows only would keep exactly the late payers. Measure from the invoice date, or model `log(delay)` with `pooled_gaussian`. |
+| An unpaid open item | **out of scope.** That is a right-censored duration and belongs to `censored_aft`; treating it as a delay of zero, or dropping it, biases a cash forecast in the direction that matters most. |
+| A segment that differs in *spread* rather than level | Not refused, but the wrong family: `dispersion` is pooled here. Use `varying_variance_gaussian`. |
+
+**Worked example:** `test/sql/f4_cash_runway.test`.
+
+### 2.6 `payer_alive` (F5)
 
 > BG/NBD buy-till-you-die model over per-customer (frequency, recency, age)
 > statistics, whose closed-form `P(alive)` rescores a customer base in SQL without
@@ -769,7 +845,90 @@ worked end to end in `test/sql/f5_payer_alive.test`.
 
 ---
 
-### 2.4 `varying_variance_gaussian` (no F-number)
+### 2.7 `hier_elasticity` (F6)
+
+> Hierarchical price elasticity — a log-link negative binomial or Gamma GLM whose
+> per-segment elasticity is pooled on the log of its magnitude and is negative by
+> construction. For a positive slope, use `pooled_gaussian` with `random_slopes`
+> instead.
+
+One row per segment per period. The response is a volume; the price column is on the
+**log** scale, because an elasticity is the coefficient of log price on log volume.
+
+**Why this and not `pooled_gaussian` + `random_slopes`.** Two things, and only two.
+**The sign is a constraint**: every draw of every segment's elasticity is negative
+because `b_g = -exp(psi + tau·z_g)`, whereas a Gaussian random slope on a thin segment
+routinely puts real mass above zero and hands a price meeting an interval saying that
+raising the price might sell more. **The response is a count**: `log(units)` is
+undefined at zero and assumes a constant log-scale spread, which is wrong exactly where
+the shrinkage is doing the work. Neither is reachable by tuning, and the transform is
+not conjugate to anything, which is why it is a family rather than a mode. Where the
+response is well-populated and the sign is not in doubt, `pooled_gaussian` is the
+better tool and is faster — see `test/sql/f3_price_elasticity.test`.
+
+**Config slots**
+
+| Slot | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `y` | column | **yes** | — | The volume. Non-negative whole counts under `negbinomial`; strictly positive under `gamma`. |
+| `price` | column | **yes** | — | Log price. Its own slot rather than one of `x`, because its coefficient is the only one pooled on its log magnitude and the only one whose sign is constrained. Naming it in `x` as well is a config error. |
+| `group` | key column | **yes** | — | The segment or product family. |
+| `x` | column or list | no | none | Controls — a month index, a trend, a competitor index. One coefficient each, shared across segments, unconstrained in sign. |
+| `likelihood` | `negbinomial` \| `gamma` | no | `negbinomial` | Counts admit a zero; use `gamma` for revenue or tonnage. |
+| `min_groups` | integer ≥ 2 | no | `3` | Below this many segments the fit is `insufficient_data`: **two** pooling scales estimated from fewer describe the sample. |
+| `min_price_variation` | number > 0 | no | `0.01` | Width of a segment's log-price column below which its elasticity is treated as unidentified — see the refusal table. The default is a 1 % spread. |
+| `prior.intercept.mean` / `.sd` | number / number > 0 | no | `0` / ∞ | Normal prior on the population log volume. |
+| `prior.beta.scale` | number > 0 | no | ∞ | Normal prior sd shared by every `x` coefficient. |
+| `prior.elasticity.log_mean` / `.log_sd` | number / number > 0 | no | `0` / `1.0` | Normal prior on `log \|elasticity\|`. **Has a concrete default**, and an elasticity is dimensionless so this asserts nothing about units: centred at unit elasticity, with a 95 % interval of roughly `[0.14, 7]` on the magnitude. That contains every published elasticity and excludes the region a segment with three price points would otherwise wander into. |
+| `prior.tau.scale` | number > 0 | no | `0.5` | Half-normal scale for the spread of `log \|elasticity\|` across segments. |
+| `prior.tau_level.scale` | number > 0 | no | `2.0` | Half-normal scale for the spread of log volume across segments. Loose — segment volumes genuinely differ by orders of magnitude, and this is a nuisance parameter. |
+| `prior.dispersion.log_mean` / `.log_sd` | number / number > 0 | no | `0` / ∞ | Normal prior on `log phi` (or `log shape`). Declared on the sampled coordinate, so no Jacobian. |
+
+**Parameters emitted**
+
+| Parameter | `group_id` | Meaning |
+|---|---|---|
+| `intercept` | `__global__` | Population log volume. |
+| `beta[<column>]` | `__global__` | One per `x` column. |
+| `elasticity` | `__global__` | Population elasticity, `-exp(psi)`. Always negative. |
+| `tau` | `__global__` | Spread of `log \|elasticity\|` across segments. |
+| `tau_level` | `__global__` | Spread of log volume across segments. |
+| `phi` / `shape` | `__global__` | Negative binomial dispersion, or Gamma shape. |
+| `group_effect` | per group | That segment's log-volume offset from the population level. |
+| `group_elasticity` | per group | **That segment's elasticity, whole.** Not an offset: unlike `pooled_gaussian`'s `group_slope[...]`, which must be joined to `beta[...]` on `(chain, draw)` and gives a wrong answer if that join is forgotten, this is the number directly. Always negative. |
+
+**Engine.** `nuts` only; `exact` and `laplace` both refuse. Two non-centred hierarchies
+mean no usable joint mode, and `target_accept` is raised to 0.95 accordingly.
+
+**The price-round scenario, in SQL.** The whole Entscheidungsvorlage is a deterministic
+transform of the draws, evaluated once per draw so the interval is the model's own
+rather than a delta-method approximation. A second question — 3 %, 8 %, a different
+segment — costs no second fit, which is what makes it answerable live in the meeting.
+
+```sql
+SELECT group_id AS segment,
+       anofox_bayes_credible_interval(exp(value * ln(1.05)), 0.90) AS volume_ratio,
+       anofox_bayes_prob_less(1.05 * exp(value * ln(1.05)), 1.0)   AS p_revenue_falls
+FROM draws
+WHERE param = 'group_elasticity' AND draw >= 0
+GROUP BY group_id;
+```
+
+**Validation and refusal**
+
+| Situation | Outcome |
+|---|---|
+| **A segment whose price never moved** | That segment alone is `insufficient_data`, named in a `__group_status__` row, and `__n_groups_unready__` counts it. It is still fitted — its elasticity is the pooled prior, with a visibly wider interval — because a pooled number is defensible to serve and dishonest to serve unlabelled. This is the *"keine Aussage möglich, die Preise waren konstant"* PARTIAL a price round has to carry. The model-level status collapses to `insufficient_data` by the crate's worst-wins doctrine; the other segments' elasticities are unaffected and are named as ready. |
+| No segment's price moved | `degenerate`, every draw `NULL` — nothing identifies an elasticity at any level |
+| Fewer than `min_groups` segments | `insufficient_data` |
+| Every volume zero (`negbinomial`) | `degenerate` |
+| R̂, ESS or a divergence fails | `degenerate` |
+| Fractional `y` under `negbinomial`, non-positive `y` under `gamma`, non-finite `price` | **not a status** — a request error naming the column and the slot that fixes it |
+| A product whose volume genuinely *rises* with price | **not refused, and visible.** The posterior piles against zero rather than reporting a confident wrong magnitude. This family cannot represent a positive elasticity; `pooled_gaussian` + `random_slopes` can. |
+
+**Worked example:** `test/sql/f6_price_elasticity.test`.
+
+### 2.8 `varying_variance_gaussian` (no F-number)
 
 > Gaussian linear model with a residual scale per group and a learned pooling scale,
 > non-centred; the family for questions about a group's tail rather than its level.
@@ -1077,7 +1236,6 @@ calling them is a syntax or binder error.
 | `anofox_scenario` catalog registration / branch-versioned counterfactuals | 0.2–0.3 | BRD BR-9 |
 | Async / job-style fit (`fit_async` + polling) | deferred | HLD §6; v0.1 accepts blocking table-function semantics |
 | `anofox_bayes_predict(draws, newdata, kind)` | **never** | DuckDB allows a table function at most one subquery parameter, so this signature cannot bind. Posterior prediction is a join today — see [the Guide](GUIDE.md#ask-a-what-if-without-re-fitting). A *different* predictive surface may appear in 0.3; this one will not. |
-| Families F1, F2, F4, F5, F6 | 0.2–0.3 | See [BRD §6](BRD.md) |
 
 
 A two-argument `anofox_bayes_fit(data, family)` form is **not** planned. DuckDB

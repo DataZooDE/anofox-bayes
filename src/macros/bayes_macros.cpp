@@ -162,7 +162,9 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
      "  WHEN 1 THEN 'hier_negbin'"
      "  WHEN 2 THEN 'censored_aft'"
      "  WHEN 3 THEN 'pooled_gaussian'"
+     "  WHEN 4 THEN 'payment_delay'"
      "  WHEN 5 THEN 'payer_alive'"
+     "  WHEN 6 THEN 'hier_elasticity'"
      "  WHEN 7 THEN 'conjugate_anomaly'"
      "  WHEN 8 THEN 'varying_variance_gaussian'"
      "  ELSE 'unknown' END"},

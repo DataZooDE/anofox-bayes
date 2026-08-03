@@ -1,0 +1,387 @@
+# name: test/sql/f6_price_elasticity.test
+# description: hier_elasticity, exercised as the price-increase agent would use it
+# group: [sql]
+#
+# The annual price round is negotiated on anecdote: sales says customers will leave,
+# management needs margin. The transaction data contains the actual elasticities per
+# segment, and this file computes them with honest uncertainty and then answers the
+# only question the meeting asks -- "list plus X per cent in segment S, what happens to
+# volume and to contribution margin, and how sure are we".
+#
+# Two things here cannot be done with `pooled_gaussian` and `random_slopes`, and they
+# are the reason this family exists:
+#
+#   1. **The sign is a constraint.** Every draw of every segment's elasticity is
+#      negative by construction. A Gaussian random slope on a thin segment routinely
+#      puts real mass above zero, and a price meeting handed an interval saying that
+#      raising the price might sell *more* stops reading the interval.
+#   2. **A segment whose prices never moved is named, not quietly pooled.** That is the
+#      PARTIAL the Entscheidungsvorlage has to carry: "keine Aussage moeglich, die
+#      Preise waren konstant" is a deliverable, and it arrives as a `__group_status__`
+#      row rather than as a plausible-looking number.
+#
+# `test/sql/f3_price_elasticity.test` is the other half of this pair: the same question
+# under the Gaussian random-slopes model, which is the right tool when the response is
+# well-populated and the sign is not in doubt.
+
+require anofox_bayes
+
+#######################################
+# Setup: 36 months of billing across seven segments
+#######################################
+
+# Seven segments, 24 months each. Within each segment the list price walks a
+# deterministic ladder about its own mean -- **within**-segment price variation is what
+# identifies an elasticity, and the identification note in the pack says so -- and
+# volume responds at that segment's own elasticity.
+#
+# FIXED_LIST is the segment that matters most: its price column is flat, because that
+# is a real thing a business does and the model has to say so rather than invent a
+# number for it.
+#
+# The counts are a genuine Poisson-Gamma draw produced deterministically through
+# `anofox_bayes_std_normal`, so the fixture is a pure function of this file's text --
+# no `setseed()`, no `random()`, the same 168 rows on every machine. Wilson-Hilferty
+# maps the normal onto the Gamma mixing weight; rounding it gives the count.
+statement ok
+CREATE TABLE billing AS
+SELECT
+    seg.name AS segment,
+    m        AS month,
+    CASE WHEN seg.name = 'FIXED_LIST' THEN 0.0
+         ELSE seg.spread * (((m * 7) % 25 - 12.0) / 12.0)
+    END AS log_price,
+    greatest(0, round(
+        exp(seg.level
+            + seg.elasticity * CASE WHEN seg.name = 'FIXED_LIST' THEN 0.0
+                                    ELSE seg.spread * (((m * 7) % 25 - 12.0) / 12.0) END)
+        * pow(1.0 - 1.0 / 360.0
+                  + anofox_bayes_std_normal(2026, seg.name, m) / sqrt(360.0), 3)
+    ))::BIGINT AS units
+FROM (VALUES
+        ('COMMODITY',   6.2, -1.60, 0.30),
+        ('MIDMARKET',   5.6, -0.90, 0.30),
+        ('PREMIUM',     4.9, -0.45, 0.30),
+        ('OEM',         6.6, -1.20, 0.30),
+        ('SPARE_PARTS', 4.4, -0.30, 0.30),
+        ('EXPORT',      5.2, -0.75, 0.30),
+        ('FIXED_LIST',  5.0, -0.80, 0.00)
+     ) AS seg(name, level, elasticity, spread),
+     generate_series(1, 24) AS g(m);
+
+query I
+SELECT count(*) FROM billing;
+----
+168
+
+# Six segments have a price column that moved; one does not. That asymmetry is the
+# subject of the refusal section below.
+query I
+SELECT count(*) FROM (
+    SELECT segment FROM billing
+    GROUP BY segment HAVING max(log_price) - min(log_price) > 0.01
+);
+----
+6
+
+#######################################
+# Fit
+#######################################
+
+# `price` is its own slot rather than one of `x`, because its coefficient is the thing
+# the family is about: it is the only one pooled on the log of its magnitude and the
+# only one whose sign is constrained. Naming the same column in `x` as well is a config
+# error rather than a rank-deficient design that looks like a mixing problem.
+#
+# `draws` is 2000 and `warmup` 2000. This family carries two pooling scales rather than
+# one, and the unpenalised intercept trades off against the segment levels along a
+# ridge a diagonal mass matrix cannot precondition -- which costs effective sample size
+# rather than correctness. This is the budget at which the ESS gate passes; the gate is
+# what makes the interval mean anything, so the budget moves rather than the gate.
+statement ok
+CREATE TABLE elasticity_fit AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT segment, month, log_price, units FROM billing),
+    'hier_elasticity',
+    {'y': 'units',
+     'price': 'log_price',
+     'group': 'segment',
+     'draws': 2000,
+     'chains': 4,
+     'warmup': 2000,
+     'seed': 606}
+);
+
+# The fit is graded `insufficient_data` and the family is named. That verdict is *not*
+# a failure: it is worst-wins over the segments, and FIXED_LIST is the one that pulled
+# it down. The next section shows that the other six are fully usable.
+query III
+SELECT anofox_bayes_status_text(param, value),
+       anofox_bayes_family_text(param, value),
+       max(CASE WHEN param = '__engine__' THEN value END)
+FROM elasticity_fit;
+----
+insufficient_data	hier_elasticity	2.0
+
+# Seven distinct parameter names: `intercept`, `elasticity`, `tau`, `tau_level` and
+# `phi` once, and `group_effect` and `group_elasticity` once per segment.
+query I
+SELECT count(DISTINCT param) FROM elasticity_fit
+WHERE draw >= 0 AND param NOT IN ('__lp__', '__divergent__', '__energy__', '__step_size__');
+----
+7
+
+query I
+SELECT sum(value) = 0 FROM elasticity_fit WHERE param = '__divergent__';
+----
+true
+
+#######################################
+# The refusal, which is a deliverable
+#######################################
+
+# **Exactly one segment is named, and the other six are not implicated.** An agent
+# holding this fit quarantines one row rather than the whole table.
+query II
+SELECT group_id, anofox_bayes_status_name(value)
+FROM elasticity_fit WHERE param = '__group_status__';
+----
+FIXED_LIST	insufficient_data
+
+query II
+SELECT max(CASE WHEN param = '__n_groups__' THEN value END),
+       max(CASE WHEN param = '__n_groups_unready__' THEN value END)
+FROM elasticity_fit;
+----
+7.0	1.0
+
+# FIXED_LIST still receives draws -- they are the pooled prior, which is a defensible
+# number to serve and a dishonest one to serve unlabelled. What makes it honest is that
+# its interval is visibly wider than a segment that earned its own estimate.
+query I
+SELECT (SELECT anofox_bayes_credible_upper(value, 0.95)
+             - anofox_bayes_credible_lower(value, 0.95)
+        FROM elasticity_fit
+        WHERE param = 'group_elasticity' AND group_id = 'FIXED_LIST' AND draw >= 0)
+     > (SELECT anofox_bayes_credible_upper(value, 0.95)
+             - anofox_bayes_credible_lower(value, 0.95)
+        FROM elasticity_fit
+        WHERE param = 'group_elasticity' AND group_id = 'COMMODITY' AND draw >= 0);
+----
+true
+
+#######################################
+# The sign constraint
+#######################################
+
+# **Not "almost always" -- never.** Across every segment and every one of the 8 000
+# draws, not a single elasticity is non-negative. That is a property of the `-exp`
+# transform rather than of this dataset, so one positive draw would be a bug.
+query I
+SELECT count(*) FROM elasticity_fit
+WHERE param = 'group_elasticity' AND draw >= 0 AND value >= 0.0;
+----
+0
+
+# ...and the constraint is not achieved by collapsing everything onto zero. The
+# magnitudes are real numbers a price round could act on.
+query I
+SELECT max(value) < -0.1 FROM (
+    SELECT group_id, median(value) AS value FROM elasticity_fit
+    WHERE param = 'group_elasticity' AND draw >= 0 GROUP BY group_id
+);
+----
+true
+
+#######################################
+# Recovery: the segments rank as they were generated
+#######################################
+
+# The six identified segments, ordered from most to least price-sensitive. The
+# generating elasticities were COMMODITY -1.60, OEM -1.20, MIDMARKET -0.90,
+# EXPORT -0.75, PREMIUM -0.45, SPARE_PARTS -0.30.
+query I
+SELECT group_id FROM elasticity_fit
+WHERE param = 'group_elasticity' AND draw >= 0 AND group_id <> 'FIXED_LIST'
+GROUP BY group_id
+ORDER BY median(value);
+----
+COMMODITY
+OEM
+MIDMARKET
+EXPORT
+PREMIUM
+SPARE_PARTS
+
+# ...and each 95 % interval contains the elasticity it was generated from. The ordering
+# above would survive a systematically shrunk fit; this would not.
+query I
+SELECT count(*) FROM (
+    SELECT d.group_id,
+           anofox_bayes_credible_lower(d.value, 0.95) AS lo,
+           anofox_bayes_credible_upper(d.value, 0.95) AS hi,
+           max(t.e) AS truth
+    FROM elasticity_fit d
+    JOIN (VALUES ('COMMODITY', -1.60), ('MIDMARKET', -0.90), ('PREMIUM', -0.45),
+                 ('OEM', -1.20), ('SPARE_PARTS', -0.30), ('EXPORT', -0.75))
+         AS t(name, e) ON t.name = d.group_id
+    WHERE d.param = 'group_elasticity' AND d.draw >= 0
+    GROUP BY d.group_id
+) WHERE truth BETWEEN lo AND hi;
+----
+6
+
+#######################################
+# The answer: the price-round scenario table
+#######################################
+
+# **The Entscheidungsvorlage.** A list-price move of +5 % per segment, evaluated once
+# per posterior draw so the interval is the model's own rather than a delta-method
+# approximation to it:
+#
+#     volume ratio = exp(elasticity_g * ln(1.05))
+#     revenue ratio = 1.05 * volume ratio
+#
+# The whole scenario is a deterministic transform of the draws. A second question --
+# 3 %, 8 %, a different segment -- costs no second fit, which is what makes this
+# answerable live in the meeting.
+statement ok
+CREATE TABLE scenario AS
+SELECT group_id AS segment,
+       chain, draw,
+       value AS elasticity,
+       exp(value * ln(1.05))       AS volume_ratio,
+       1.05 * exp(value * ln(1.05)) AS revenue_ratio
+FROM elasticity_fit
+WHERE param = 'group_elasticity' AND draw >= 0;
+
+# Every segment loses volume -- the sign constraint guarantees it -- and among the six
+# segments that identified an elasticity, the ones that lose the most are the ones with
+# the largest magnitudes.
+#
+# FIXED_LIST is excluded here for the same reason it is excluded from the recovery
+# section: its elasticity is the pooled prior, so where it ranks is a property of the
+# population estimate rather than a finding about that segment. Pinning its rank would
+# be pinning the prior.
+query I
+SELECT segment FROM scenario WHERE segment <> 'FIXED_LIST'
+GROUP BY segment ORDER BY median(volume_ratio);
+----
+COMMODITY
+OEM
+MIDMARKET
+EXPORT
+PREMIUM
+SPARE_PARTS
+
+# Every segment loses *some* volume, including the pooled one. That is the sign
+# constraint reaching the decision table rather than stopping at the parameter.
+query I
+SELECT count(*) FROM (
+    SELECT segment, median(volume_ratio) AS r FROM scenario GROUP BY segment
+) WHERE r < 1.0;
+----
+7
+
+# **The regret view**, which is what management actually decides on: the probability
+# that a +5 % list move *reduces* revenue in a segment. It does so only where the
+# elasticity magnitude exceeds one, and COMMODITY at -1.6 is the segment where the
+# price round should not go.
+query II
+SELECT segment, anofox_bayes_prob_less(revenue_ratio, 1.0) > 0.5
+FROM scenario GROUP BY segment ORDER BY segment;
+----
+COMMODITY	true
+EXPORT	false
+FIXED_LIST	false
+MIDMARKET	false
+OEM	true
+PREMIUM	false
+SPARE_PARTS	false
+
+# A larger move costs more volume everywhere, monotonically, which is the sanity check
+# a reader of the table performs first.
+query I
+SELECT count(*) FROM (
+    SELECT segment,
+           median(exp(elasticity * ln(1.03))) AS r3,
+           median(exp(elasticity * ln(1.05))) AS r5,
+           median(exp(elasticity * ln(1.10))) AS r10
+    FROM scenario GROUP BY segment
+) WHERE r3 > r5 AND r5 > r10;
+----
+7
+
+# **And the honest cell in the table.** FIXED_LIST gets a number -- the pooled prior --
+# and its 95 % interval on the volume response is visibly the widest of the seven, so
+# the Entscheidungsvorlage shows a band rather than a recommendation for it.
+query I
+SELECT segment FROM scenario
+GROUP BY segment
+ORDER BY anofox_bayes_credible_upper(volume_ratio, 0.95)
+       - anofox_bayes_credible_lower(volume_ratio, 0.95) DESC
+LIMIT 1;
+----
+FIXED_LIST
+
+#######################################
+# Refusals
+#######################################
+
+# A panel in which *no* segment's price moved identifies nothing at any level. That is
+# `degenerate` rather than merely thin, and the parameters that cannot be estimated are
+# NULL rather than a plausible number.
+query II
+SELECT anofox_bayes_status_text(param, value),
+       count(*) FILTER (WHERE draw >= 0 AND param = 'elasticity' AND value IS NOT NULL)
+FROM anofox_bayes_fit(
+    (SELECT segment, 0.0 AS log_price, units FROM billing),
+    'hier_elasticity',
+    {'y': 'units', 'price': 'log_price', 'group': 'segment',
+     'draws': 200, 'chains': 2, 'warmup': 200, 'seed': 1}
+);
+----
+degenerate	0
+
+# Two segments cannot identify two pooling scales.
+query I
+SELECT anofox_bayes_status_text(param, value) FROM anofox_bayes_fit(
+    (SELECT segment, log_price, units FROM billing
+     WHERE segment IN ('COMMODITY', 'PREMIUM')),
+    'hier_elasticity',
+    {'y': 'units', 'price': 'log_price', 'group': 'segment',
+     'draws': 200, 'chains': 2, 'warmup': 400, 'seed': 1}
+);
+----
+insufficient_data
+
+# A fractional response under the count likelihood names the slot that fixes it, rather
+# than being silently rounded.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, log_price, units + 0.5 AS units FROM billing),
+    'hier_elasticity',
+    {'y': 'units', 'price': 'log_price', 'group': 'segment'}
+);
+----
+"likelihood": "gamma"
+
+# Naming the price column again as a control would give one column two coefficients.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, log_price, units FROM billing),
+    'hier_elasticity',
+    {'y': 'units', 'price': 'log_price', 'group': 'segment', 'x': 'log_price'}
+);
+----
+already the `price` slot
+
+# The Laplace engine is refused with a reason rather than served badly.
+statement error
+SELECT count(*) FROM anofox_bayes_fit(
+    (SELECT segment, log_price, units FROM billing),
+    'hier_elasticity',
+    {'y': 'units', 'price': 'log_price', 'group': 'segment', 'engine': 'laplace'}
+);
+----
+NUTS only
