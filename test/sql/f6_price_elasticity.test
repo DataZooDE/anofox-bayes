@@ -187,15 +187,22 @@ true
 # on a GitHub `linux_amd64` runner, and failed -- reproducibly, five runs out of five --
 # on the same source built inside the manylinux release container.
 #
-# The model is not the fragile part, and that was measured too rather than assumed.
-# Across 24 seeds locally, 8 seeds on the CI runner's own CPU, five input perturbations
-# up to 1e-9 relative, and five row orders, the fit produced zero divergences every
-# time. What differs is one toolchain's rounding of the log density, and a divergence
-# is a *thresholded* diagnostic sitting on top of path-dependent warmup adaptation: one
-# accept/reject comparison landing on the other side of its uniform gives the rest of
-# that run a different step size. `crates/anofox-bayes-core/src/catalog/
-# f6_hier_elasticity.rs`'s `sql_fixture_check` holds the seed sweep, and
-# `.github/workflows/sampler-probe.yml` re-runs it on a runner on demand.
+# **The cause is named, not guessed at.** The difference is the C library the log
+# density's `exp` and `ln` resolve to -- same source, same `rustc 1.97.1`, same CPU
+# family. Reproduced by running the fit inside the release container:
+#
+#   glibc 2.44  zero divergences at 24 seeds, at five input perturbations up to 1e-9
+#               relative, and at five row orders
+#   glibc 2.28  exactly one divergent draw out of 8000, at seed 606 only -- the seed
+#               this file happens to use. Seeds 1 through 8 are clean there too.
+#
+# One draw in 8000, on one seed, under one libm, is what "on the boundary" looks like.
+# A divergence is a *thresholded* diagnostic layered on path-dependent warmup
+# adaptation: one accept/reject comparison landing on the other side of its uniform
+# gives the rest of that run a different step size, so a last-ulp difference in `exp`
+# moves the count without moving the posterior. `crates/anofox-bayes-core/src/catalog/
+# f6_hier_elasticity.rs`'s `sql_fixture_check` holds the measurements and
+# `.github/workflows/sampler-probe.yml` re-runs them on a runner on demand.
 #
 # So the gate moves to a fit that is expected to converge and be acted on -- where a
 # divergence would mean the extension is refusing an answer a user is owed, which is a
