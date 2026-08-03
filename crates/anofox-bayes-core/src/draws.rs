@@ -267,6 +267,21 @@ impl Posterior {
         (0..self.n_draws).map(move |d| self.values[base + d * n_params])
     }
 
+    /// The per-draw statistics of one chain, in draw order.
+    ///
+    /// The chain-major layout that makes [`Self::chain_values`] a strided walk makes
+    /// this a contiguous slice. Diagnostics that need to tell one chain from another
+    /// -- which one diverged, which one adapted to a larger step -- cannot use the
+    /// flat `stats` view, because a total says nothing about whether the trouble was
+    /// spread evenly or belonged to a single chain.
+    pub fn stats_of_chain(&self, chain: usize) -> &[SampleStats] {
+        if self.stats.is_empty() {
+            return &[];
+        }
+        let base = chain * self.n_draws;
+        &self.stats[base..base + self.n_draws]
+    }
+
     /// How many kept draws the sampler reported as divergent.
     ///
     /// `None` — not `Some(0)` — when no engine reported the statistic, for the same

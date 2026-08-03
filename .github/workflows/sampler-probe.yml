@@ -1,0 +1,66 @@
+#
+# A sampler diagnostic you can point at a runner.
+#
+# `test/sql/f6_price_elasticity.test` asserts zero NUTS divergences and fails on
+# GitHub's `linux_amd64` runner while passing on developer machines off the same
+# source. Divergence is a thresholded diagnostic layered on warmup adaptation, and
+# warmup adaptation is path dependent: one accept/reject comparison landing on the
+# other side of its uniform gives the rest of the run a different step size. A
+# difference in `exp`, in `ln_gamma`, or in how a vector reduction is ordered is
+# enough to cause that. None of it is visible from a machine that agrees.
+#
+# Reproducing it through the distribution pipeline costs a full DuckDB build --
+# most of an hour -- to exercise a few hundred lines of Rust. This runs the same
+# fit directly against the core crate, on the same runner image, in minutes.
+#
+# It is not a gate. It runs only on `probe/**` branches, so it costs nothing on a
+# normal PR and cannot block one.
+#
+name: Sampler probe
+
+on:
+  push:
+    branches: ['probe/**']
+  workflow_dispatch:
+
+concurrency:
+  group: sampler-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  divergences:
+    name: F6 divergences (linux-amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: sampler-probe-${{ hashFiles('Cargo.lock') }}
+
+      # Which CPU the runner gave us, and which libm. Both are inputs to the
+      # answer, and neither is knowable after the fact.
+      - name: Record the environment
+        run: |
+          echo "--- CPU ---"
+          lscpu | grep -E 'Model name|Flags' | cut -c1-400 || true
+          echo "--- libc ---"
+          ldd --version | head -1
+          echo "--- rustc ---"
+          rustc -vV
+
+      - name: F6 fixture, per-chain sampler state
+        run: |
+          cargo test -p anofox-bayes-core --release --lib -- \
+            catalog::f6_hier_elasticity::sql_fixture_check \
+            --ignored --nocapture

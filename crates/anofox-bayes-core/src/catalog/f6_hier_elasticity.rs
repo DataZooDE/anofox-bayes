@@ -2050,3 +2050,156 @@ mod tests {
         assert!(out.iter().all(|v| v.is_finite()));
     }
 }
+
+#[cfg(test)]
+mod sql_fixture_check {
+    //! The fit `test/sql/f6_price_elasticity.test` runs, reproduced here.
+    //!
+    //! That file asserts `sum(__divergent__) = 0`, and a divergence is not a
+    //! stylistic complaint: this crate refuses any fit that produces one, so the
+    //! assertion is the difference between the scenario table meaning something and
+    //! the family being unusable. `make test` builds DuckDB, which takes the better
+    //! part of an hour, so the property is checked against the same core the
+    //! extension links rather than by running the query.
+
+    use super::*;
+    use crate::data::testing::Frame;
+    use crate::fit::fit;
+
+    /// The 168 rows the `.test` file's `CREATE TABLE billing` produces.
+    ///
+    /// Recomputed rather than pasted, because the SQL builds them from
+    /// `anofox_bayes_std_normal` -- the same keyed generator this crate exposes -- so
+    /// a Rust transcription of the arithmetic is a pure function of the same inputs.
+    /// A Wilson-Hilferty cube maps the normal onto the Gamma mixing weight, exactly
+    /// as the SQL does.
+    fn billing() -> (Vec<f64>, Vec<f64>, Vec<String>) {
+        const SEGMENTS: [(&str, f64, f64, f64); 7] = [
+            ("COMMODITY", 6.2, -1.60, 0.30),
+            ("MIDMARKET", 5.6, -0.90, 0.30),
+            ("PREMIUM", 4.9, -0.45, 0.30),
+            ("OEM", 6.6, -1.20, 0.30),
+            ("SPARE_PARTS", 4.4, -0.30, 0.30),
+            ("EXPORT", 5.2, -0.75, 0.30),
+            ("FIXED_LIST", 5.0, -0.80, 0.00),
+        ];
+        let (mut units, mut log_price, mut segment) = (Vec::new(), Vec::new(), Vec::new());
+        for (name, level, elasticity, spread) in SEGMENTS {
+            for m in 1..=24i64 {
+                let lp = if name == "FIXED_LIST" {
+                    0.0
+                } else {
+                    spread * (((m * 7) % 25) as f64 - 12.0) / 12.0
+                };
+                let z = crate::keyed_rng::std_normal(2026, name.as_bytes(), m);
+                let w = (1.0 - 1.0 / 360.0 + z / 360.0_f64.sqrt()).powi(3);
+                let y = ((level + elasticity * lp).exp() * w).round().max(0.0);
+                units.push(y);
+                log_price.push(lp);
+                segment.push(name.to_string());
+            }
+        }
+        (units, log_price, segment)
+    }
+
+    fn divergences_at(seed: u64) -> f64 {
+        let (units, log_price, segment) = billing();
+        assert_eq!(units.len(), 168, "the fixture in the .test file has moved");
+        let frame = Frame::new(units.len())
+            .numeric("units", units)
+            .numeric("log_price", log_price)
+            .key("segment", segment.iter().map(String::as_str).collect());
+        let refs = frame.key_refs();
+        let view = frame.view(&refs);
+        let cfg = format!(
+            r#"{{"y": "units", "price": "log_price", "group": "segment",
+                 "draws": 2000, "chains": 4, "warmup": 2000, "seed": {seed}}}"#
+        );
+        let f = fit("hier_elasticity", &Config::parse(&cfg).unwrap(), &view).unwrap();
+        f.posterior.n_divergent().unwrap_or(0) as f64
+    }
+
+    /// **The property the SQL file asserts, checked at more than one seed.**
+    ///
+    /// `test/sql/f6_price_elasticity.test:134` pins zero divergences at seed 606, and
+    /// that assertion passed here and on CI's arm64 runner while failing on CI's
+    /// amd64 runner off the same source. A sampler trajectory is a long chain of
+    /// floating-point arithmetic, and two toolchains that contract a multiply-add
+    /// differently will eventually visit different points; when a fit sits one
+    /// unlucky step from a divergence, which side of the line it lands on stops being
+    /// a property of the model and becomes a property of the compiler.
+    ///
+    /// So the fix is not to make seed 606 pass on amd64. It is to move the fit far
+    /// enough from the boundary that no seed is near it -- and the way to see that
+    /// from one machine is to vary the one input that is *supposed* to change the
+    /// trajectory while leaving the posterior alone.
+    #[test]
+    #[ignore = "slow: several full four-chain fits of the SQL fixture"]
+    fn the_sql_fixture_fits_without_divergences_whatever_the_seed() {
+        let offenders: Vec<(u64, f64)> = [606, 1, 7, 99, 2024, 31337]
+            .into_iter()
+            .map(|seed| (seed, divergences_at(seed)))
+            .filter(|(_, d)| *d > 0.0)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the fixture diverged at {offenders:?}. test/sql/f6_price_elasticity.test \
+             asserts sum(__divergent__) = 0, and this crate refuses any fit that \
+             diverges, so a fit this close to the boundary is one toolchain away from \
+             being unusable."
+        );
+    }
+
+    /// **A diagnostic, meant to be run on the machine that disagrees.**
+    ///
+    /// `test/sql/f6_price_elasticity.test:134` fails on GitHub's `linux_amd64`
+    /// runner and passes here, off the same source. Divergence is a thresholded
+    /// diagnostic sitting on top of warmup adaptation, and warmup adaptation is
+    /// path dependent: one accept/reject comparison landing on the other side of its
+    /// uniform -- which a different `exp` or a different vector reduction is enough
+    /// to cause -- gives the rest of the run a different step size and a different
+    /// mass matrix. So "the posterior is robust to perturbation" and "the divergence
+    /// count is reproducible across toolchains" are separate claims, and only the
+    /// first is established.
+    ///
+    /// This prints what distinguishes those two worlds -- per-chain divergences, the
+    /// adapted step size each chain settled on -- so the CI run can be compared
+    /// against a local one rather than guessed at. `probe/**` branches run it.
+    #[test]
+    #[ignore = "diagnostic: prints per-chain sampler state for cross-machine comparison"]
+    fn diagnose_the_sql_fixture_across_seeds() {
+        let mut diverging = Vec::new();
+        for seed in 1..=8u64 {
+            let (units, log_price, segment) = billing();
+            let frame = Frame::new(units.len())
+                .numeric("units", units)
+                .numeric("log_price", log_price)
+                .key("segment", segment.iter().map(String::as_str).collect());
+            let refs = frame.key_refs();
+            let view = frame.view(&refs);
+            let cfg = format!(
+                r#"{{"y": "units", "price": "log_price", "group": "segment",
+                     "draws": 2000, "chains": 4, "warmup": 2000, "seed": {seed}}}"#
+            );
+            let f = fit("hier_elasticity", &Config::parse(&cfg).unwrap(), &view).unwrap();
+            let p = &f.posterior;
+            let total = p.n_divergent().unwrap_or(0);
+            if total > 0 {
+                diverging.push(seed);
+            }
+            let per_chain: Vec<String> = (0..p.n_chains)
+                .map(|c| {
+                    let rows = &p.stats_of_chain(c);
+                    let d = rows.iter().filter(|s| s.divergent == Some(1.0)).count();
+                    let step = rows.last().and_then(|s| s.step_size).unwrap_or(f64::NAN);
+                    format!("c{c}: div {d} step {step:.5}")
+                })
+                .collect();
+            println!(
+                "seed {seed}: total divergences {total} | {}",
+                per_chain.join(" | ")
+            );
+        }
+        println!("SEEDS THAT DIVERGED: {diverging:?}");
+    }
+}
