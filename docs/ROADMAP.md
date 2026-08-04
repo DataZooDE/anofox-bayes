@@ -15,27 +15,29 @@ This document is the plan for the other five, plus the defects in what already s
 ## 1. The gaps
 
 Originally ranked by agents unblocked per engineer-day; the table now records **state**,
-since most of it is done. Eleven of the fourteen are closed — three of those with a
-named remainder rather than cleanly, and one closed by deciding not to build it (§3.4)
-— two are in progress, and one is unstarted. Where an estimate turned out wrong it says so; the point of writing
-them down was to find out.
+since the work is done. **All fourteen are closed**, three of them with a named
+remainder rather than cleanly — gap 2 (the other bridged likelihoods), gap 13 (the
+counterfactual suite does not run in CI) and gap 14 (streaming and lazy emission). Gap 9
+is the one that was closed by deciding *not* to build it (§3.4) and then reopened when
+the trigger that closure itself named turned up in an agent brief. Where an estimate
+turned out wrong it says so; the point of writing them down was to find out.
 
 | # | Gap | Agents | State | Remaining |
 |---:|---|---|---|---|
 | 1 | `random()` is not seeded by the fit | 01–07 | **Done.** `anofox_bayes_uniform` / `anofox_bayes_std_normal`, pure functions of `(seed, key, draw)` | — |
 | 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 unblocked; 01, 04, 06 still degraded | **Seam done, F2 censored AFT shipped.** The covariance is reassembled from public primitives and cross-checked bit-exactly against the upstream standard errors | The other likelihoods: negbinomial + Gamma 4–7 d, mixed-effects 6–10 d (§3.1) |
-| 3 | F5 payer-alive (BG/NBD) | 05 | **Done.** SBC certifies Laplace; NUTS not needed | PyMC parity test |
+| 3 | F5 payer-alive (BG/NBD) | 05 | **Done.** SBC certifies Laplace; NUTS not needed; `test_parity_f5.py` since shipped | — |
 | 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | **Done.** Random slopes in `pooled_gaussian` (still conjugate, three engines agree); the learned scale in `varying_variance_gaussian` | — |
 | 5 | Per-group variance + learned pooling scale | 04, 06 | **Done.** `varying_variance_gaussian`, non-centred on both hierarchies. SBC says Laplace is inadmissible here — NUTS is the default | — |
 | 6 | NUTS engine (`nuts-rs` adapter) | none directly | **Done.** Pinned `=0.18.3`; byte-identical across thread counts | — |
-| 7 | F1 hierarchical negative binomial | 01 | **Done, natively.** The bridge was built and measured first and cannot cover a thin SKU — its plug-in dispersion error propagates into the pooling scale (§3.5) | PyMC parity test |
+| 7 | F1 hierarchical negative binomial | 01 | **Done, natively.** The bridge was built and measured first and cannot cover a thin SKU — its plug-in dispersion error propagates into the pooling scale (§3.5); `test_parity_f1.py` since shipped | — |
 | 8 | F4 payment delay, native | 04 | **Shipped** as `payment_delay`. The Gamma branch is the thing `pooled_gaussian` on log-delay structurally cannot offer, and a covenant test reads the tail where the two disagree. Reasoning in §3.5 | — |
 | 9 | F6 hierarchical elasticity, native | 06 | **Reopened and shipped** as `hier_elasticity`, on the trigger §3.4 itself named: a count likelihood, plus a sign constraint. Reasoning in §3.4 | — |
 | 10 | `conjugate_anomaly` has no `as_differentiable` | none | **Done.** All three engines now serve it, so a closed form has three independent derivations | — |
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | **Done.** `__group_status__` names the refused groups; the collapsed verdict is deliberately unchanged | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | **Done.** `sample_from: 'prior'`, refused unless the prior is proper | — |
 | 13 | No `anofox-scenario` integration (BR-9) | 01–07 | **Closed as documentation.** The two extensions already compose; an API cannot bind (§5) | The suite does not run in CI — see below |
-| 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | **Group parallelism done**, 8× in-crate. Profiling showed the bottleneck was diagnostics, not the sampler | Streaming needs a C++ streaming FFI; lazy emission saves ~11 % and is blocked by whole-chain diagnostics |
+| 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | **Group *and chain* parallelism done.** Groups 8× in-crate; NUTS chains now run one rayon task each on the caller's budget, **3.8×** on the F1 fixture (12.71 s → 3.35 s at `SET threads = 4`). Profiling showed the bottleneck was diagnostics, not the sampler | Streaming needs a C++ streaming FFI; lazy emission saves ~11 % and is blocked by whole-chain diagnostics |
 
 **The largest remaining scale cost is no longer the fit.** Of 2.76 s at 5 000 groups,
 roughly 1.2 s is the FFI row boundary and 1.26 s is DuckDB materialising the output
@@ -711,19 +713,18 @@ covers the branch's rows — is directly checked.
 Under a day each, independent of everything above, each fixing something currently
 *wrong* rather than merely absent.
 
-**`setseed()` in every recipe that uses `random()`** — ~0.5 d. Measured above: the same
-draws table yields 0.4224 and 0.5518 on consecutive runs. `diagnostics.test` already
-seeds, so the pattern exists in the repo and simply was not applied where it matters.
-Add `setseed()` to every recipe, state the requirement in `GUIDE.md` and
-`DRAWS_CONTRACT.md`, and add a sqllogictest that runs a predictive recipe twice and
-asserts identical output.
+**`setseed()` in every recipe that uses `random()`** — **done, and skipped in favour of
+the real fix.** The stopgap was never shipped, because the thing it was a stopgap for
+arrived first: `anofox_bayes_uniform` and `anofox_bayes_std_normal(seed, key, draw)` are
+pure functions of their arguments, so a predictive recipe is reproducible without
+depending on session-global state. `GUIDE.md`, `API_REFERENCE.md` and
+`DRAWS_CONTRACT.md` now tell the reader to use them **rather than** `random()`, and
+`test/sql/keyed_random.test` asserts reproducibility across runs and that a different
+seed genuinely moves the answer.
 
-That is a stopgap. The fix — about three days, in v0.2 — is a pure scalar
-`anofox_bayes_std_normal(seed, row_id, draw)` hashing its arguments into a
-deterministic standard normal. That makes the predictive reproducible without depending
-on session-global state, which is the same reason this extension keeps no state of its
-own: a recipe whose correctness depends on a `SET` the caller might not have issued is
-a recipe that will silently be wrong somewhere.
+That ordering is the right one and worth stating: a recipe whose correctness depends on
+a `SET` the caller might not have issued is a recipe that will silently be wrong
+somewhere, which is the same reason this extension keeps no state of its own.
 
 **Record the family in the draws table** — **done.** `__family__` carries the catalog
 F-number (`3` = `pooled_gaussian`, `7` = `conjugate_anomaly`), decoded in SQL by
