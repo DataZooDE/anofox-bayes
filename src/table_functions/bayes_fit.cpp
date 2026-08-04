@@ -294,8 +294,28 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 	auto param_out = FlatVector::GetData<string_t>(output.data[4]);
 	auto value_out = FlatVector::GetData<double>(output.data[5]);
 
+	// The three string columns repeat, heavily and by construction. `model_id` is one
+	// value for the whole fit; `group_id` takes one value per group and `param` one per
+	// parameter, and a draws table is those few names crossed with thousands of draws.
+	// The core hands back borrowed `&str` into storage it owns for the life of the fit,
+	// so the *same* distinct string always arrives as the same pointer -- which makes
+	// the pointer a sound cache key, and a cheaper one than the bytes.
+	//
+	// Without this, every row calls `AddString`, and a string longer than the 12 bytes
+	// `string_t` inlines is a heap copy each time. `model_id` is 16 hex characters, so
+	// it was one allocation per row: five million of them for the same value on a
+	// 5 000-group fit.
+	// `model_id` is one value for the entire fit, and at 16 hex characters it is past
+	// the 12 bytes `string_t` inlines -- so the naive loop heap-copied the same string
+	// once per row, five million times on a 5 000-group fit. Added once per chunk
+	// instead. `group_id` and `param` are deliberately *not* cached: measured, a
+	// pointer-keyed memo for them was slower than calling `AddString`, because a
+	// 2048-row chunk spans more distinct groups than a small cache holds and both
+	// columns are usually short enough to inline anyway.
+	const string_t model_str =
+	    written > 0 ? StringVector::AddString(output.data[0], model_id[0].ptr, model_id[0].len) : string_t();
 	for (idx_t i = 0; i < written; i++) {
-		model_out[i] = StringVector::AddString(output.data[0], model_id[i].ptr, model_id[i].len);
+		model_out[i] = model_str;
 		group_out[i] = StringVector::AddString(output.data[1], group_id[i].ptr, group_id[i].len);
 		chain_out[i] = chain[i];
 		draw_out[i] = draw[i];

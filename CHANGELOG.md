@@ -7,6 +7,23 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Changed — `model_id` is added once per chunk instead of once per row
+
+A 12 % cut in the time to materialise a draws table, measured on a 5 000-group
+`conjugate_anomaly` fit emitting 5 000 011 rows: **1.10-1.14 s before, 0.96-1.00 s
+after**, three runs each.
+
+`model_id` is one value for an entire fit, and at 16 hex characters it is past the 12
+bytes `string_t` inlines -- so the emit loop heap-copied the same string once per row.
+It is now added to the chunk once.
+
+**`group_id` and `param` are deliberately left alone, because caching them was
+measured and was slower**: 1.17-1.20 s, worse than doing nothing. A 2048-row chunk
+spans more distinct groups than a small pointer-keyed cache holds, so most rows paid a
+full scan *and* still called `AddString`, and both columns are usually short enough to
+inline in the first place. The roadmap's suggestion to attack all three string columns
+was right about `model_id` and wrong about the other two.
+
 ### Added — the counterfactual suite runs, instead of reporting a pass for skipping
 
 `test/sql/scenario_counterfactual.test` was a specification that never executed. It is

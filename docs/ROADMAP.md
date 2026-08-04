@@ -42,8 +42,18 @@ them down was to find out.
 
 **The largest remaining scale cost is no longer the fit.** Of 2.76 s at 5 000 groups,
 roughly 1.2 s is the FFI row boundary and 1.26 s is DuckDB materialising the output
-table, against 0.23 s of inference. Dictionary vectors for the three string columns
-would attack the first; it is C++ work and is not yet scheduled.
+table, against 0.23 s of inference.
+
+The suggestion here used to be "dictionary vectors for the three string columns". That
+was **right about one column and wrong about the other two**, and the difference was
+measured rather than reasoned. `model_id` is a single value for the whole fit and is
+16 hex characters, past what `string_t` inlines, so it was one heap copy per row; adding
+it once per chunk is worth **12 %** of emission (1.10-1.14 s to 0.96-1.00 s on a
+5 000 011-row result). Caching `group_id` and `param` the same way made it *slower*
+(1.17-1.20 s): a 2048-row chunk spans more distinct groups than a small cache holds, so
+most rows paid the scan and called `AddString` anyway, and both columns are usually
+short enough to inline. What is left of this line item is the FFI row boundary itself,
+which needs a different shape than a string cache.
 
 Two ranking notes worth stating rather than leaving implicit.
 
