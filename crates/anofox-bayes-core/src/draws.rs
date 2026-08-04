@@ -320,6 +320,66 @@ impl Posterior {
             + self.n_chains * self.n_draws * (self.n_params() + self.stats_per_draw())
     }
 
+    /// A maximal block of rows that share their structure, starting at `index`.
+    ///
+    /// The draws table is emitted row by row across the FFI, and a row is not cheap to
+    /// produce one at a time: `row_at` pays two divisions, two modulos and a three-way
+    /// branch each. But the table is far more regular than that walk admits, and this
+    /// exposes the regularity so a consumer can copy blocks instead.
+    ///
+    /// Inside one draw the parameter rows are **contiguous in `values`** -- the layout
+    /// is `values[(chain*n_draws + draw)*n_params + param]` and the rows are emitted in
+    /// exactly that order -- so their whole `value` column is a slice rather than a
+    /// loop. Their `(group_id, param)` pairs are a function of the parameter index
+    /// alone and so repeat identically for every draw, and `chain` and `draw` are
+    /// constant across the block. A caller can turn those three facts into a memcpy, a
+    /// dictionary and a constant.
+    ///
+    /// Header and statistic rows carry no such structure and are reported as runs of
+    /// one, so a caller falls back to [`Self::row_at`] without a special case. They are
+    /// also few: the metadata block is fixed-size and statistics are at most four rows
+    /// per draw, against an `n_params` that is thousands once groups are involved.
+    pub fn run_at(&self, index: usize) -> Option<Run<'_>> {
+        if index >= self.n_rows() {
+            return None;
+        }
+        let single = |chain: i32, draw: i32, first_param: usize| Run {
+            kind: RunKind::Single,
+            chain,
+            draw,
+            start: index,
+            len: 1,
+            first_param,
+            values: &[],
+        };
+
+        let per_draw = self.n_params() + self.stats_per_draw();
+        if index < self.header_rows() || per_draw == 0 {
+            return Some(single(META_INDEX, META_INDEX, 0));
+        }
+
+        let offset = index - self.header_rows();
+        let flat_draw = offset / per_draw;
+        let slot = offset % per_draw;
+        let chain = (flat_draw / self.n_draws) as i32;
+        let draw = (flat_draw % self.n_draws) as i32;
+        if slot >= self.n_params() {
+            return Some(single(chain, draw, slot));
+        }
+
+        // The remainder of this draw's parameter rows: the block worth having.
+        let base = flat_draw * self.n_params();
+        Some(Run {
+            kind: RunKind::Params,
+            chain,
+            draw,
+            start: index,
+            len: self.n_params() - slot,
+            first_param: slot,
+            values: &self.values[base + slot..base + self.n_params()],
+        })
+    }
+
     /// The row at a linear index, in O(1).
     ///
     /// Random access rather than a stateful iterator because the C++ layer emits
@@ -459,6 +519,44 @@ pub const META_ROWS: &[&str] = &[
     META_N_DRAWS,
 ];
 
+/// What kind of rows a [`Run`] covers, and therefore what a caller may assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    /// Parameter rows inside one draw: `values` is their `value` column verbatim,
+    /// `chain` and `draw` are constant, and the parameter at offset `i` is
+    /// `params[first_param + i]`.
+    Params,
+    /// One row with no exploitable structure -- metadata, a group status, or a
+    /// sampler statistic. Read it with [`Posterior::row_at`].
+    Single,
+}
+
+/// A block of rows sharing their structure. See [`Posterior::run_at`].
+#[derive(Debug, Clone, Copy)]
+pub struct Run<'a> {
+    pub kind: RunKind,
+    pub chain: i32,
+    pub draw: i32,
+    /// Row index of the first row in the block.
+    pub start: usize,
+    /// How many rows the block covers. Never zero.
+    pub len: usize,
+    /// Index into `params` of the first row, when `kind` is [`RunKind::Params`].
+    pub first_param: usize,
+    /// The `value` column of the block, when `kind` is [`RunKind::Params`].
+    pub values: &'a [f64],
+}
+
+impl Run<'_> {
+    /// The row at `offset` within the block, for tests and for callers that would
+    /// rather not special-case the kinds.
+    pub fn row<'p>(&self, offset: usize, posterior: &'p Posterior) -> DrawRow<'p> {
+        posterior
+            .row_at(self.start + offset)
+            .expect("a run only covers live rows")
+    }
+}
+
 /// One row of the draws contract.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawRow<'a> {
@@ -552,6 +650,126 @@ mod tests {
             }
         }
         Posterior::new(meta(), params, 2, 3, values, Vec::new()).unwrap()
+    }
+
+    /// Build a posterior of an arbitrary shape, including the awkward ones.
+    fn shaped(
+        n_chains: usize,
+        n_draws: usize,
+        n_params: usize,
+        unready: usize,
+        stats: bool,
+    ) -> Posterior {
+        let mut params = Vec::new();
+        for p in 0..n_params {
+            params.push(if p % 3 == 0 {
+                ParamName::global(format!("g{p}")).unwrap()
+            } else {
+                ParamName::grouped(format!("K-{}", p % 7), format!("p{p}")).unwrap()
+            });
+        }
+        let mut values = Vec::new();
+        for c in 0..n_chains {
+            for d in 0..n_draws {
+                for p in 0..n_params {
+                    // NaN in one cell: the refusal path travels as a value, and the
+                    // run walk must carry it as faithfully as the row walk.
+                    values.push(if c == 0 && d == 0 && p == n_params / 2 {
+                        f64::NAN
+                    } else {
+                        (1000 * c + 10 * d + p) as f64
+                    });
+                }
+            }
+        }
+        let stat_rows = if stats {
+            (0..n_chains * n_draws)
+                .map(|i| SampleStats {
+                    lp: Some(-(i as f64)),
+                    divergent: Some(if i % 5 == 0 { 1.0 } else { 0.0 }),
+                    energy: Some(i as f64 * 0.5),
+                    step_size: Some(0.1),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let unready_groups: Vec<(String, FitStatus)> = (0..unready)
+            .map(|i| (format!("U-{i}"), FitStatus::InsufficientData))
+            .collect();
+        Posterior::with_unready(
+            meta(),
+            params,
+            n_chains,
+            n_draws,
+            values,
+            stat_rows,
+            unready_groups,
+        )
+        .unwrap()
+    }
+
+    /// **The invariant the run-based emission must not break.**
+    ///
+    /// `run_at` exists to let the FFI hand DuckDB whole contiguous blocks instead of
+    /// one row at a time. It is only allowed to do that if walking by runs visits
+    /// exactly the same rows, in exactly the same order, carrying exactly the same
+    /// values as walking by `row_at` -- which is what the draws contract promises and
+    /// what every SQL consumer joins on.
+    ///
+    /// Checked across the shapes that break naive chunking: more parameters than a
+    /// vector holds, more draws than parameters, a single draw, refused groups in the
+    /// header, and with and without sampler statistics.
+    #[test]
+    fn walking_by_runs_visits_exactly_the_rows_walking_by_index_does() {
+        let shapes = [
+            (2, 3, 2, 0, false),
+            (2, 3, 2, 1, true),
+            (1, 1, 1, 0, false),
+            (4, 2, 5000, 2, true),
+            (1, 500, 3, 0, true),
+            (3, 7, 11, 3, false),
+        ];
+        for (n_chains, n_draws, n_params, unready, stats) in shapes {
+            let p = shaped(n_chains, n_draws, n_params, unready, stats);
+            let total = p.n_rows();
+            let mut index = 0usize;
+            let mut seen = 0usize;
+            while index < total {
+                let run = p.run_at(index).expect("a run at every live index");
+                assert!(
+                    run.len > 0,
+                    "a zero-length run would not terminate the walk"
+                );
+                for offset in 0..run.len {
+                    let expected = p.row_at(index + offset).expect("row inside the run");
+                    let got = run.row(offset, &p);
+                    assert_eq!(got.model_id, expected.model_id);
+                    assert_eq!(
+                        got.group_id,
+                        expected.group_id,
+                        "shape {n_chains}x{n_draws}x{n_params} row {}",
+                        index + offset
+                    );
+                    assert_eq!(got.chain, expected.chain);
+                    assert_eq!(got.draw, expected.draw);
+                    assert_eq!(got.param, expected.param);
+                    assert_eq!(
+                        got.value.to_bits(),
+                        expected.value.to_bits(),
+                        "value at row {} of shape {n_chains}x{n_draws}x{n_params}",
+                        index + offset
+                    );
+                }
+                index += run.len;
+                seen += run.len;
+            }
+            assert_eq!(
+                seen, total,
+                "the run walk must cover every row exactly once"
+            );
+            assert!(p.run_at(total).is_none(), "no run past the end");
+        }
     }
 
     #[test]

@@ -71,6 +71,18 @@ struct BayesFitGlobalState : public GlobalTableFunctionState {
 	idx_t emitted = 0;
 	idx_t total = 0;
 
+	// The run dictionary, fetched once per fit. A run of parameter rows names its
+	// parameters by index, so the names are looked up here rather than re-derived per
+	// row. These borrow from the fit and are valid until it is freed.
+	vector<AnofoxBayesStr> dict_group;
+	vector<AnofoxBayesStr> dict_param;
+	AnofoxBayesStr model_id {nullptr, 0};
+	// The same names as DuckDB vectors, built once so a chunk can *reference* them
+	// through a selection vector instead of copying a string per row.
+	unique_ptr<Vector> dict_group_vec;
+	unique_ptr<Vector> dict_param_vec;
+	SelectionVector run_sel {STANDARD_VECTOR_SIZE};
+
 	~BayesFitGlobalState() override {
 		if (fit) {
 			anofox_bayes_ffi_fit_free(fit);
@@ -278,15 +290,93 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 		RunFit(bind_data, gstate, ResolveThreadBudget(context.client));
 	}
 
-	idx_t capacity = STANDARD_VECTOR_SIZE;
-	vector<AnofoxBayesStr> model_id(capacity), group_id(capacity), param(capacity);
-	vector<int32_t> chain(capacity), draw(capacity);
-	vector<double> value(capacity);
+	// The dictionary and the model id are properties of the fit, not of a chunk, so
+	// they are fetched once. `model_id` is read off the first row because it is the
+	// same value on every row of the fit -- that is what makes it worth hoisting.
+	if (gstate.model_id.ptr == nullptr && gstate.total > 0) {
+		auto n_params = anofox_bayes_ffi_fit_param_count(gstate.fit);
+		gstate.dict_group.resize(n_params);
+		gstate.dict_param.resize(n_params);
+		if (n_params > 0) {
+			anofox_bayes_ffi_fit_param_names(gstate.fit, gstate.dict_group.data(), gstate.dict_param.data());
+		}
+		AnofoxBayesStr r_group, r_param;
+		int32_t r_chain, r_draw;
+		double r_value;
+		anofox_bayes_ffi_fit_rows(gstate.fit, 0, 1, &gstate.model_id, &r_group, &r_chain, &r_draw, &r_param,
+		                          &r_value);
+		if (n_params > 0) {
+			gstate.dict_group_vec = make_uniq<Vector>(LogicalType::VARCHAR, n_params);
+			gstate.dict_param_vec = make_uniq<Vector>(LogicalType::VARCHAR, n_params);
+			auto g = FlatVector::GetData<string_t>(*gstate.dict_group_vec);
+			auto p = FlatVector::GetData<string_t>(*gstate.dict_param_vec);
+			for (idx_t i = 0; i < n_params; i++) {
+				g[i] = StringVector::AddString(*gstate.dict_group_vec, gstate.dict_group[i].ptr,
+				                               gstate.dict_group[i].len);
+				p[i] = StringVector::AddString(*gstate.dict_param_vec, gstate.dict_param[i].ptr,
+				                               gstate.dict_param[i].len);
+			}
+		}
+	}
 
-	idx_t written = anofox_bayes_ffi_fit_rows(gstate.fit, gstate.emitted, capacity, model_id.data(), group_id.data(),
-	                                          chain.data(), draw.data(), param.data(), value.data());
-	gstate.emitted += written;
+	// The whole-chunk fast path: when the next run is parameter rows and covers a full
+	// chunk, the two name columns are *references* into the per-fit dictionary rather
+	// than 2048 fresh string copies. Measured, the two `AddString` calls were ~19 % of
+	// the emit; a selection vector of consecutive indices replaces them.
+	//
+	// Only this shape is special-cased. A chunk that mixes runs -- which happens at the
+	// metadata block, at group statuses and around sampler statistics -- takes the flat
+	// path below, and there are few such chunks against an `n_params` in the thousands.
+	{
+		const idx_t capacity = STANDARD_VECTOR_SIZE;
+		AnofoxBayesRun peek;
+		if (gstate.dict_param_vec && anofox_bayes_ffi_fit_run(gstate.fit, gstate.emitted, capacity, &peek) &&
+		    peek.kind == 0 && peek.len == capacity && peek.values != nullptr) {
+			for (idx_t i = 0; i < capacity; i++) {
+				gstate.run_sel.set_index(i, peek.first_param + i);
+			}
+			output.data[1].Slice(*gstate.dict_group_vec, gstate.run_sel, capacity);
+			output.data[4].Slice(*gstate.dict_param_vec, gstate.run_sel, capacity);
 
+			output.data[0].SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::GetData<string_t>(output.data[0])[0] =
+			    StringVector::AddString(output.data[0], gstate.model_id.ptr, gstate.model_id.len);
+
+			auto chain_fast = FlatVector::GetData<int32_t>(output.data[2]);
+			auto draw_fast = FlatVector::GetData<int32_t>(output.data[3]);
+			auto value_fast = FlatVector::GetData<double>(output.data[5]);
+			memcpy(value_fast, peek.values, capacity * sizeof(double));
+			for (idx_t i = 0; i < capacity; i++) {
+				chain_fast[i] = peek.chain;
+				draw_fast[i] = peek.draw;
+			}
+			if (peek.has_nan) {
+				for (idx_t i = 0; i < capacity; i++) {
+					if (std::isnan(value_fast[i])) {
+						FlatVector::SetNull(output.data[5], i, true);
+					}
+				}
+			}
+			output.SetCardinality(capacity);
+			gstate.emitted += capacity;
+			if (gstate.emitted >= gstate.total) {
+				return OperatorFinalizeResultType::FINISHED;
+			}
+			gstate.claimed.store(false);
+			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
+		}
+	}
+
+	// No un-slicing is needed before the flat path below, and it is worth saying why
+	// rather than defending against it: the executor calls `DataChunk::Reset()` on this
+	// chunk before every `FinalExecute` (`pipeline_executor.cpp`), and `Reset` restores
+	// each vector from its cache -- flat type, own data pointer, no dictionary. A
+	// `SetVectorType(FLAT_VECTOR)` here would be dead code, and worse, it would look
+	// like protection while providing none: it changes the type without restoring
+	// `data`, so a vector still pointing into the dictionary would then be written
+	// through.
+
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
 	auto model_out = FlatVector::GetData<string_t>(output.data[0]);
 	auto group_out = FlatVector::GetData<string_t>(output.data[1]);
 	auto chain_out = FlatVector::GetData<int32_t>(output.data[2]);
@@ -294,41 +384,88 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 	auto param_out = FlatVector::GetData<string_t>(output.data[4]);
 	auto value_out = FlatVector::GetData<double>(output.data[5]);
 
-	// The three string columns repeat, heavily and by construction. `model_id` is one
-	// value for the whole fit; `group_id` takes one value per group and `param` one per
-	// parameter, and a draws table is those few names crossed with thousands of draws.
-	// The core hands back borrowed `&str` into storage it owns for the life of the fit,
-	// so the *same* distinct string always arrives as the same pointer -- which makes
-	// the pointer a sound cache key, and a cheaper one than the bytes.
+	// Emit by *runs* rather than by rows.
 	//
-	// Without this, every row calls `AddString`, and a string longer than the 12 bytes
-	// `string_t` inlines is a heap copy each time. `model_id` is 16 hex characters, so
-	// it was one allocation per row: five million of them for the same value on a
-	// 5 000-group fit.
-	// `model_id` is one value for the entire fit, and at 16 hex characters it is past
-	// the 12 bytes `string_t` inlines -- so the naive loop heap-copied the same string
-	// once per row, five million times on a 5 000-group fit. Added once per chunk
-	// instead. `group_id` and `param` are deliberately *not* cached: measured, a
-	// pointer-keyed memo for them was slower than calling `AddString`, because a
-	// 2048-row chunk spans more distinct groups than a small cache holds and both
-	// columns are usually short enough to inline anyway.
+	// The draws table is far more regular than a row-at-a-time walk admits, and
+	// `anofox_bayes_ffi_fit_run` reports that regularity: inside one draw the parameter
+	// rows are contiguous in the core's own buffer, their `chain` and `draw` are
+	// constant, and their names are a function of the parameter index. So the `value`
+	// column of a block is a `memcpy` straight out of Rust rather than a copy into a
+	// staging array and a second copy out of it, and the six per-chunk staging vectors
+	// this loop used to allocate are gone entirely.
+	//
+	// Rows with no such structure -- the metadata block, group statuses, sampler
+	// statistics -- arrive as runs of one and take the original row path, which is
+	// still the right tool for them: there are a fixed handful of the first two, and
+	// at most four statistics per draw against an `n_params` in the thousands.
+	//
+	// `model_id` is added to the chunk once and reused: it is one value for the whole
+	// fit and, at 16 hex characters, past the 12 bytes `string_t` inlines, so calling
+	// `AddString` per row is one heap copy per row of the same string.
 	const string_t model_str =
-	    written > 0 ? StringVector::AddString(output.data[0], model_id[0].ptr, model_id[0].len) : string_t();
-	for (idx_t i = 0; i < written; i++) {
-		model_out[i] = model_str;
-		group_out[i] = StringVector::AddString(output.data[1], group_id[i].ptr, group_id[i].len);
-		chain_out[i] = chain[i];
-		draw_out[i] = draw[i];
-		param_out[i] = StringVector::AddString(output.data[4], param[i].ptr, param[i].len);
-		// A parameter the model could not estimate arrives as NaN and leaves as SQL
-		// NULL. That is the only honest rendering: a number here would be
-		// indistinguishable from an estimate, and telling the two apart is the whole
-		// point of the refusal path.
-		if (std::isnan(value[i])) {
-			FlatVector::SetNull(output.data[5], i, true);
-		} else {
-			value_out[i] = value[i];
+	    gstate.model_id.ptr != nullptr
+	        ? StringVector::AddString(output.data[0], gstate.model_id.ptr, gstate.model_id.len)
+	        : string_t();
+
+	idx_t written = 0;
+	while (written < capacity && gstate.emitted < gstate.total) {
+		AnofoxBayesRun run;
+		if (!anofox_bayes_ffi_fit_run(gstate.fit, gstate.emitted, capacity - written, &run)) {
+			break;
 		}
+
+		if (run.kind == 0 && run.values != nullptr) {
+			// One move for the whole block's values, then the columns that are constant
+			// across it.
+			memcpy(value_out + written, run.values, run.len * sizeof(double));
+			for (idx_t i = 0; i < run.len; i++) {
+				const idx_t at = written + i;
+				const auto slot = run.first_param + i;
+				model_out[at] = model_str;
+				group_out[at] =
+				    StringVector::AddString(output.data[1], gstate.dict_group[slot].ptr, gstate.dict_group[slot].len);
+				param_out[at] =
+				    StringVector::AddString(output.data[4], gstate.dict_param[slot].ptr, gstate.dict_param[slot].len);
+				chain_out[at] = run.chain;
+				draw_out[at] = run.draw;
+			}
+			// A parameter the model could not estimate arrives as NaN and leaves as SQL
+			// NULL. That is the only honest rendering: a number here would be
+			// indistinguishable from an estimate, and telling the two apart is the whole
+			// point of the refusal path. `has_nan` lets the usual case skip the scan.
+			if (run.has_nan) {
+				for (idx_t i = 0; i < run.len; i++) {
+					if (std::isnan(value_out[written + i])) {
+						FlatVector::SetNull(output.data[5], written + i, true);
+					}
+				}
+			}
+		} else {
+			// The unstructured rows, read one at a time as before.
+			AnofoxBayesStr r_model, r_group, r_param;
+			(void)r_model;
+			int32_t r_chain, r_draw;
+			double r_value;
+			const idx_t got = anofox_bayes_ffi_fit_rows(gstate.fit, gstate.emitted, run.len, &r_model, &r_group,
+			                                            &r_chain, &r_draw, &r_param, &r_value);
+			if (got == 0) {
+				break;
+			}
+			model_out[written] = model_str;
+			group_out[written] = StringVector::AddString(output.data[1], r_group.ptr, r_group.len);
+			param_out[written] = StringVector::AddString(output.data[4], r_param.ptr, r_param.len);
+			chain_out[written] = r_chain;
+			draw_out[written] = r_draw;
+			if (std::isnan(r_value)) {
+				FlatVector::SetNull(output.data[5], written, true);
+			} else {
+				value_out[written] = r_value;
+			}
+			run.len = got;
+		}
+
+		written += run.len;
+		gstate.emitted += run.len;
 	}
 	output.SetCardinality(written);
 

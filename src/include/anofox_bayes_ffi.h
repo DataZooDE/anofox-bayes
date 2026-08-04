@@ -69,6 +69,23 @@ typedef struct {
 	size_t len;
 } AnofoxBayesStr;
 
+// A block of structurally identical rows. `kind` is 0 for parameter rows inside one
+// draw and 1 for a single row with no exploitable structure.
+//
+// For a parameter run, `values` points into the fit's own buffer and is valid as long
+// as the fit is: the block's `value` column is already contiguous and in emission
+// order, so it can be copied in one move rather than a row at a time.
+typedef struct {
+	int32_t kind;
+	int32_t chain;
+	int32_t draw;
+	size_t start;
+	size_t len;
+	size_t first_param;
+	const double *values;
+	bool has_nan;
+} AnofoxBayesRun;
+
 typedef struct {
 	int32_t code;
 	char message[512];
@@ -103,6 +120,15 @@ size_t anofox_bayes_ffi_fit_row_count(const AnofoxBayesFit *fit);
 size_t anofox_bayes_ffi_fit_rows(const AnofoxBayesFit *fit, size_t offset, size_t max, AnofoxBayesStr *out_model_id,
                                  AnofoxBayesStr *out_group_id, int32_t *out_chain, int32_t *out_draw,
                                  AnofoxBayesStr *out_param, double *out_value);
+
+// Describes the run of rows beginning at `offset`, clamped to `max`. False past the end.
+bool anofox_bayes_ffi_fit_run(const AnofoxBayesFit *fit, size_t offset, size_t max, AnofoxBayesRun *out);
+
+// The parameter names and group ids in parameter order, so a caller builds the run
+// dictionary once per fit rather than re-deriving a name per row.
+size_t anofox_bayes_ffi_fit_param_count(const AnofoxBayesFit *fit);
+size_t anofox_bayes_ffi_fit_param_names(const AnofoxBayesFit *fit, AnofoxBayesStr *out_group_id,
+                                        AnofoxBayesStr *out_param);
 
 // FitStatus code; -1 for a null handle. Reasons are newline-joined.
 int32_t anofox_bayes_ffi_fit_status(const AnofoxBayesFit *fit, AnofoxBayesStr *out_reasons);

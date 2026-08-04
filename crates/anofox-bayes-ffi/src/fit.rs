@@ -25,6 +25,7 @@ use std::ffi::c_char;
 
 use anofox_bayes_core::config::Config;
 use anofox_bayes_core::data::{DataView, KeyColumn, NumericColumn};
+use anofox_bayes_core::draws::RunKind;
 use anofox_bayes_core::errors::ErrorCode;
 use anofox_bayes_core::fit::{fit as core_fit, Fit};
 use anofox_bayes_core::BayesError;
@@ -357,6 +358,119 @@ pub unsafe extern "C" fn anofox_bayes_ffi_fit_rows(
     })
 }
 
+/// A block of structurally identical rows, described rather than materialised.
+///
+/// See `Posterior::run_at`. `kind` is 0 for a run of parameter rows and 1 for a single
+/// row with no exploitable structure; a caller reads the latter through
+/// `anofox_bayes_ffi_fit_rows` at that index.
+///
+/// For a parameter run, `values` points **into the fit's own buffer** and stays valid
+/// as long as the fit does. That is the whole point: the `value` column of the block is
+/// already contiguous and in emission order, so it can be copied out in one move
+/// instead of a row at a time.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BayesRun {
+    pub kind: i32,
+    pub chain: i32,
+    pub draw: i32,
+    pub start: usize,
+    pub len: usize,
+    pub first_param: usize,
+    pub values: *const f64,
+    /// Whether any value in the block is NaN, so the common case can skip the scan
+    /// that turns NaN into SQL NULL.
+    pub has_nan: bool,
+}
+
+/// Describe the run of rows beginning at `offset`, clamped to `max` rows.
+///
+/// Returns false when `offset` is past the end.
+///
+/// # Safety
+/// `fit` must come from `anofox_bayes_ffi_fit`, and `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn anofox_bayes_ffi_fit_run(
+    fit: *const BayesFit,
+    offset: usize,
+    max: usize,
+    out: *mut BayesRun,
+) -> bool {
+    let Some(fit) = fit.as_ref() else {
+        return false;
+    };
+    if out.is_null() || max == 0 {
+        return false;
+    }
+    crate::guard(false, || {
+        let Some(run) = fit.fit.posterior.run_at(offset) else {
+            return false;
+        };
+        let len = run.len.min(max);
+        let values = &run.values[..len.min(run.values.len())];
+        *out = BayesRun {
+            kind: match run.kind {
+                RunKind::Params => 0,
+                RunKind::Single => 1,
+            },
+            chain: run.chain,
+            draw: run.draw,
+            start: run.start,
+            len,
+            first_param: run.first_param,
+            values: if values.is_empty() {
+                std::ptr::null()
+            } else {
+                values.as_ptr()
+            },
+            has_nan: values.iter().any(|v| v.is_nan()),
+        };
+        true
+    })
+}
+
+/// The parameter names and group ids, in parameter order.
+///
+/// A run of parameter rows names its parameters by index, so a caller can build the
+/// dictionary once per fit instead of re-deriving a name per row.
+///
+/// # Safety
+/// `fit` must come from `anofox_bayes_ffi_fit`; `out_group_id` and `out_param` must
+/// each have room for `anofox_bayes_ffi_fit_param_count` entries.
+#[no_mangle]
+pub unsafe extern "C" fn anofox_bayes_ffi_fit_param_names(
+    fit: *const BayesFit,
+    out_group_id: *mut BayesStr,
+    out_param: *mut BayesStr,
+) -> usize {
+    let Some(fit) = fit.as_ref() else {
+        return 0;
+    };
+    if out_group_id.is_null() || out_param.is_null() {
+        return 0;
+    }
+    crate::guard(0, || {
+        let params = &fit.fit.posterior.params;
+        for (i, p) in params.iter().enumerate() {
+            *out_group_id.add(i) = BayesStr::from(p.group_id.as_str());
+            *out_param.add(i) = BayesStr::from(p.name.as_str());
+        }
+        params.len()
+    })
+}
+
+/// How many parameters the fit reports, which is the length of the run dictionary.
+///
+/// # Safety
+/// `fit` must come from `anofox_bayes_ffi_fit`.
+#[no_mangle]
+pub unsafe extern "C" fn anofox_bayes_ffi_fit_param_count(fit: *const BayesFit) -> usize {
+    match fit.as_ref() {
+        None => 0,
+        Some(f) => f.fit.posterior.params.len(),
+    }
+}
+
 /// The fit's status code, and its reasons joined by newlines.
 ///
 /// Exposed separately from the draws so that a caller can gate without scanning the
@@ -398,6 +512,136 @@ mod tests {
     }
 
     /// The full round trip a table function performs, exercised without DuckDB.
+    /// **The run path must produce the same table as the row path, through the ABI.**
+    ///
+    /// `run_at` is pinned against `row_at` in the core. This pins the C surface on top
+    /// of it: the same fit, walked by runs and reassembled from the dictionary, must
+    /// give byte-identical values and the same names in the same order. A caller that
+    /// trusted the runs and got a different table would be silently wrong in a way no
+    /// SQL assertion downstream would localise.
+    #[test]
+    fn the_run_surface_reassembles_the_same_table_as_the_row_surface() {
+        unsafe {
+            let data = anofox_bayes_ffi_data_new(8);
+            let values = [2.0, 2.1, 1.9, 2.05, 1.95, 2.02, 2.2, 1.85];
+            let valid: [u8; 8] = [1; 8];
+            assert!(anofox_bayes_ffi_data_add_numeric(
+                data,
+                s("cost"),
+                values.as_ptr(),
+                valid.as_ptr(),
+                8
+            ));
+            let mut err = err_buf();
+            let fit = anofox_bayes_ffi_fit(
+                s("conjugate_anomaly"),
+                s(r#"{"value": "cost", "draws": 200, "seed": 11}"#),
+                data,
+                1,
+                &mut err,
+            );
+            assert!(!fit.is_null(), "fit failed with code {}", err.code);
+
+            let n_params = anofox_bayes_ffi_fit_param_count(fit);
+            let mut dict_group = vec![BayesStr::empty(); n_params];
+            let mut dict_param = vec![BayesStr::empty(); n_params];
+            assert_eq!(
+                anofox_bayes_ffi_fit_param_names(
+                    fit,
+                    dict_group.as_mut_ptr(),
+                    dict_param.as_mut_ptr()
+                ),
+                n_params
+            );
+            let as_str = |b: BayesStr| -> String {
+                if b.ptr.is_null() {
+                    String::new()
+                } else {
+                    std::str::from_utf8(std::slice::from_raw_parts(b.ptr as *const u8, b.len))
+                        .unwrap()
+                        .to_string()
+                }
+            };
+
+            let total = anofox_bayes_ffi_fit_row_count(fit);
+            let cap = 64usize;
+            let mut offset = 0usize;
+            while offset < total {
+                let mut run = BayesRun {
+                    kind: -1,
+                    chain: 0,
+                    draw: 0,
+                    start: 0,
+                    len: 0,
+                    first_param: 0,
+                    values: std::ptr::null(),
+                    has_nan: false,
+                };
+                assert!(anofox_bayes_ffi_fit_run(fit, offset, cap, &mut run));
+                assert!(run.len > 0 && run.len <= cap);
+                assert_eq!(run.start, offset);
+
+                // The same rows, read the old way.
+                let n = run.len;
+                let mut model_id = vec![BayesStr::empty(); n];
+                let mut group_id = vec![BayesStr::empty(); n];
+                let mut chain = vec![0i32; n];
+                let mut draw = vec![0i32; n];
+                let mut param = vec![BayesStr::empty(); n];
+                let mut value = vec![0.0f64; n];
+                assert_eq!(
+                    anofox_bayes_ffi_fit_rows(
+                        fit,
+                        offset,
+                        n,
+                        model_id.as_mut_ptr(),
+                        group_id.as_mut_ptr(),
+                        chain.as_mut_ptr(),
+                        draw.as_mut_ptr(),
+                        param.as_mut_ptr(),
+                        value.as_mut_ptr(),
+                    ),
+                    n
+                );
+
+                if run.kind == 0 {
+                    let vals = std::slice::from_raw_parts(run.values, run.len);
+                    let mut any_nan = false;
+                    for i in 0..n {
+                        assert_eq!(run.chain, chain[i], "chain constant across a run");
+                        assert_eq!(run.draw, draw[i], "draw constant across a run");
+                        assert_eq!(
+                            vals[i].to_bits(),
+                            value[i].to_bits(),
+                            "the run's contiguous values are the row values"
+                        );
+                        any_nan |= vals[i].is_nan();
+                        let slot = run.first_param + i;
+                        assert_eq!(as_str(dict_group[slot]), as_str(group_id[i]));
+                        assert_eq!(as_str(dict_param[slot]), as_str(param[i]));
+                    }
+                    assert_eq!(run.has_nan, any_nan, "has_nan must describe the block");
+                }
+
+                offset += run.len;
+            }
+            assert_eq!(offset, total, "the run walk covers the table exactly");
+            let mut past = BayesRun {
+                kind: -1,
+                chain: 0,
+                draw: 0,
+                start: 0,
+                len: 0,
+                first_param: 0,
+                values: std::ptr::null(),
+                has_nan: false,
+            };
+            assert!(!anofox_bayes_ffi_fit_run(fit, total, cap, &mut past));
+
+            anofox_bayes_ffi_fit_free(fit);
+        }
+    }
+
     #[test]
     fn a_relation_built_through_the_ffi_fits_and_streams_its_draws_back() {
         unsafe {
