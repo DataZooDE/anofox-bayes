@@ -7,6 +7,27 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Added — the counterfactual suite runs, instead of reporting a pass for skipping
+
+`test/sql/scenario_counterfactual.test` was a specification that never executed. It is
+now a test: **57 assertions**, run by `make test_scenario` in the Validation workflow,
+which had already paid for `make release`.
+
+- **The recorded blocker is gone.** It read *"signed anofox-scenario binaries, or a
+  `test/unittest` that permits unsigned extensions -- neither in this repository"*.
+  anofox-scenario is published in the DuckDB community repository, so
+  `INSTALL ... FROM community` yields a signed binary and `LOAD anofox_scenario`
+  succeeds inside `test/unittest` with no `-unsigned` anywhere. The Makefile's note
+  that the community repository "silently does nothing" for it was out of date.
+- **Signing was not the whole story.** `require anofox_scenario` skips even when the
+  extension is installed and loadable, because `require` answers "is this statically
+  linked" rather than "can this be loaded" -- and a skipped suite reports as a pass.
+  The suite now guards on `require-env ANOFOX_SCENARIO` and loads explicitly, so a
+  developer without the extension still skips the file while CI gets a real run.
+- **What it buys.** BR-9's composition is checked rather than hand-verified: the draws
+  are asserted bit-identical inside every branch, and `model_id` is asserted to diverge
+  because the data fingerprint covers the branch's rows.
+
 ### Changed — WASM archs are excluded from the distribution matrix
 
 The three `wasm_*` builds have failed on every run for a while, and a permanently-red
