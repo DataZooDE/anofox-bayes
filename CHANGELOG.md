@@ -7,6 +7,24 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Changed — WASM archs are excluded from the distribution matrix
+
+The three `wasm_*` builds have failed on every run for a while, and a permanently-red
+pipeline hides the day it goes red for a new reason. They are now excluded and the
+reason is written down.
+
+- **The blocker is upstream and exact.** `extension-ci-tools` pins the WASM job to
+  `dtolnay/rust-toolchain@1.86.0`; `argmin 0.11`, reached transitively through
+  `anofox-regression`, calls `is_multiple_of`, stable only from 1.87. Four `E0658`s,
+  none in this repository.
+- **This extension is WASM-ready.** `cargo check -p anofox-bayes-core --target
+  wasm32-unknown-emscripten` on 1.97.1 compiles clean. Deleting one `exclude_archs`
+  entry is the whole fix once upstream bumps the pin.
+- **`engines/nuts.rs` now selects a sequential chain loop under
+  `#[cfg(target_family = "wasm")]`**, matching what `parallel.rs` has always done:
+  rayon cannot spawn a worker on `wasm32-unknown-emscripten`. Same chunking, same
+  order, same draws.
+
 ### Added — seven demo TUIs, one per model family
 
 `demo/` — a uv workspace with a shared Textual shell and one runnable demo per agent

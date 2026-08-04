@@ -17,10 +17,12 @@ This document is the plan for the other five, plus the defects in what already s
 Originally ranked by agents unblocked per engineer-day; the table now records **state**,
 since the work is done. **All fourteen are closed**, three of them with a named
 remainder rather than cleanly — gap 2 (the other bridged likelihoods), gap 13 (the
-counterfactual suite does not run in CI) and gap 14 (streaming and lazy emission). Gap 9
-is the one that was closed by deciding *not* to build it (§3.4) and then reopened when
-the trigger that closure itself named turned up in an agent brief. Where an estimate
-turned out wrong it says so; the point of writing them down was to find out.
+counterfactual suite does not run in CI) and gap 14 (streaming and lazy emission). A
+fourth known gap sits outside the table: there is no DuckDB-Wasm build, and it is
+blocked upstream rather than here. Gap 9 is the one that was closed by deciding *not* to
+build it (§3.4) and then reopened when the trigger that closure itself named turned up
+in an agent brief. Where an estimate turned out wrong it says so; the point of writing
+them down was to find out.
 
 | # | Gap | Agents | State | Remaining |
 |---:|---|---|---|---|
@@ -692,6 +694,25 @@ F8 finding does: a flat prior on a hierarchical scale is proper but its upper ta
 where the sampler diverges, and every divergence is a refusal under
 `max_divergent = 0`. Any future hierarchical family whose pooling scale is on a log
 quantity should do the same.
+
+### Known gap: no DuckDB-Wasm build
+
+The three `wasm_*` archs are excluded from the distribution matrix, so the extension
+does not ship for DuckDB-Wasm. The blocker is upstream and precisely located:
+`extension-ci-tools`'s `_extension_distribution.yml:1128` pins the WASM job to
+`dtolnay/rust-toolchain@1.86.0`, and `argmin 0.11` -- reached transitively through
+`anofox-regression` -- calls `is_multiple_of`, which stabilised in 1.87. The build dies
+with four `E0658`s, none of them in this repository.
+
+**Our own code is ready.** `cargo check -p anofox-bayes-core --target
+wasm32-unknown-emscripten` on 1.97.1 compiles clean, including the sequential chain loop
+`engines/nuts.rs` selects under `#[cfg(target_family = "wasm")]` because rayon cannot
+spawn a worker there. So this is one line of `exclude_archs` away from being fixed the
+day upstream bumps the pin, and nothing else.
+
+It is excluded rather than left failing for the reason the `deploy-configured` job
+gives: a pipeline that is permanently red for a known reason trains everyone to ignore
+it, including on the day it goes red for an unknown one.
 
 ### Known gap: the counterfactual suite does not run in CI
 

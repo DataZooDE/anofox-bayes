@@ -68,7 +68,16 @@ jobs:
       enable_rust: true
       # windows_amd64_rtools: only needed for R package builds
       # windows_amd64_mingw: rtools42 MinGW lacks libbcrypt.a needed by Rust getrandom 0.3+
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw'
+      # wasm_*: blocked upstream, not here. extension-ci-tools pins the WASM job to
+      #   dtolnay/rust-toolchain@1.86.0 (_extension_distribution.yml:1128), and argmin
+      #   0.11 -- a transitive dependency through anofox-regression -- calls
+      #   `is_multiple_of`, stable only from 1.87. Four E0658s, none of them our code:
+      #   `cargo check --target wasm32-unknown-emscripten` on 1.97.1 builds
+      #   anofox-bayes-core clean, sequential chain loop and all. Excluded rather than
+      #   left failing, for the reason `deploy-configured` below gives: a pipeline
+      #   that is permanently red for a known reason trains everyone to ignore it.
+      #   Delete this line the day upstream bumps the pin.
+      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   # Whether the distribution channel is configured at all.
   #
@@ -108,7 +117,7 @@ jobs:
       duckdb_version: v1.4.5
       ci_tools_version: v1.4-andium
       extension_name: anofox_bayes
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw'
+      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
 
@@ -123,7 +132,16 @@ jobs:
       enable_rust: true
       # windows_amd64_rtools: only needed for R package builds
       # windows_amd64_mingw: rtools42 MinGW lacks libbcrypt.a needed by Rust getrandom 0.3+
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw'
+      # wasm_*: blocked upstream, not here. extension-ci-tools pins the WASM job to
+      #   dtolnay/rust-toolchain@1.86.0 (_extension_distribution.yml:1128), and argmin
+      #   0.11 -- a transitive dependency through anofox-regression -- calls
+      #   `is_multiple_of`, stable only from 1.87. Four E0658s, none of them our code:
+      #   `cargo check --target wasm32-unknown-emscripten` on 1.97.1 builds
+      #   anofox-bayes-core clean, sequential chain loop and all. Excluded rather than
+      #   left failing, for the reason `deploy-configured` below gives: a pipeline
+      #   that is permanently red for a known reason trains everyone to ignore it.
+      #   Delete this line the day upstream bumps the pin.
+      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   duckdb-latest-deploy:
     name: Deploy extension binaries (v1.5.5)
@@ -136,6 +154,6 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: v1.5-variegata
       extension_name: anofox_bayes
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw'
+      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
