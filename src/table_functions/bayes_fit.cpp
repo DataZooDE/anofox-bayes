@@ -367,10 +367,14 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 		}
 	}
 
-	// The general path writes flat vectors, so undo any slicing a previous chunk left.
-	output.data[0].SetVectorType(VectorType::FLAT_VECTOR);
-	output.data[1].SetVectorType(VectorType::FLAT_VECTOR);
-	output.data[4].SetVectorType(VectorType::FLAT_VECTOR);
+	// No un-slicing is needed before the flat path below, and it is worth saying why
+	// rather than defending against it: the executor calls `DataChunk::Reset()` on this
+	// chunk before every `FinalExecute` (`pipeline_executor.cpp`), and `Reset` restores
+	// each vector from its cache -- flat type, own data pointer, no dictionary. A
+	// `SetVectorType(FLAT_VECTOR)` here would be dead code, and worse, it would look
+	// like protection while providing none: it changes the type without restoring
+	// `data`, so a vector still pointing into the dictionary would then be written
+	// through.
 
 	const idx_t capacity = STANDARD_VECTOR_SIZE;
 	auto model_out = FlatVector::GetData<string_t>(output.data[0]);
