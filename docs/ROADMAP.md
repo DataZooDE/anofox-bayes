@@ -26,7 +26,7 @@ them down was to find out.
 | # | Gap | Agents | State | Remaining |
 |---:|---|---|---|---|
 | 1 | `random()` is not seeded by the fit | 01–07 | **Done.** `anofox_bayes_uniform` / `anofox_bayes_std_normal`, pure functions of `(seed, key, draw)` | — |
-| 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 unblocked; 01, 04, 06 still degraded | **Seam done, F2 censored AFT shipped.** The covariance is reassembled from public primitives and cross-checked bit-exactly against the upstream standard errors | The other likelihoods: negbinomial + Gamma 4–7 d, mixed-effects 6–10 d (§3.1) |
+| 2 | Bridge `anofox-statistics` MAP+Laplace fits into the draws contract | 02 unblocked; 01, 04, 06 now served natively | **Seam done, F2 censored AFT shipped.** The covariance is reassembled from public primitives and cross-checked bit-exactly against the upstream standard errors | The **ungrouped** likelihoods: negbinomial + Gamma 4–7 d, mixed-effects 6–10 d. F1 and F4 cover the *hierarchical* count and Gamma cases and refuse a single group, so this is now the no-groups hole rather than a cheaper route (§3.1a) |
 | 3 | F5 payer-alive (BG/NBD) | 05 | **Done.** SBC certifies Laplace; NUTS not needed; `test_parity_f5.py` since shipped | — |
 | 4 | Random slopes + learned pooling scale | 06 blocker; 03 degradation | **Done.** Random slopes in `pooled_gaussian` (still conjugate, three engines agree); the learned scale in `varying_variance_gaussian` | — |
 | 5 | Per-group variance + learned pooling scale | 04, 06 | **Done.** `varying_variance_gaussian`, non-centred on both hierarchies. SBC says Laplace is inadmissible here — NUTS is the default | — |
@@ -42,8 +42,18 @@ them down was to find out.
 
 **The largest remaining scale cost is no longer the fit.** Of 2.76 s at 5 000 groups,
 roughly 1.2 s is the FFI row boundary and 1.26 s is DuckDB materialising the output
-table, against 0.23 s of inference. Dictionary vectors for the three string columns
-would attack the first; it is C++ work and is not yet scheduled.
+table, against 0.23 s of inference.
+
+The suggestion here used to be "dictionary vectors for the three string columns". That
+was **right about one column and wrong about the other two**, and the difference was
+measured rather than reasoned. `model_id` is a single value for the whole fit and is
+16 hex characters, past what `string_t` inlines, so it was one heap copy per row; adding
+it once per chunk is worth **12 %** of emission (1.10-1.14 s to 0.96-1.00 s on a
+5 000 011-row result). Caching `group_id` and `param` the same way made it *slower*
+(1.17-1.20 s): a 2048-row chunk spans more distinct groups than a small cache holds, so
+most rows paid the scan and called `AddString` anyway, and both columns are usually
+short enough to inline. What is left of this line item is the FFI row boundary itself,
+which needs a different shape than a string cache.
 
 Two ranking notes worth stating rather than leaving implicit.
 
@@ -300,6 +310,26 @@ coefficients and leave its dispersion or variance parameter uncertified until
 
 **What would change this:** nothing now. The bridge is built and F2 is shipped; a
 native F2 is no longer competitive at any price.
+
+**What shipping F1 and F4 changed, and it is not what it looks like.** The catalog now
+has a negative-binomial likelihood (F1) and a Gamma one (F4), so the first two rows of
+the table above read as though they were overtaken. They were not. **Both native
+families require a `group` and refuse a single one** -- measured, not assumed: a
+200-row count regression through `hier_negbin` with one group comes back
+`insufficient_data` with `is_actionable` false, and `payment_delay` does the same. That
+is correct behaviour for a family whose subject is pooling across groups, and it means
+the remainder here is narrower and sharper than "the other likelihoods":
+
+> **There is no non-hierarchical count or positive-continuous GLM in the catalog.** A
+> user with one population and no groups to pool over cannot fit a negative-binomial or
+> Gamma regression at all. `pooled_gaussian` is the only ungrouped GLM, and it is
+> Gaussian.
+
+So the bridge rows are still worth building, for exactly the case the native families
+decline rather than as a cheaper route to the case they serve -- and §3.4's measurement,
+that a bridged *hierarchical* fit conditions on two point estimates and under-covers
+thin groups, is not an argument against them in the ungrouped case where there is no
+pooling scale to condition on.
 
 ### 3.1b Postscript: was HLD §3 right?
 
