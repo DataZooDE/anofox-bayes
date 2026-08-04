@@ -88,6 +88,16 @@ jobs:
             || { echo "::error::extension binary missing after 'make release'"; exit 1; }
           ls -l build/release/extension/anofox_bayes/
 
+      # The counterfactual suite (BR-9), which needs anofox-scenario alongside this
+      # extension and so cannot run in the distribution matrix. It lives here because
+      # this job has already paid for `make release`.
+      #
+      # `make test_scenario` installs the signed community build, sets the variable the
+      # suite guards on, and exits non-zero if the suite skips -- a skipped suite
+      # reporting as a pass is the whole reason this file spent its life unrun.
+      - name: Run the counterfactual suite
+        run: make test_scenario
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:

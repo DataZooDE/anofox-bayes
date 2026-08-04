@@ -15,13 +15,12 @@ This document is the plan for the other five, plus the defects in what already s
 ## 1. The gaps
 
 Originally ranked by agents unblocked per engineer-day; the table now records **state**,
-since the work is done. **All fourteen are closed**, three of them with a named
-remainder rather than cleanly — gap 2 (the other bridged likelihoods), gap 13 (the
-counterfactual suite does not run in CI) and gap 14 (streaming and lazy emission). A
-fourth known gap sits outside the table: there is no DuckDB-Wasm build, and it is
-blocked upstream rather than here. Gap 9 is the one that was closed by deciding *not* to
-build it (§3.4) and then reopened when the trigger that closure itself named turned up
-in an agent brief. Where an estimate turned out wrong it says so; the point of writing
+since the work is done. **All fourteen are closed**, two of them with a named
+remainder rather than cleanly — gap 2 (the other bridged likelihoods) and gap 14
+(streaming and lazy emission). One further known gap sits outside the table: there is no
+DuckDB-Wasm build, and it is blocked upstream rather than here. Gap 9 is the one that
+was closed by deciding *not* to build it (§3.4) and then reopened when the trigger that
+closure itself named turned up in an agent brief. Where an estimate turned out wrong it says so; the point of writing
 them down was to find out.
 
 | # | Gap | Agents | State | Remaining |
@@ -38,7 +37,7 @@ them down was to find out.
 | 10 | `conjugate_anomaly` has no `as_differentiable` | none | **Done.** All three engines now serve it, so a closed form has three independent derivations | — |
 | 11 | `Readiness::worst` downgrades the whole fit | 01, 07 | **Done.** `__group_status__` names the refused groups; the collapsed verdict is deliberately unchanged | — |
 | 12 | No prior-predictive check (BR-11) | 01–07 | **Done.** `sample_from: 'prior'`, refused unless the prior is proper | — |
-| 13 | No `anofox-scenario` integration (BR-9) | 01–07 | **Closed as documentation.** The two extensions already compose; an API cannot bind (§5) | The suite does not run in CI — see below |
+| 13 | No `anofox-scenario` integration (BR-9) | 01–07 | **Closed, and now tested.** The two extensions already compose; an API cannot bind (§5). `scenario_counterfactual.test` runs in CI — 57 assertions — since anofox-scenario reached the DuckDB community repository | — |
 | 14 | Group parallelism, streaming sufficient statistics, lazy draw emission | 01, 07 | **Group *and chain* parallelism done.** Groups 8× in-crate; NUTS chains now run one rayon task each on the caller's budget, **3.8×** on the F1 fixture (12.71 s → 3.35 s at `SET threads = 4`). Profiling showed the bottleneck was diagnostics, not the sampler | Streaming needs a C++ streaming FFI; lazy emission saves ~11 % and is blocked by whole-chain diagnostics |
 
 **The largest remaining scale cost is no longer the fit.** Of 2.76 s at 5 000 groups,
@@ -714,20 +713,30 @@ It is excluded rather than left failing for the reason the `deploy-configured` j
 gives: a pipeline that is permanently red for a known reason trains everyone to ignore
 it, including on the day it goes red for an unknown one.
 
-### Known gap: the counterfactual suite does not run in CI
+### Closed: the counterfactual suite now runs in CI
 
-`test/sql/scenario_counterfactual.test` is a specification rather than a running test.
-`require anofox_scenario` *skips* rather than fails when the extension will not load,
-anofox-scenario's binaries are unsigned, and `test/unittest` is a Catch binary with no
-`-unsigned` flag. A skipped suite reports as a pass, so `make test_scenario` now exits
-non-zero on a skip rather than letting it read as green.
+`test/sql/scenario_counterfactual.test` was a specification that never executed. It is
+now a test: **57 assertions**, run by `make test_scenario` in the Validation workflow.
 
-Fixing it needs one of two things, neither in this repository: signed anofox-scenario
-binaries, or a `test/unittest` that permits unsigned extensions. What has been verified
-by hand meanwhile: every statement in the suite executes without error with both
-extensions loaded in the shell, and the composition it depends on — fitting from an
-attached scenario catalog, with `model_id` diverging because the data fingerprint
-covers the branch's rows — is directly checked.
+The blocker as recorded was *"signed anofox-scenario binaries, or a `test/unittest` that
+permits unsigned extensions -- neither in this repository"*. The first of those arrived:
+**anofox-scenario is published in the DuckDB community repository**, so
+`INSTALL anofox_scenario FROM community` produces a signed binary and
+`LOAD anofox_scenario` succeeds inside `test/unittest` with no `-unsigned` anywhere.
+The Makefile's note that the community repository "silently does nothing" for it was
+simply out of date.
+
+One thing the signing did not fix, and it is worth writing down because it is the part
+that reads like a pass: **`require anofox_scenario` skips even when the extension is
+installed and loadable.** `require` answers "is this statically linked", not "can this
+be loaded". So the suite guards on `require-env ANOFOX_SCENARIO` and loads the
+extension explicitly -- a developer without it still skips the file and the rest of
+`make test` still runs, while CI sets the variable and gets a real run.
+
+What this buys beyond a green tick: the composition BR-9 asks for is now *checked*
+rather than hand-verified -- the draws are asserted bit-identical inside every branch,
+and `model_id` is asserted to diverge because the data fingerprint covers the branch's
+rows.
 
 ## 4. Quick wins
 

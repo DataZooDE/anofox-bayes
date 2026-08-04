@@ -31,7 +31,21 @@
 
 require anofox_bayes
 
-require anofox_scenario
+# `require anofox_scenario` is deliberately *not* used, and the difference matters.
+#
+# `require` skips when the extension is not statically linked, and it skips even when
+# the extension is installed and loadable -- verified: `LOAD anofox_scenario` succeeds
+# inside this same `test/unittest` binary. A skipped suite reports as a pass, which is
+# how this file spent its life as a specification that never ran.
+#
+# So the availability check moves to the environment, where the build can answer it
+# honestly. `make test_scenario` installs the signed community build, sets the
+# variable and fails if the suite skips anyway; a developer who has not installed it
+# skips this file and everything else in `make test` still runs.
+require-env ANOFOX_SCENARIO
+
+statement ok
+LOAD anofox_scenario;
 
 #######################################
 # Fit: weekly demand as a function of price and promotion
