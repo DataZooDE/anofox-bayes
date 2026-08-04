@@ -66,6 +66,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 
+#[cfg(not(target_family = "wasm"))]
 use rayon::prelude::*;
 
 use nuts_rs::{
@@ -142,10 +143,25 @@ impl Engine for NutsEngine {
         // were asked for, not of how many threads were available, and not of the
         // order they happened to finish in. That is the same rule every other
         // parallel site in this crate follows, and the invariant tests hold it.
+        //
+        // WASM takes the same walk sequentially, for the reason `parallel.rs` gives:
+        // rayon cannot spawn a worker on `wasm32-unknown-emscripten`, which is in the
+        // release matrix. The chunking is identical, so this is the same computation
+        // in the same order producing the same draws -- only the `par_` prefix goes.
         let chunk_values = opts.n_draws * n_params;
+        #[cfg(not(target_family = "wasm"))]
         let outcomes: Vec<BayesResult<()>> = values
             .par_chunks_mut(chunk_values)
             .zip(stats.par_chunks_mut(opts.n_draws))
+            .enumerate()
+            .map(|(chain, (values, stats))| {
+                Self::run_chain(target, opts, chain, dim, n_params, values, stats)
+            })
+            .collect();
+        #[cfg(target_family = "wasm")]
+        let outcomes: Vec<BayesResult<()>> = values
+            .chunks_mut(chunk_values)
+            .zip(stats.chunks_mut(opts.n_draws))
             .enumerate()
             .map(|(chain, (values, stats))| {
                 Self::run_chain(target, opts, chain, dim, n_params, values, stats)
