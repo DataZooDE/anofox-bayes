@@ -1,0 +1,133 @@
+# name: test/sql/draws_emission.test
+# description: The draws table is emitted in blocks; this pins what the blocking must not change
+# group: [sql]
+#
+# `anofox_bayes_fit` does not hand DuckDB one row at a time. It asks the core for a
+# *run* -- a maximal block of structurally identical rows -- and, when a run fills a
+# whole 2048-row vector, copies the block's values in one move, fills `chain` and
+# `draw` as constants, and points the two name columns at a per-fit dictionary instead
+# of copying a string per row.
+#
+# That is a large amount of machinery standing between the posterior and the table a
+# user reads, and it has two shapes: the fast path above, and a general path for chunks
+# that mix runs. Everything here is chosen to make one of those paths do something it
+# would otherwise never be asked to do in the rest of the suite, because a blocking bug
+# does not corrupt a number -- it shifts a whole column by one row, or serves the wrong
+# chunk twice, and every individual value still looks plausible.
+
+require anofox_bayes
+
+#######################################
+# A fit whose parameter count lands exactly on the vector boundary
+#######################################
+
+# 1024 groups x 2 parameters = **exactly** 2048 parameters, which is DuckDB's vector
+# size. So every draw is one full run, every chunk is one full run, and the fast path
+# runs back to back for the whole table with no partial block to fall out on. If the
+# fast path could fail to advance -- re-serving the same 2048 rows forever -- this is
+# the shape that would hang rather than the shape that would be caught by a value.
+statement ok
+CREATE TABLE aligned_obs AS
+SELECT 'G' || (i % 1024)::VARCHAR AS grp, (i % 29)::DOUBLE + 5.0 AS y
+FROM range(0, 40960) t(i);
+
+statement ok
+CREATE TABLE aligned AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT grp, y FROM aligned_obs), 'conjugate_anomaly',
+    {'value': 'y', 'group': 'grp', 'draws': 64, 'seed': 3});
+
+# 11 metadata rows, then 64 draws of 2048 parameters each. The arithmetic is spelled
+# out because the point is that it is exact: 64 * 2048 = 131072.
+query III
+SELECT count(*), count(*) FILTER (WHERE draw < 0), count(DISTINCT group_id)
+FROM aligned;
+----
+131083	11	1025
+
+# Every group must appear with both of its parameters in every draw. A dictionary
+# indexed one slot off would still produce 2048 names per draw -- just the wrong ones,
+# and shifted consistently, so no count would move. This counts the pairing instead.
+query I
+SELECT count(*) FROM (
+    SELECT group_id FROM aligned WHERE draw >= 0 AND group_id <> '__global__'
+    GROUP BY group_id HAVING count(DISTINCT param) <> 2
+);
+----
+0
+
+# The names that belong to `__global__` must not leak onto a group, which is what a
+# dictionary shifted across the group boundary would do.
+query I
+SELECT count(*) FROM aligned
+WHERE draw >= 0 AND group_id <> '__global__' AND param NOT IN ('mu', 'sigma');
+----
+0
+
+# A draw's values must still belong to that draw. `mu` is a per-group mean and the
+# fixture's groups all draw from the same distribution, so a block copied from the
+# wrong offset would still look like a number -- but it would not stay inside the
+# response's own range.
+query I
+SELECT count(*) FROM aligned
+WHERE draw >= 0 AND param = 'mu' AND (value < 0.0 OR value > 40.0);
+----
+0
+
+#######################################
+# A refused fit, where the value column is mostly NULL
+#######################################
+
+# A constant response is refused, and a refused model reports NaN for the parameters it
+# will not estimate. NaN leaves as SQL NULL, and the fast path only scans for it when
+# the core says the block contains one -- so a wrong `has_nan` would publish NaN as a
+# number, or lose a NULL, without changing any count.
+statement ok
+CREATE TABLE flat_obs AS
+SELECT 'S' || (i % 4)::VARCHAR AS g, 7.0 AS y FROM range(0, 40) t(i);
+
+statement ok
+CREATE TABLE refused AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT g, y FROM flat_obs), 'varying_variance_gaussian',
+    {'y': 'y', 'group': 'g', 'draws': 50, 'chains': 2, 'seed': 2});
+
+query II
+SELECT anofox_bayes_status_text(param, value),
+       count(*) FILTER (WHERE value IS NULL)
+FROM refused;
+----
+degenerate	1200
+
+# No NaN reaches SQL as a number. `isnan` over a NULL is NULL, not true, so this counts
+# only values that arrived as real doubles and are nonetheless not numbers.
+query I
+SELECT count(*) FROM refused WHERE value IS NOT NULL AND isnan(value);
+----
+0
+
+#######################################
+# A fit small enough that no chunk is ever full
+#######################################
+
+# Three parameters and ten draws: every chunk mixes the metadata block with parameter
+# rows, so the fast path never triggers and the general path carries the whole table.
+# Both paths have to produce the same contract, and this is the one that proves the
+# fallback is not dead code.
+statement ok
+CREATE TABLE tiny AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT g, y FROM flat_obs WHERE g IN ('S0', 'S1')), 'conjugate_anomaly',
+    {'value': 'y', 'group': 'g', 'draws': 10, 'seed': 5});
+
+query II
+SELECT count(*) > 0, count(DISTINCT model_id) FROM tiny;
+----
+true	1
+
+# `model_id` is one value per fit and is served as a constant on the fast path. Two
+# different fits must still disagree, or the constant is being cached across fits.
+query I
+SELECT (SELECT DISTINCT model_id FROM aligned) <> (SELECT DISTINCT model_id FROM tiny);
+----
+true
