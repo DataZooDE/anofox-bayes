@@ -124,3 +124,16 @@ def con(extension_path: pathlib.Path) -> duckdb.DuckDBPyConnection:
             "Re-read docs/DRAWS_CONTRACT.md and update the suite deliberately."
         )
     return connection
+
+
+@pytest.fixture(scope="session")
+def parity_comparison_count():
+    """How many statistics the suite actually compared, for the sizing test.
+
+    Read from `MARGINS` rather than counted statically, because the per-family
+    comparison lists are built at run time from the fixtures. Each recorded margin
+    carries the four statistics `parity_deltas` returns.
+    """
+    from _support import MARGINS
+
+    return len(MARGINS) * 4

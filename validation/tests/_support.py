@@ -97,6 +97,39 @@ def _sample_kwargs(**overrides):
 # --------------------------------------------------------------------------
 
 
+# The suite compares 126 parameters on four statistics each. A limit sized for one
+# comparison is the wrong size for 504 of them: at the 3.5 sigma TOLERANCES.md
+# derived, the expected number of spurious failures is 0.23 per run, so **one run in
+# five fails on nothing**. That is not a hypothetical -- it is what sent `tau` over
+# the line on an unrelated PR, on two families at once, while the same commit passed
+# on re-run.
+#
+# So the sigma is chosen family-wise: the probability that *any* of the 504
+# comparisons trips when both implementations are correct is held at 1 %.
+#
+# `tau` is always the first to go, and for a reason worth keeping in view: it is the
+# hierarchical scale, its ESS is the lowest in any family that has one, and MCSE on
+# an sd goes as 1/sqrt(2*ESS).
+PARITY_FAMILY_WISE_ALPHA = 0.01
+PARITY_COMPARISON_BUDGET = 504
+PER_COMPARISON_SIGMA_BEFORE = 3.5
+PARITY_SIGMA = 4.27
+
+# The per-comparison derivation TOLERANCES.md sets out, kept verbatim so the
+# family-wise factor is visibly a *scaling* of it rather than a new set of numbers
+# picked to make the suite quiet. `test_tolerance_sizing.py` asserts the relation.
+TOLERANCE_BASELINE = {
+    "F7 conjugate_anomaly": {"mean": 0.05, "sd": 0.05, "quantile": 0.09},
+    "F3 pooled_gaussian": {"mean": 0.07, "sd": 0.07, "quantile": 0.12},
+    "F8 varying_variance_gaussian": {"mean": 0.09, "sd": 0.06, "quantile": 0.17},
+    "F1 hier_negbin": {"mean": 0.11, "sd": 0.08, "quantile": 0.23},
+    "F4 payment_delay": {"mean": 0.10, "sd": 0.08, "quantile": 0.20},
+    "F6 hier_elasticity": {"mean": 0.13, "sd": 0.10, "quantile": 0.26},
+    "F2 censored_aft (vs Laplace)": {"mean": 0.02, "sd": 0.02, "quantile": 0.04},
+    "F5 payer_alive (vs Laplace)": {"mean": 0.02, "sd": 0.02, "quantile": 0.04},
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class Tolerance:
     """A tolerance triple, in units documented in TOLERANCES.md.
@@ -118,7 +151,7 @@ class Tolerance:
 # (ESS ~= the raw draw count). Combined MCSE is ~0.012 sd on a mean and ~0.026
 # sd on a 5%/95% endpoint; the numbers below are roughly 3.5x that. See
 # TOLERANCES.md for the derivation and the measured margins.
-F7_TOL = Tolerance(mean=0.05, sd=0.05, quantile=0.09, label="F7 conjugate_anomaly")
+F7_TOL = Tolerance(mean=0.061, sd=0.061, quantile=0.110, label="F7 conjugate_anomaly")
 
 # F3's grouped posterior has a ridge-identified intercept/group-effect block, so
 # NUTS autocorrelation is materially higher and the reference MCSE roughly
@@ -126,27 +159,27 @@ F7_TOL = Tolerance(mean=0.05, sd=0.05, quantile=0.09, label="F7 conjugate_anomal
 # deficit documented in test_parity_f3.py -- that deficit is measured directly
 # rather than caught here, because a tolerance tight enough to catch it would
 # flake on the panel's own Monte Carlo error.
-F3_TOL = Tolerance(mean=0.07, sd=0.07, quantile=0.12, label="F3 pooled_gaussian")
+F3_TOL = Tolerance(mean=0.086, sd=0.086, quantile=0.147, label="F3 pooled_gaussian")
 
 # --- The NUTS-served families. Both sides are Markov chains, so the floor is
 # sd/sqrt(ESS) on each side with ESS *measured* (see TOLERANCES.md for the
 # arithmetic and the measured ESS these were derived from).
-F8_TOL = Tolerance(mean=0.09, sd=0.06, quantile=0.17, label="F8 varying_variance_gaussian")
-F1_TOL = Tolerance(mean=0.11, sd=0.08, quantile=0.23, label="F1 hier_negbin")
+F8_TOL = Tolerance(mean=0.110, sd=0.074, quantile=0.208, label="F8 varying_variance_gaussian")
+F1_TOL = Tolerance(mean=0.135, sd=0.098, quantile=0.281, label="F1 hier_negbin")
 
 # F4 sits between F8 and F1. Its `tau` runs through the same intercept/offset
 # ridge, but with only six segments there are fewer coordinates in it, and the
 # Gamma likelihood is better conditioned than the negative binomial's -- the
 # dispersion enters the log-density through `lnGamma` rather than through a
 # `(y + phi) log(phi + mu)` that couples it to every mean.
-F4_TOL = Tolerance(mean=0.10, sd=0.08, quantile=0.20, label="F4 payment_delay")
+F4_TOL = Tolerance(mean=0.122, sd=0.098, quantile=0.244, label="F4 payment_delay")
 
 # F6 is the loosest of the NUTS-served set, and deliberately. It carries *two*
 # pooling scales rather than one, so there are two ridges rather than one, and
 # the `-exp` transform on the elasticity means the per-segment coefficients are
 # a nonlinear function of coordinates that are themselves poorly conditioned.
 # Measured ESS on `tau` is the binding constraint; see TOLERANCES.md.
-F6_TOL = Tolerance(mean=0.13, sd=0.10, quantile=0.26, label="F6 hier_elasticity")
+F6_TOL = Tolerance(mean=0.159, sd=0.122, quantile=0.318, label="F6 hier_elasticity")
 
 # --- The Laplace-served families. These carry *two* tolerances each, because
 # there are two different questions and one number cannot answer both.
@@ -162,9 +195,9 @@ F6_TOL = Tolerance(mean=0.13, sd=0.10, quantile=0.26, label="F6 hier_elasticity"
 # an approximation, so this comparison can never be tight, and pretending
 # otherwise would mean loosening the algebra gate to accommodate it. It is
 # derived from the *measured* approximation error rather than from Monte Carlo.
-F2_EXACT_TOL = Tolerance(mean=0.02, sd=0.02, quantile=0.04, label="F2 censored_aft (vs Laplace)")
+F2_EXACT_TOL = Tolerance(mean=0.025, sd=0.025, quantile=0.049, label="F2 censored_aft (vs Laplace)")
 F2_TOL = Tolerance(mean=0.12, sd=0.05, quantile=0.26, label="F2 censored_aft")
-F5_EXACT_TOL = Tolerance(mean=0.02, sd=0.02, quantile=0.04, label="F5 payer_alive (vs Laplace)")
+F5_EXACT_TOL = Tolerance(mean=0.025, sd=0.025, quantile=0.049, label="F5 payer_alive (vs Laplace)")
 F5_TOL = Tolerance(mean=0.15, sd=0.11, quantile=0.38, label="F5 payer_alive")
 
 # Every tolerance the suite defines, so conftest's margin report does not have to
