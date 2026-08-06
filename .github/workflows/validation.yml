@@ -115,7 +115,12 @@ jobs:
         working-directory: validation
         env:
           ANOFOX_BAYES_EXTENSION: ${{ github.workspace }}/build/release/extension/anofox_bayes/anofox_bayes.duckdb_extension
-        run: uv run pytest -v
+          # Diagnostic: print the PyMC reference's own ESS/R-hat. `tau`'s reference sd
+          # differs by 12 % on some runners while the extension's is identical to five
+          # decimals, so the question is whether PyMC mixed worse there or converged
+          # somewhere else. Locally its tau ESS is 3026 bulk / 3383 tail.
+          ANOFOX_DUMP_REFERENCE_ESS: "1"
+        run: uv run pytest -v -s
 
       - name: Upload the built extension on failure
         if: failure()

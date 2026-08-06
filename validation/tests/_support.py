@@ -433,6 +433,10 @@ def reference_summaries(idata, var_names: list[str]) -> dict[str, Summary]:
     lo_col = next(c for c in table.columns if c.endswith("_lb"))
     hi_col = next(c for c in table.columns if c.endswith("_ub"))
 
+    import os as _os
+    if _os.environ.get("ANOFOX_DUMP_REFERENCE_ESS"):
+        print("\n--- PyMC reference diagnostics ---")
+        print(table[["mean", "sd", "ess_bulk", "ess_tail", "r_hat"]].to_string())
     bad = table[(table["ess_bulk"] < MIN_ESS) | (table["ess_tail"] < MIN_ESS) | (table["r_hat"] > MAX_RHAT)]
     if len(bad):
         raise AssertionError(
