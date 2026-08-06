@@ -43,9 +43,62 @@ F3 panel.
 ## The chosen values
 
 ```python
-F7_TOL = Tolerance(mean=0.05, sd=0.05, quantile=0.09)   # conjugate_anomaly
-F3_TOL = Tolerance(mean=0.07, sd=0.07, quantile=0.12)   # pooled_gaussian
+F7_TOL = Tolerance(mean=0.061, sd=0.061, quantile=0.110)   # conjugate_anomaly
+F3_TOL = Tolerance(mean=0.086, sd=0.086, quantile=0.147)   # pooled_gaussian
 ```
+
+Every number below is quoted as its **per-comparison** derivation -- the 3.5-4x MCSE
+figure -- and the shipped constant is that value scaled by the family-wise factor in
+the next section. `tests/test_tolerance_sizing.py` asserts the relation, so the two
+cannot drift.
+
+## The factor the per-comparison derivation was missing
+
+A 3.5-sigma limit is the right size for **one** comparison. This suite makes 504 of
+them -- 126 parameters on four statistics each -- and applies the limit to every one.
+
+At 3.5 sigma the two-sided per-comparison probability is `4.65e-4`, so the expected
+number of failures when both implementations are correct is
+
+```text
+504 x 4.65e-4 = 0.23 per run   ->   P(at least one) = 21%
+```
+
+**One run in five failed on nothing.** That is not a derivation detail; it is a CI
+that cries wolf often enough to be ignored, which is the failure mode this repository
+keeps finding elsewhere. It was diagnosed the hard way: an unrelated submodule bump
+went red on `tau` in two families at once, the identical commit passed on re-run, and
+three local runs at the same seed reproduced bit-identically -- so the harness was
+deterministic and the gate was simply too tight for the number of times it is applied.
+
+`tau` goes first every time, and structurally so: it is the hierarchical scale, its
+ESS is the lowest in any family that has one, and `MCSE(sd) = sd / sqrt(2 ESS)`.
+
+So the sigma is chosen **family-wise**. Holding the probability that *any* of the 504
+comparisons trips at 1 %:
+
+```text
+alpha' = 0.01 / 504 = 1.98e-5   ->   z = 4.27
+```
+
+which is `4.27 / 3.5 = 1.22x` the per-comparison values. That factor is applied to
+every Monte-Carlo-derived tolerance.
+
+**It is not applied to `F2_TOL` or `F5_TOL`.** Those are approximation budgets rather
+than Monte-Carlo floors -- they measure how far a Laplace posterior sits from NUTS,
+which is a systematic quantity that does not shrink with draws and is not subject to
+the multiplicity argument. Widening them would weaken a real gate to fix a different
+problem.
+
+**What this costs.** A 22 % wider limit still detects any systematic disagreement
+larger than about a tenth of a posterior sd, and the negative controls -- a flattened
+catalogue, a scrambled response, permuted recency, permuted within-segment price --
+still breach by orders of magnitude. Measured after the change, the worst margin
+across all 504 comparisons is **61.8 %** of tolerance, on `tau`; before it was 75.7 %.
+
+**What would change this.** Adding a family raises the comparison count, and
+`test_the_comparison_budget_still_covers_what_the_suite_compares` fails rather than
+letting the sigma be inherited silently.
 
 ### F7 `conjugate_anomaly` — mean 0.05 sd, sd 5 %, quantiles 0.09 sd
 
