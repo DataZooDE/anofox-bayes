@@ -104,6 +104,15 @@ else()
     set(ANOFOX_TELEMETRY_ENABLED OFF)
 endif()
 
+# Feedback banner (header-only). The flag follows ANOFOX_TELEMETRY_ENABLED --
+# on MinGW there is no telemetry.hpp to include. Global include path rather
+# than target propagation, matching the rest of the anofox fleet.
+set(DATAZOO_BANNER_TELEMETRY ${ANOFOX_TELEMETRY_ENABLED} CACHE BOOL "" FORCE)
+set(DATAZOO_BANNER_TELEMETRY_INCLUDE_DIR
+    ${CMAKE_CURRENT_SOURCE_DIR}/posthog-telemetry/include CACHE PATH "" FORCE)
+add_subdirectory(datazoo-banner)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/datazoo-banner/include)
+
 include_directories(src/include)
 
 # Extension source files

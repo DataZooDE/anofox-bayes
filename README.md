@@ -241,6 +241,23 @@ SET anofox_telemetry_enabled = false;
 
 Details in [TELEMETRY.md](TELEMETRY.md).
 
+## Feedback
+
+If a fit misbehaves or a posterior looks wrong, please
+[open an issue](https://github.com/DataZooDE/anofox-bayes/issues). Inference quality
+depends on real data shapes we cannot reproduce from synthetic draws, so a report with
+your model and data shape is the fastest path to a fix. Errors from `anofox_bayes_fit`
+end with that link.
+
+Note that the link is appended to the message a human reads; `BayesError` itself, which
+agents branch on, is unchanged.
+
+If it saved you time, a star on the repo helps other people find it.
+
+The first time you load the extension in an interactive terminal each day, a small
+banner says the same thing. It never prints when output is piped, in notebooks, or in
+CI. Silence it with `SET datazoo_banner = false;` or `DATAZOO_NO_BANNER=1`.
+
 ## License
 
 [Business Source License 1.1](LICENSE). Production use is permitted; offering the

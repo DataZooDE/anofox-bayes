@@ -1,0 +1,38 @@
+# name: test/sql/feedback.test
+# description: The feedback banner's two contracts: errors from the fit entry
+#              point carry an issue link, and the banner never writes anything
+#              under a test runner.
+# group: [sql]
+
+require anofox_bayes
+
+# --- The fit runs in the finalize phase, not in bind or init, so the guard has
+#     to sit on the in-out functions -- guarding only bind/init left the footer
+#     off every real failure. This asserts the path that actually errors.
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT 1 AS x), 'not_a_family', NULL);
+----
+https://github.com/DataZooDE/anofox-bayes/issues
+
+# The link is appended, not substituted. The diagnostic here comes from the Rust
+# core and is machine-readable by design (it names the whole catalog so a caller
+# can repair its own request) -- that content must survive untouched.
+statement error
+SELECT * FROM anofox_bayes_fit((SELECT 1 AS x), 'not_a_family', NULL);
+----
+unknown model family 'not_a_family'
+
+# --- Errors DuckDB raises before dispatch are deliberately NOT annotated.
+statement error
+SELECT * FROM anofox_bayes_fit();
+----
+Binder Error
+
+# --- The opt-out knob exists and is settable. The banner itself cannot be
+#     observed from a .test file at all -- stderr is not a tty here, which is
+#     precisely the guarantee that keeps this suite's expected output unchanged.
+statement ok
+SET datazoo_banner = false;
+
+statement ok
+SET datazoo_banner = true;

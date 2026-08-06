@@ -12,6 +12,7 @@
 #include "../include/anofox_bayes_ffi.h"
 #include "../include/config_json.hpp"
 #include "telemetry.hpp"
+#include "anofox_bayes_banner.hpp"
 
 namespace duckdb {
 
@@ -481,9 +482,13 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 
 void RegisterBayesFitFunction(ExtensionLoader &loader) {
 	TableFunction fit("anofox_bayes_fit", {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::ANY}, nullptr,
-	                  BayesFitBind, BayesFitInitGlobal);
-	fit.in_out_function = BayesFitInOut;
-	fit.in_out_function_final = BayesFitFinalize;
+	                  DATAZOO_GUARD(ANOFOX_BAYES_BANNER, BayesFitBind),
+	                  DATAZOO_GUARD(ANOFOX_BAYES_BANNER, BayesFitInitGlobal));
+	// The fit itself runs in the finalize phase (see RunFit), so that is where a
+	// core error actually surfaces -- guarding only bind/init left the footer off
+	// every real failure.
+	fit.in_out_function = DATAZOO_GUARD(ANOFOX_BAYES_BANNER, BayesFitInOut);
+	fit.in_out_function_final = DATAZOO_GUARD(ANOFOX_BAYES_BANNER, BayesFitFinalize);
 
 	// Registered as a single overload, not a set. DuckDB refuses to bind a function
 	// that has a TABLE parameter *and* multiple overloads ("this is not supported"),
