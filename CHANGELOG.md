@@ -7,6 +7,41 @@ tables persisted by a customer stay readable across extension upgrades.
 
 ## [Unreleased]
 
+### Changed — the F2 bridge takes its curvature from `anofox-statistics`
+
+`bridge.rs` loses **326 lines** and gains 136. What goes is a duplicate of work the
+upstream crate was already doing.
+
+- **`observed_information` walked every observation** rebuilding the AFT Hessian from
+  `AftDistribution`'s first two derivatives, and **`aligned_priors` re-implemented that
+  crate's private `build_penalty`** so a prior landed on the same coordinate. Both
+  existed for one reason: `fit_aft` computed the matrix and threw it away before
+  returning. `ROADMAP.md` §3.1b already conceded the point — *"roughly a third of the
+  work was assembling a matrix from public primitives that already existed as a private
+  local variable one crate over."*
+- **It reports both now.** `AftInference` carries the penalised observed information
+  and its inverse in design order (DataZooDE/anofox-statistics#120 and #126), so the
+  bridge reads them instead of re-deriving them. Its own `laplace::inference` call goes
+  too — the import is no longer needed at all.
+- **The deletion was licensed by measurement.**
+  `the_published_covariance_is_the_one_anofox_stats_core_reports` was written *first*
+  and shows the two matrices agreeing entry for entry to `SE_AGREEMENT_TOLERANCE`
+  across Weibull, lognormal and log-logistic, on a covariate held away from zero so the
+  off-diagonal was not incidentally zero.
+- **The seam is still checked**, and the check now means something different: not that
+  arithmetic done here is right, but that the pinned revision still means the same
+  thing by this likelihood. A revision that changed it fails loudly rather than
+  publishing a different posterior under the same name.
+- **Three tests were removed with their subject** — the finite-difference check on the
+  rebuilt Hessian and the two prior-alignment tests. What replaces them is not nothing:
+  `a_gaussian_prior_narrows_the_bridged_posterior_and_not_only_the_mode` is now what
+  proves the curvature handed over is the *penalised* one, since a likelihood-only
+  curvature would move the mode and leave the width alone.
+
+Every refusal path was verified individually rather than by a suite total, because
+three of them originated in the deleted code: an empty cohort, a rank-deficient design,
+and a failed mode search each still arrive as the verdict they did before.
+
 ### Changed — `model_id` is added once per chunk instead of once per row
 
 A 12 % cut in the time to materialise a draws table, measured on a 5 000-group

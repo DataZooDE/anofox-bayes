@@ -65,7 +65,7 @@ libc = "0.2"
 # AFT likelihood and the curvature primitive that a bridged posterior is built from,
 # so a silent upstream change would silently change customers' posteriors. Bumping it
 # is a deliberate act that must re-run the SBC suite and consider ALGORITHM_VERSION.
-anofox-stats-core = { git = "https://github.com/DataZooDE/anofox-statistics.git", rev = "26f236e0970ba5f6bee5482fc940401cac45109b" }
+anofox-stats-core = { git = "https://github.com/DataZooDE/anofox-statistics.git", rev = "b7bb49d78825cbec07fd7722652c4d874daf0af6" }
 
 [profile.release]
 lto = true
