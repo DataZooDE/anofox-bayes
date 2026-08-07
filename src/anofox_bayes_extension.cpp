@@ -5,6 +5,12 @@
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "telemetry.hpp"
+#include "anofox_bayes_banner.hpp"
+
+// Deliberately outside namespace duckdb: the banner library is DuckDB-agnostic
+// and the guard macro refers to this object from every guarded source file.
+const datazoo::BannerInfo ANOFOX_BAYES_BANNER {
+    "anofox_bayes", "0.1.0", "https://github.com/DataZooDE/anofox-bayes"};
 
 namespace duckdb {
 
@@ -86,6 +92,11 @@ void LoadInternal(ExtensionLoader &loader) {
 	RegisterDiagnosticAggregates(loader);
 	RegisterBayesFitFunction(loader);
 	RegisterBayesMacros(loader);
+
+	datazoo::RegisterBannerOption(loader);
+	// Last, so a load that fails earlier never advertises itself. Silent unless
+	// stderr is a terminal and the ~/.duckdb stamp is over a day old.
+	datazoo::ShowBanner(ANOFOX_BAYES_BANNER);
 }
 
 void AnofoxBayesExtension::Load(ExtensionLoader &loader) {
