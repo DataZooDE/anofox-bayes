@@ -203,15 +203,40 @@ pub fn fit(family_id: &str, cfg: &Config, data: &DataView) -> BayesResult<Fit> {
         model.unready_groups(),
     )?;
 
-    Ok(grade(posterior, readiness, &Thresholds::default()))
+    Ok(grade(
+        posterior,
+        readiness,
+        &Thresholds::default(),
+        model.fixed_params(),
+    ))
 }
 
 /// Combine the structural verdict with the sampled diagnostics into a final status.
-fn grade(mut posterior: Posterior, readiness: Readiness, thresholds: &Thresholds) -> Fit {
+fn grade(
+    mut posterior: Posterior,
+    readiness: Readiness,
+    thresholds: &Thresholds,
+    fixed: &[&'static str],
+) -> Fit {
     let diags = diagnostics::diagnose(&posterior);
     let mut reasons = readiness.reasons;
 
-    let failing: Vec<&ParamDiagnostics> = diags.iter().filter(|d| !d.passes(thresholds)).collect();
+    // A parameter the family declares it does not estimate is skipped, because its
+    // diagnostics describe a constant rather than a chain: `rhat` is undefined and
+    // `ess` is zero however well the fit went. `censored_aft` under
+    // `dist: 'exponential'` is the case -- the scale is 1 by the definition of the
+    // distribution, and grading the fit on it condemned posteriors whose coefficients
+    // were entirely sound.
+    //
+    // Narrow on purpose. The exemption comes from the family's declaration, never from
+    // the draws: a stuck sampler also produces identical values, and `ess` reporting
+    // zero for it is the behaviour that stops it passing an `ess >= 400` gate. Reading
+    // "constant" off the values would hand a stuck chain the same pass.
+    let failing: Vec<&ParamDiagnostics> = diags
+        .iter()
+        .filter(|d| !fixed.contains(&d.param.as_str()))
+        .filter(|d| !d.passes(thresholds))
+        .collect();
     let mut sampling_status = FitStatus::Converged;
     if !failing.is_empty() {
         for d in &failing {
@@ -774,6 +799,86 @@ mod tests {
     /// says so is the status. Graded here on a synthetic posterior rather than by
     /// hunting for a model that diverges, so the rule is pinned exactly and cannot
     /// stop being tested when the sampler improves.
+    /// **The exemption is a scope, not an off switch.**
+    ///
+    /// A declared-fixed parameter stops condemning the fit; anything else with the
+    /// same dead diagnostics still does. Asserted on `grade` directly, with two
+    /// parameters that are both constant, because the interesting case is telling
+    /// them apart -- from the draws alone they are indistinguishable, which is exactly
+    /// why the declaration exists.
+    #[test]
+    fn declaring_a_parameter_fixed_exempts_that_parameter_and_no_other() {
+        let meta = ModelMeta {
+            model_id: "fixedparam".to_string(),
+            family: crate::types::FamilyCode::CensoredAft,
+            engine: EngineKind::Laplace,
+            status: FitStatus::Converged,
+            seed: 1,
+            n_obs: 100,
+            n_groups: 1,
+            n_groups_unready: 0,
+            sample_from: crate::types::SampleFrom::Posterior,
+        };
+        let params = vec![
+            crate::draws::ParamName::global("sigma").unwrap(),
+            crate::draws::ParamName::global("beta").unwrap(),
+        ];
+        // Both parameters never move: ess 0, rhat undefined, for both.
+        let values: Vec<f64> = (0..2000).flat_map(|_| [1.0, 2.0]).collect();
+        let post = || {
+            Posterior::new(
+                meta.clone(),
+                params.clone(),
+                2,
+                1000,
+                values.clone(),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+
+        let none = grade(post(), Readiness::ready(), &Thresholds::default(), &[]);
+        assert_eq!(
+            none.posterior.meta.status,
+            FitStatus::Degenerate,
+            "with nothing declared fixed, a dead parameter must condemn the fit"
+        );
+
+        let sigma_fixed = grade(
+            post(),
+            Readiness::ready(),
+            &Thresholds::default(),
+            &["sigma"],
+        );
+        assert_eq!(
+            sigma_fixed.posterior.meta.status,
+            FitStatus::Degenerate,
+            "exempting `sigma` must not rescue a fit whose `beta` is also dead"
+        );
+        assert!(
+            sigma_fixed.reasons.iter().all(|r| !r.contains("'sigma'")),
+            "the exempted parameter must not be reported: {:?}",
+            sigma_fixed.reasons
+        );
+        assert!(
+            sigma_fixed.reasons.iter().any(|r| r.contains("'beta'")),
+            "the parameter that is *not* exempt must still be named: {:?}",
+            sigma_fixed.reasons
+        );
+
+        let both_fixed = grade(
+            post(),
+            Readiness::ready(),
+            &Thresholds::default(),
+            &["sigma", "beta"],
+        );
+        assert_eq!(
+            both_fixed.posterior.meta.status,
+            FitStatus::Converged,
+            "with every dead parameter declared fixed there is nothing left to condemn"
+        );
+    }
+
     #[test]
     fn a_single_divergence_downgrades_the_fit_and_says_why() {
         let params = vec![crate::draws::ParamName::global("mu").unwrap()];
@@ -804,7 +909,7 @@ mod tests {
                 .collect();
             let post = Posterior::new(meta.clone(), params.clone(), 2, 1000, values.clone(), stats)
                 .unwrap();
-            grade(post, Readiness::ready(), &Thresholds::default())
+            grade(post, Readiness::ready(), &Thresholds::default(), &[])
         };
 
         let clean = graded(0);
