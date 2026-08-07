@@ -154,21 +154,36 @@ refusal machinery exists to prevent: a fit that cannot answer must say so **on a
   input. Fixed by spelling out the empty case, as `conjugate_anomaly` already does.
   Pinned by `a_fit_over_no_usable_rows_refuses_rather_than_reporting_converged`.
 
-### Known — `dist: 'exponential'` is graded `degenerate` on a good fit
+### Fixed — `dist: 'exponential'` no longer condemns itself on a scale it never estimates
 
-Reported rather than fixed, because the fix is a contract decision rather than a patch.
-Under `exponential` the AFT scale is **held at 1 by the definition of the
-distribution**, so its posterior has a standard deviation of exactly zero. `ess` returns
-`0.0` for a parameter that never moves — deliberately, so that a genuinely stuck sampler
-cannot sail through an `ess >= 400` gate — and the fit is then graded `degenerate` even
-though every coefficient is estimated correctly and the other three distributions
-converge on the same data.
+Reported as a known limitation before, on the grounds that the fix was a contract
+decision rather than a patch. The decision is taken here, and it is the narrower of
+the two options that were on the table.
 
-Distinguishing "fixed by construction" from "did not move" needs a notion of a
-structurally-fixed parameter that the crate does not currently have, and either answer
-(omit `sigma` from the draws for this `dist`, or exempt it from the gate) changes
-something a SQL consumer joins on. Until then, `weibull` with a `sigma` near 1 is the
-working alternative.
+- **The defect.** Under `exponential` the AFT scale is held at 1 *by the definition of
+  the distribution*, so its posterior standard deviation is exactly zero and `ess`
+  returns `0.0`. The gate saw a dead parameter and graded the whole fit `degenerate`
+  while every coefficient was estimated correctly and the other three distributions
+  converged on the same data. An agent reading `anofox_bayes_is_actionable` was told to
+  ignore a fit that was fine.
+- **Not fixed by looking at the draws.** `ess` returning zero for a parameter that never
+  moves is deliberate — it is what stops a genuinely stuck sampler passing an
+  `ess >= 400` gate — and a stuck chain is indistinguishable from a constant one by its
+  values alone. Inferring "structurally fixed" from the draws would have handed the
+  stuck chain the same exemption.
+- **The family declares it instead.** `CompiledModel::fixed_params` names the parameters
+  a model reports but does not estimate; `censored_aft` returns `sigma` under
+  `exponential` and nothing under the other three, so a scale that genuinely fails to
+  mix still condemns the fit it belongs to. The default is empty, so a family that
+  declares nothing gets no exemption.
+- **Nothing moves in the draws contract.** `sigma` is still published, still exactly 1,
+  so a consumer joining on `param = 'sigma'` need not branch on `dist` — which is why
+  the alternative, omitting the row, was rejected.
+- **The scope is asserted, not described.**
+  `declaring_a_parameter_fixed_exempts_that_parameter_and_no_other` grades a posterior
+  with two dead parameters three ways: exempting neither condemns, exempting `sigma`
+  still condemns for `beta` and names only `beta`, exempting both converges.
+
 ### Changed — NUTS runs its chains in parallel
 
 A four-chain fit used one core and left the rest of the machine idle. Chains are
