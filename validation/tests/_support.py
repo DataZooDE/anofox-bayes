@@ -75,7 +75,18 @@ PYMC_SEED = 20260801
 
 # Below these the *reference* is not trustworthy and a "pass" would mean
 # nothing. Gate on the reference before comparing anything to it.
-MIN_ESS = 1_000
+# The floor the *reference* must clear to be allowed to referee anything.
+#
+# 2_000, not 1_000, and the difference is not cosmetic. At 1_000 a PyMC fit that had
+# mixed badly still passed this gate and was then used as truth: on F1 an
+# under-adapted reference reported `tau` with ESS 1_157 and an sd of 0.2396, against
+# 0.1871 from a well-mixed run of the same model -- a 28 % swing that the parity test
+# then charged to the extension.
+#
+# With every hierarchical reference adapting as hard as the model it references, the
+# lowest reference ESS anywhere in this suite is 3_208 bulk / 4_690 tail, so this floor
+# has room to spare and still rejects the band where an sd estimate is not trustworthy.
+MIN_ESS = 2_000
 MAX_RHAT = 1.01
 
 
@@ -1592,5 +1603,12 @@ def pymc_f1(frame: pd.DataFrame, y_col: str, group_col: str):
         pm.NegativeBinomial("obs", mu=pt.exp(intercept + u[group_index]), alpha=phi, observed=y)
         # The family does not override nuts-rs's 0.8, so the reference does not
         # override PyMC's either.
-        idata = pm.sample(**_sample_kwargs(target_accept=0.8))
+        # 0.95, matching the family it references. This was the last hierarchical
+        # reference left on PyMC's 0.8 default, and the mismatch mattered: the
+        # extension adapts to 0.95 *because* 0.8 mixes badly on a non-centred scale
+        # parameter, so the referee was sampling the same posterior less carefully
+        # than the thing it was judging. Measured across three seeds, `tau`'s
+        # reference sd moved 0.187 / 0.194 / 0.240 at 0.8 -- a 28 % spread, with the
+        # outlier's ESS down at 1_157 -- and 0.1904 / 0.1910 / 0.1928 at 0.95.
+        idata = pm.sample(**_sample_kwargs(target_accept=0.95))
     return idata
