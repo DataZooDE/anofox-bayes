@@ -49,7 +49,7 @@ dependencies = [
 [[package]]
 name = "anofox-stats-core"
 version = "0.1.0"
-source = "git+https://github.com/DataZooDE/anofox-statistics.git?rev=26f236e0970ba5f6bee5482fc940401cac45109b#26f236e0970ba5f6bee5482fc940401cac45109b"
+source = "git+https://github.com/DataZooDE/anofox-statistics.git?rev=b7bb49d78825cbec07fd7722652c4d874daf0af6#b7bb49d78825cbec07fd7722652c4d874daf0af6"
 dependencies = [
  "anofox-regression",
  "anofox-statistics",

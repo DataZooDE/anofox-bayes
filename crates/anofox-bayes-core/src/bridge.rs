@@ -13,31 +13,35 @@
 //!   ─────────────────                    ────────────
 //!   fit_aft  ──▶ mode (beta, log sigma)
 //!            ──▶ converged / refusal  ──▶ FitStatus          (refusal mapping)
-//!   AftDistribution derivatives       ──▶ observed information at the mode
-//!   laplace::inference                ──▶ FULL covariance    (cross-check)
+//!   AftInference.information          ──▶ observed information at the mode
+//!   AftInference.vcov                 ──▶ FULL covariance    (cross-check)
 //!                                     ──▶ GaussianBlock      ──▶ LaplaceEngine
 //! ```
 //!
-//! ## Why the information matrix is reassembled here
+//! ## Where the curvature comes from
 //!
-//! `glm_engine::laplace::LaplaceInference` holds `pub vcov: Mat<f64>` — the full
-//! `p × p` covariance — but `fit_aft` does not return it. `AftInference` keeps only
-//! slices of the *diagonal* (`std_errors`, `z_values`, `ci_lower`, …), so the
-//! off-diagonal block is discarded before the result leaves the crate, in-process just
-//! as much as over SQL.
+//! From `fit_aft`, which computes it on the way to the standard errors it reports.
+//! `AftInference` publishes both the penalised observed information at the mode and
+//! its inverse, in design order — intercept, then coefficients, then `log sigma`.
 //!
-//! It is nevertheless reachable, because the pieces the matrix is *made of* are all
-//! public: [`AftDistribution`] exposes `log_density`, `log_survival` and their first
-//! two derivatives, `glm_engine::laplace::inference` is public and returns the full
-//! matrix, and `PriorSpec::precision` gives the prior's quadratic contribution. So the
-//! observed information is reassembled at the mode `fit_aft` returned, from the same
-//! primitives `fit_aft` itself used, and handed to statistics' own inference routine.
+//! It did not always. Until `anofox-statistics` reported them, this module rebuilt
+//! the matrix: `observed_information` walked every observation accumulating the
+//! Hessian from [`AftDistribution`]'s first two derivatives, and `aligned_priors`
+//! re-implemented that crate's private `build_penalty` so a prior landed on the same
+//! coordinate it would have. Around 130 lines existed for one reason — the result was
+//! computed one crate over and discarded before it left.
 //!
-//! **That reassembly is checked, not trusted.** The diagonal of the covariance it
-//! produces must reproduce the `std_errors` `fit_aft` reported, to
-//! [`SE_AGREEMENT_TOLERANCE`]; measured, it agrees to the last bit. A mismatch means
-//! this crate and the pinned revision of `anofox-stats-core` no longer agree about
-//! what the likelihood is, and that is an error rather than a number to publish.
+//! Deleting it was licensed by measurement rather than by inspection:
+//! `the_published_covariance_is_the_one_anofox_stats_core_reports` showed the two
+//! matrices agreeing entry for entry to [`SE_AGREEMENT_TOLERANCE`] across all three
+//! distributions, on a covariate held away from zero so the off-diagonal — the part a
+//! diagonal-only surface loses — was not incidentally zero.
+//!
+//! **The seam is still checked.** The diagonal of the covariance handed over must
+//! reproduce the standard errors reported alongside it. That is no longer a check on
+//! arithmetic performed here; it is the assertion that the pinned revision still means
+//! the same thing by this likelihood, and it fails loudly rather than publishing a
+//! different posterior under the same name.
 //!
 //! ## Why the full matrix and not the diagonal
 //!
@@ -51,7 +55,6 @@
 //! merely wrong.
 
 use anofox_stats_core::errors::StatsError;
-use anofox_stats_core::models::glm_engine::laplace;
 use anofox_stats_core::models::{fit_aft, AftDistribution, AftOptions, AftResult};
 use anofox_stats_core::types::{PriorSpec, VcovType};
 use faer::Mat;
@@ -188,64 +191,69 @@ pub fn fit_censored_aft(req: &CensoredAftRequest) -> BayesResult<Bridged> {
         ))));
     }
 
-    let information = observed_information(req, &mode, fit.core.scale, fit_scale);
+    // The curvature and its inverse come from `fit_aft`, which computed both on the
+    // way to the standard errors it reports. This used to be reassembled here --
+    // `observed_information` walked every row rebuilding the Hessian from
+    // `AftDistribution`'s derivatives, and `aligned_priors` re-implemented the
+    // crate's private `build_penalty` so a prior landed on the same coordinate --
+    // for one reason only: the result was computed there and thrown away.
+    //
+    // `the_published_covariance_is_the_one_anofox_stats_core_reports` is what
+    // licensed removing it: the two matrices agreed entry for entry to
+    // `SE_AGREEMENT_TOLERANCE` on an off-centre covariate, where the off-diagonal is
+    // the part a diagonal-only surface loses.
+    let Some(inference) = fit.inference.as_ref() else {
+        return Ok(Bridged::Refused(Readiness::degenerate(
+            "anofox-stats-core reported no inference for the censored AFT fit, so \
+             there is no curvature at the mode to build a posterior from"
+                .to_string(),
+        )));
+    };
+    let (Some(information), Some(covariance)) =
+        (inference.information.as_ref(), inference.vcov.as_ref())
+    else {
+        return Ok(Bridged::Refused(Readiness::degenerate(
+            "anofox-stats-core reported inference without the curvature; the pinned \
+             revision no longer publishes what this bridge samples from"
+                .to_string(),
+        )));
+    };
     if !(0..n_params).all(|i| (0..n_params).all(|j| information[(i, j)].is_finite())) {
         return Ok(Bridged::Refused(Readiness::degenerate(
             "the curvature at the censored AFT mode is not finite".to_string(),
         )));
     }
-
-    let inactive = vec![false; n_params];
-    let inference = laplace::inference(
-        &mode,
-        &information,
-        None,
-        1.0,
-        0.95,
-        VcovType::Laplace,
-        &inactive,
-    );
-    let inference = match inference {
-        Ok(i) => i,
-        // `invert_spd` refusing means the information is not positive definite: the
-        // point found is not an interior maximum, so a covariance derived from it is
-        // not a posterior. That is a refusal, not an error.
-        Err(e) => {
-            return Ok(Bridged::Refused(Readiness::degenerate(format!(
-                "the observed information at the censored AFT mode is not invertible \
-                 ({e}); the posterior is flat in at least one direction"
-            ))))
-        }
-    };
+    let information = information.clone();
 
     // Degeneracy is decided before agreement is, and deliberately so. A rank-deficient
     // design leaves `invert_spd` returning a matrix full of non-finite entries rather
     // than failing outright, and both crates then report `NaN` — they *agree*, and the
     // agreement is worthless. Refusing first means the cross-check below only ever
     // compares numbers, so a `NaN == NaN` can never be mistaken for a passing check.
-    let degenerate = inference
-        .std_errors
-        .iter()
-        .any(|s| !s.is_finite() || *s <= 0.0)
-        || (0..n_params).any(|i| (0..n_params).any(|j| !inference.vcov[(i, j)].is_finite()));
+    let std_errors: Vec<f64> = (0..n_params).map(|j| covariance[(j, j)].sqrt()).collect();
+    let degenerate = std_errors.iter().any(|s| !s.is_finite() || *s <= 0.0)
+        || (0..n_params).any(|i| (0..n_params).any(|j| !covariance[(i, j)].is_finite()));
     if degenerate {
         return Ok(Bridged::Refused(Readiness::degenerate(format!(
-            "the censored AFT posterior has no usable covariance ({:?}); the design is \
-             rank deficient at the mode, so the curvature there is not a posterior",
-            inference.std_errors
+            "the censored AFT posterior has no usable covariance ({std_errors:?}); the \
+             design is rank deficient at the mode, so the curvature there is not a \
+             posterior"
         ))));
     }
 
-    // The reassembly is checked against the numbers statistics itself reported.
+    // The seam is still checked, and it is worth keeping now that the matrix is no
+    // longer ours: this asserts that the covariance the pinned revision hands over is
+    // the one summarised by the standard errors it also reports. A revision that
+    // changed what it means by this likelihood would fail here rather than publish a
+    // different posterior under the same name.
     let reported = statistics_standard_errors(&fit, n_beta, req.intercept, fit_scale);
-    for (j, (ours, theirs)) in inference.std_errors.iter().zip(reported.iter()).enumerate() {
+    for (j, (ours, theirs)) in std_errors.iter().zip(reported.iter()).enumerate() {
         let scale = theirs.abs().max(1e-300);
         if !theirs.is_finite() || (ours - theirs).abs() > SE_AGREEMENT_TOLERANCE * scale {
             return Err(BayesError::Internal(format!(
-                "the reassembled observed information disagrees with anofox-stats-core \
-                 at coordinate {j}: standard error {ours} against the reported {theirs}. \
-                 The pinned revision of anofox-stats-core no longer computes the \
-                 likelihood this bridge reassembles"
+                "anofox-stats-core's covariance disagrees with its own standard errors \
+                 at coordinate {j}: {ours} against the reported {theirs}. The pinned \
+                 revision no longer means the same thing by this likelihood"
             )));
         }
     }
@@ -253,8 +261,8 @@ pub fn fit_censored_aft(req: &CensoredAftRequest) -> BayesResult<Bridged> {
     Ok(Bridged::Fitted(Box::new(BridgedGaussian {
         mode,
         information,
-        covariance: inference.vcov,
-        std_errors: inference.std_errors,
+        covariance: covariance.clone(),
+        std_errors,
         scale: fit.core.scale,
         fit_scale,
         n_obs: fit.core.n_observations,
@@ -288,119 +296,6 @@ fn statistics_standard_errors(
         out.push(inf.log_scale_std_error.unwrap_or(f64::NAN));
     }
     out
-}
-
-/// The observed information at the mode: `-d² log posterior / dtheta²`.
-///
-/// Assembled from `anofox-stats-core`'s own per-observation derivatives, in the
-/// parameterisation its Newton search uses. With `z = (log t - x'beta) / sigma`, and
-/// `u`, `v` the first two derivatives with respect to `z` of the term this row
-/// contributes — the log density when the event was observed, the log survival when
-/// the row is censored:
-///
-/// ```text
-///   d²l/dbeta_j dbeta_k =  v x_j x_k / sigma²
-///   d²l/dbeta_j dlog s  =  x_j (v z + u) / sigma
-///   d²l/dlog s²         =  v z² + u z
-/// ```
-///
-/// A Gaussian prior subtracts its precision from the corresponding diagonal entry.
-/// There is no log-Jacobian term: `log sigma` is the coordinate the likelihood is
-/// already written in and the prior is declared on it directly, so no change of
-/// variables happens anywhere in this function. `the_bridged_log_density_matches_the_
-/// closed_form_censored_weibull` checks the density itself rather than inferring its
-/// correctness from agreement elsewhere.
-fn observed_information(
-    req: &CensoredAftRequest,
-    mode: &[f64],
-    sigma: f64,
-    fit_scale: bool,
-) -> Mat<f64> {
-    let n = req.time.len();
-    let n_features = req.x.len();
-    let int_off = usize::from(req.intercept);
-    let p = n_features + int_off;
-    let n_params = p + usize::from(fit_scale);
-    let dist = req.dist;
-
-    let mut hess: Mat<f64> = Mat::zeros(n_params, n_params);
-    let mut row = vec![0.0; p];
-
-    for i in 0..n {
-        if req.intercept {
-            row[0] = 1.0;
-        }
-        for (c, col) in req.x.iter().enumerate() {
-            row[c + int_off] = col[i];
-        }
-
-        let eta: f64 = (0..p).map(|j| row[j] * mode[j]).sum();
-        let z = (req.time[i].ln() - eta) / sigma;
-        let (u, v) = if req.event[i] == 1.0 {
-            (dist.d_log_density(z), dist.dd_log_density(z))
-        } else {
-            (dist.d_log_survival(z), dist.dd_log_survival(z))
-        };
-
-        for j in 0..p {
-            for k in 0..p {
-                hess[(j, k)] += v * row[j] * row[k] / (sigma * sigma);
-            }
-            if fit_scale {
-                let cross = row[j] * (v * z + u) / sigma;
-                hess[(j, p)] += cross;
-                hess[(p, j)] += cross;
-            }
-        }
-        if fit_scale {
-            hess[(p, p)] += v * z * z + u * z;
-        }
-    }
-
-    // The prior's quadratic contribution, aligned exactly as `fit_aft` aligns it.
-    for (j, prior) in aligned_priors(&req.priors, p, req.intercept, n_features)
-        .iter()
-        .enumerate()
-    {
-        hess[(j, j)] -= prior.precision();
-    }
-
-    Mat::from_fn(n_params, n_params, |r, c| -hess[(r, c)])
-}
-
-/// Positionally align the caller's priors with the design columns.
-///
-/// Mirrors `anofox-stats-core`'s own private `build_penalty`: a list as long as the
-/// design carries an entry for the intercept, a list as long as the feature count does
-/// not. Getting this wrong would put a prior on the wrong coefficient, so it is
-/// pinned by `priors_align_with_the_design_the_same_way_statistics_aligns_them`.
-fn aligned_priors(
-    priors: &[PriorSpec],
-    n_beta: usize,
-    intercept: bool,
-    n_features: usize,
-) -> Vec<PriorSpec> {
-    let mut aligned = vec![PriorSpec::flat(); n_beta];
-    if priors.is_empty() {
-        return aligned;
-    }
-    let expected = n_features + usize::from(intercept);
-    let has_intercept_entry = intercept && priors.len() == expected;
-    if has_intercept_entry {
-        aligned[0] = priors[0];
-    }
-    let feature_priors = if has_intercept_entry {
-        &priors[1..]
-    } else {
-        priors
-    };
-    let off = usize::from(intercept);
-    for (j, p) in feature_priors.iter().enumerate() {
-        if j + off < n_beta {
-            aligned[j + off] = *p;
-        }
-    }
-    aligned
 }
 
 /// Map `anofox-stats-core`'s refusal vocabulary onto the draws contract's.
@@ -504,6 +399,24 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    //! Three tests were removed when the reassembly they exercised was.
+    //!
+    //! `the_bridged_log_density_matches_the_closed_form_censored_weibull` checked the
+    //! rebuilt Hessian against finite differences of a hand-written censored Weibull
+    //! density; `a_prior_adds_its_precision_to_exactly_one_diagonal_entry` and
+    //! `priors_align_with_the_design_the_same_way_statistics_aligns_them` checked that
+    //! a prior landed on the coordinate `build_penalty` would have put it on. All three
+    //! had `observed_information` or `aligned_priors` as their subject, and that
+    //! subject no longer exists -- the matrix is `anofox-stats-core`'s now, checked
+    //! there against its own derivatives.
+    //!
+    //! What replaces them is not nothing. `the_published_covariance_is_the_one_anofox_
+    //! stats_core_reports` pins the matrix we publish to the one upstream reports, and
+    //! `a_gaussian_prior_narrows_the_bridged_posterior_and_not_only_the_mode` is what
+    //! now proves the curvature we are handed is the *penalised* one: if upstream ever
+    //! returned the likelihood's curvature instead, a prior would move the mode and
+    //! leave the width alone, and that test would fail.
+
     use super::testing::survival_fixture;
     use super::*;
     use crate::types::FitStatus;
@@ -521,6 +434,79 @@ mod tests {
             x,
             intercept: true,
             priors: Vec::new(),
+        }
+    }
+
+    /// **The covariance this bridge publishes is upstream's own, entry for entry.**
+    ///
+    /// It used to be reassembled here: `observed_information` walked every
+    /// observation, rebuilt the Hessian from `AftDistribution`'s derivatives, and
+    /// `aligned_priors` re-implemented the crate's private `build_penalty` so the
+    /// prior landed on the same coordinate. That existed for one reason -- `fit_aft`
+    /// computed the full covariance and then dropped it, keeping only slices of the
+    /// diagonal.
+    ///
+    /// It does not drop it any more. This asserts the two are the same matrix, which
+    /// is what licenses deleting the reassembly: not "the numbers look close" but
+    /// "the thing we were rebuilding is the thing we are now handed".
+    ///
+    /// Checked away from a centred covariate, because with `x` at zero the intercept
+    /// and slope are uncorrelated and the off-diagonal -- the part the diagonal-only
+    /// surface was losing -- would be zero and prove nothing.
+    #[test]
+    fn the_published_covariance_is_the_one_anofox_stats_core_reports() {
+        for dist in [
+            AftDistribution::Weibull,
+            AftDistribution::LogNormal,
+            AftDistribution::LogLogistic,
+        ] {
+            let (time, xs, event) = survival_fixture(dist, 1.0, 0.25, 0.4, 240, 3.0, Some(40.0));
+            let x = vec![xs];
+            let req = request(dist, &time, &x, &event);
+
+            let ours = match fit_censored_aft(&req).unwrap() {
+                Bridged::Fitted(g) => *g,
+                Bridged::Refused(r) => panic!("expected a fit, got {r:?}"),
+            };
+
+            // The same call the bridge makes, read directly.
+            let opts = AftOptions {
+                dist,
+                fit_intercept: true,
+                compute_inference: true,
+                vcov: VcovType::Laplace,
+                ..Default::default()
+            };
+            let upstream =
+                fit_aft(&time, &x, &event, &opts).expect("the upstream fit that the bridge wraps");
+            let theirs = upstream
+                .inference
+                .as_ref()
+                .expect("inference was requested")
+                .vcov
+                .as_ref()
+                .expect("anofox-stats-core reports the covariance");
+
+            assert_eq!(ours.covariance.nrows(), theirs.nrows(), "{dist:?} shape");
+            let mut worst = 0.0f64;
+            for r in 0..theirs.nrows() {
+                for c in 0..theirs.ncols() {
+                    let scale = theirs[(r, c)].abs().max(1e-12);
+                    worst = worst.max((ours.covariance[(r, c)] - theirs[(r, c)]).abs() / scale);
+                }
+            }
+            assert!(
+                worst < SE_AGREEMENT_TOLERANCE,
+                "{dist:?}: the published covariance differs from the reported one by \
+                 {worst:e} relative, above {SE_AGREEMENT_TOLERANCE:e}"
+            );
+
+            // And the off-diagonal is genuinely there, so the comparison had something
+            // to compare.
+            assert!(
+                theirs[(0, 1)].abs() > 1e-12,
+                "{dist:?}: intercept and slope must covary on an off-centre covariate"
+            );
         }
     }
 
@@ -617,105 +603,6 @@ mod tests {
         // merely be imprecise, it would report an interval 25 times too wide and an
         // agent would refuse deliveries it should promise.
         assert!(full.sqrt() < 0.1 * diagonal.sqrt());
-    }
-
-    /// Two-engine agreement does not catch a missing log-Jacobian: it is an `O(1/n)`
-    /// perturbation that hides inside any tolerance loose enough not to flake. So the
-    /// density is checked against its closed form directly.
-    ///
-    /// For the Weibull AFT, `W` is standard extreme-value (minimum), so with
-    /// `z = (log t - eta) / sigma`:
-    ///
-    /// ```text
-    ///   log f_W(z) = z - exp(z)          log S_W(z) = -exp(z)
-    /// ```
-    ///
-    /// This differences the log posterior implied by the bridge's own curvature
-    /// assembly — that is, the likelihood in `(beta, log sigma)` with the prior added —
-    /// between two points, and compares it against the same difference computed from
-    /// the closed form above. A missing or spurious Jacobian term would shift one and
-    /// not the other.
-    #[test]
-    fn the_bridged_log_density_matches_the_closed_form_censored_weibull() {
-        let (time, xs, event) = survival_fixture(
-            AftDistribution::Weibull,
-            1.0,
-            0.25,
-            0.4,
-            120,
-            0.0,
-            Some(6.0),
-        );
-        assert!(
-            event.contains(&0.0) && event.contains(&1.0),
-            "the fixture must contain both censored and observed rows"
-        );
-
-        // The closed form, written out here and nowhere else in the crate.
-        let closed_form = |beta: &[f64], log_sigma: f64, prior_precision: f64| -> f64 {
-            let sigma = log_sigma.exp();
-            let mut ll = 0.0;
-            for i in 0..time.len() {
-                let eta = beta[0] + beta[1] * xs[i];
-                let z = (time[i].ln() - eta) / sigma;
-                ll += if event[i] == 1.0 {
-                    // log f_T(t) = log f_W(z) - log sigma - log t
-                    (z - z.exp()) - log_sigma - time[i].ln()
-                } else {
-                    -z.exp()
-                };
-            }
-            // A N(0, s) prior on the slope only, matching the request below.
-            ll - 0.5 * prior_precision * beta[1] * beta[1]
-        };
-
-        // The bridge's own assembly, exercised through its Hessian: differencing the
-        // *density* is not what `observed_information` returns, so the comparison is
-        // made on the curvature instead, against second differences of the closed
-        // form. That is the same statement one derivative down and it is the quantity
-        // the posterior is actually built from.
-        let x = vec![xs.clone()];
-        let prior_scale = 2.0;
-        let precision = 1.0 / (prior_scale * prior_scale);
-        let req = CensoredAftRequest {
-            dist: AftDistribution::Weibull,
-            time: &time,
-            event: &event,
-            x: &x,
-            intercept: true,
-            priors: vec![PriorSpec::flat(), PriorSpec::normal(0.0, prior_scale)],
-        };
-
-        // Deliberately away from the mode: at the mode a first derivative vanishes and
-        // a sign error in a term proportional to the gradient is invisible.
-        let theta = [1.3_f64, 0.19, (0.45_f64).ln()];
-        let info = observed_information(&req, &theta, theta[2].exp(), true);
-
-        let h = 1e-4;
-        for a in 0..3 {
-            for b in 0..3 {
-                let mut pp = theta;
-                let mut pm = theta;
-                let mut mp = theta;
-                let mut mm = theta;
-                pp[a] += h;
-                pp[b] += h;
-                pm[a] += h;
-                pm[b] -= h;
-                mp[a] -= h;
-                mp[b] += h;
-                mm[a] -= h;
-                mm[b] -= h;
-                let f = |t: &[f64; 3]| closed_form(&t[0..2], t[2], precision);
-                let numeric = (f(&pp) - f(&pm) - f(&mp) + f(&mm)) / (4.0 * h * h);
-                let analytic = -info[(a, b)]; // information is the *negative* Hessian
-                let tol = 1e-3 * analytic.abs().max(1.0);
-                assert!(
-                    (analytic - numeric).abs() < tol,
-                    "curvature ({a},{b}): bridge {analytic} vs closed form {numeric}"
-                );
-            }
-        }
     }
 
     /// The `log sigma` coordinate carries no change of variables, and that must be a
@@ -950,79 +837,6 @@ mod tests {
         assert!(!r.status.is_actionable());
         // Failed outranks every other verdict when a fit is collapsed over groups.
         assert!((FitStatus::Failed as i32) > (FitStatus::InsufficientData as i32));
-    }
-
-    /// A Gaussian prior is a quadratic penalty, so it contributes exactly its
-    /// precision `1/scale²` to one diagonal entry of the observed information and
-    /// nothing anywhere else — no cross terms, no contribution to the scale
-    /// coordinate.
-    ///
-    /// Asserted at a **fixed** point, because that is the only place the claim is
-    /// exactly true: comparing two *fitted* models would compare curvatures evaluated
-    /// at two different modes, and the difference would then be the prior's precision
-    /// plus however much the likelihood's own curvature changed on the way.
-    #[test]
-    fn a_prior_adds_its_precision_to_exactly_one_diagonal_entry() {
-        let (time, xs, event) = survival_fixture(
-            AftDistribution::Weibull,
-            1.0,
-            0.25,
-            0.4,
-            120,
-            0.0,
-            Some(6.0),
-        );
-        let x = vec![xs];
-        let theta = [1.1_f64, 0.3, (0.42_f64).ln()];
-        let scale = 0.05;
-
-        let base = CensoredAftRequest {
-            dist: AftDistribution::Weibull,
-            time: &time,
-            event: &event,
-            x: &x,
-            intercept: true,
-            priors: Vec::new(),
-        };
-        let with_prior = CensoredAftRequest {
-            priors: vec![PriorSpec::flat(), PriorSpec::normal(0.0, scale)],
-            ..base.clone()
-        };
-
-        let flat = observed_information(&base, &theta, theta[2].exp(), true);
-        let penalised = observed_information(&with_prior, &theta, theta[2].exp(), true);
-
-        let precision = 1.0 / (scale * scale);
-        for a in 0..3 {
-            for b in 0..3 {
-                let expected = if (a, b) == (1, 1) { precision } else { 0.0 };
-                let got = penalised[(a, b)] - flat[(a, b)];
-                assert!(
-                    (got - expected).abs() < 1e-8 * precision.max(1.0),
-                    "entry ({a},{b}) changed by {got}, expected {expected}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn priors_align_with_the_design_the_same_way_statistics_aligns_them() {
-        let slope = PriorSpec::normal(0.0, 0.5);
-        // As long as the design (intercept entry present).
-        let a = aligned_priors(&[PriorSpec::flat(), slope], 2, true, 1);
-        assert_eq!(a[0].precision(), 0.0);
-        assert_eq!(a[1].precision(), 4.0);
-        // As long as the feature count (no intercept entry): the intercept stays flat.
-        let b = aligned_priors(&[slope], 2, true, 1);
-        assert_eq!(b[0].precision(), 0.0);
-        assert_eq!(b[1].precision(), 4.0);
-        // No intercept fitted at all.
-        let c = aligned_priors(&[slope], 1, false, 1);
-        assert_eq!(c[0].precision(), 4.0);
-        // Empty means flat throughout.
-        assert!(aligned_priors(&[], 3, true, 2)
-            .iter()
-            .all(|p| p.precision() == 0.0));
     }
 
     /// A prior adds information, so it must shrink the posterior it is put on — and
