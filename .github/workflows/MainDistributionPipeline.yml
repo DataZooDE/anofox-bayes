@@ -103,9 +103,18 @@ jobs:
             attached as artifacts; publishing is skipped rather than failed."
           fi
 
+  duckdb-lts-smoke-test:
+    name: Smoke test (v1.4.5)
+    needs: duckdb-lts-build
+    uses: ./.github/workflows/_extension_smoke_test.yml
+    with:
+      duckdb_version: v1.4.5
+      extension_name: anofox_bayes
+      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
   duckdb-lts-deploy:
     name: Deploy extension binaries (v1.4.5 LTS)
-    needs: [duckdb-lts-build, deploy-configured]
+    needs: [duckdb-lts-build, deploy-configured, duckdb-lts-smoke-test]
     # Run the deploy step even when a non-essential build matrix entry fails -- it
     # fans out per arch and only pushes the artifacts that actually exist -- but not
     # at all until the channel is configured.
@@ -143,9 +152,18 @@ jobs:
       #   Delete this line the day upstream bumps the pin.
       exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
+  duckdb-latest-smoke-test:
+    name: Smoke test (v1.5.5)
+    needs: duckdb-latest-build
+    uses: ./.github/workflows/_extension_smoke_test.yml
+    with:
+      duckdb_version: v1.5.5
+      extension_name: anofox_bayes
+      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
   duckdb-latest-deploy:
     name: Deploy extension binaries (v1.5.5)
-    needs: [duckdb-latest-build, deploy-configured]
+    needs: [duckdb-latest-build, deploy-configured, duckdb-latest-smoke-test]
     if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped'
             && needs.deploy-configured.outputs.ready == 'true' }}
     uses: ./.github/workflows/_extension_deploy.yml
