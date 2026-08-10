@@ -1,11 +1,46 @@
 # Changelog
 
 All notable changes to anofox-bayes are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is semantic, and
-the **draws schema** (`docs/DRAWS_CONTRACT.md`) is versioned separately so that draw
-tables persisted by a customer stay readable across extension upgrades.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is **CalVer**,
+`YYYY.MM.DD`, matching the other DataZoo extensions. The **draws schema**
+(`docs/DRAWS_CONTRACT.md`) is versioned separately — and stays a plain integer — so
+that draw tables persisted by a customer remain readable across extension upgrades.
+
+A dated version makes no compatibility claim, so anything that would have been a
+breaking change under semver has to be stated here in words. The draws schema is
+where compatibility is actually promised.
 
 ## [Unreleased]
+
+## [2026.08.10]
+
+### Changed — releases are dated (CalVer), not semantic
+
+Tags become `vYYYY.MM.DD`, matching `erpl`, `erpl-idoc`, `erpl-tunnel`, `gdrive` and
+the rest of the fleet.
+
+- **`anofox_bayes_version()` now returns the release date**, e.g. `2026.08.10`. It is
+  still read through the FFI, so it still proves the Rust core is linked in.
+- **The version no longer comes from `Cargo.toml`.** Cargo parses the manifest version
+  as semver and rejects `2026.08.10` outright — *invalid leading zero in minor version
+  number*. Only the zero-stripped `2026.8.10` would parse, and that is a different
+  string from the tag. The release version is therefore a constant in
+  `crates/anofox-bayes-core/src/lib.rs`; the manifest keeps a semver number that is
+  crate metadata and deliberately not the release identity.
+- **`scripts/check_version.sh` guards the three copies** — Rust constant, C++ fallback,
+  banner — and on a tag build the tag itself. A stale constant is otherwise invisible:
+  the extension builds and loads while reporting the previous release.
+
+### Added
+
+- Per-platform smoke tests: the shipped artifact is installed into a stock DuckDB CLI,
+  loaded, and asked to run a real query on Linux, macOS and Windows.
+
+## [0.1.0] — 2026-08-07
+
+The last release under semantic versioning. The entries below were recorded under
+*Unreleased* and never moved when the tag was cut; every commit they describe is an
+ancestor of `v0.1.0`.
 
 ### Changed — the F2 bridge takes its curvature from `anofox-statistics`
 

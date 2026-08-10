@@ -10,7 +10,7 @@
 // Deliberately outside namespace duckdb: the banner library is DuckDB-agnostic
 // and the guard macro refers to this object from every guarded source file.
 const datazoo::BannerInfo ANOFOX_BAYES_BANNER {
-    "anofox_bayes", "0.1.0", "https://github.com/DataZooDE/anofox-bayes"};
+    "anofox_bayes", "2026.08.10", "https://github.com/DataZooDE/anofox-bayes"};
 
 namespace duckdb {
 
@@ -18,12 +18,14 @@ namespace {
 
 // Single source of truth for the version string reported by both the extension API
 // and the SQL surface. EXT_VERSION_ANOFOX_BAYES is injected by the DuckDB extension
-// build; the literal is the fallback for local, non-CI builds.
+// build from the git tag; the literal is the fallback for local, non-CI builds and
+// tracks the CalVer release (see crates/anofox-bayes-core/src/lib.rs, which holds
+// the same number for the Rust side).
 const char *ExtensionVersion() {
 #ifdef EXT_VERSION_ANOFOX_BAYES
 	return EXT_VERSION_ANOFOX_BAYES;
 #else
-	return "0.1.0";
+	return "2026.08.10";
 #endif
 }
 

@@ -48,6 +48,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # The release version lives in three places and cannot live in Cargo.toml
+      # (cargo rejects a zero-padded CalVer date as semver), so nothing else notices
+      # when one goes stale -- the extension builds, loads, and reports the previous
+      # release. On a tag build this also asserts the tag matches the source, so
+      # cutting a release with a forgotten bump fails here instead of shipping.
+      - name: Version is consistent (and matches the tag, on a tag build)
+        run: make check_version
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
