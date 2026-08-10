@@ -6,10 +6,19 @@ require anofox_bayes
 
 # A version string proves the whole toolchain is wired: corrosion built the Rust
 # core, the FFI archive linked into the loadable extension, and C++ can call it.
+#
+# Asserted by SHAPE, not as a literal. Releases are CalVer (`YYYY.MM.DD`), so a
+# pinned date would make every release edit this file, and a test that must change
+# alongside the thing it checks stops being evidence. The exact number is checked
+# by scripts/check_version.sh, which compares the Rust macro, the C++ fallback, the
+# banner and -- on a tag build -- the git tag.
+#
+# This still fails loudly if the FFI hands back an empty string or garbage, which
+# is what the test is actually for.
 query I
-SELECT anofox_bayes_version();
+SELECT regexp_matches(anofox_bayes_version(), '^\d{4}\.\d{2}\.\d{2}$');
 ----
-0.1.0
+true
 
 # The draws-schema version is a separate, independently evolving contract: draw
 # tables written by an older extension must remain readable, so this number is

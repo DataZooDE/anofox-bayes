@@ -10,7 +10,7 @@ namespace {
 
 // Both functions read through the FFI rather than from a C++ constant on purpose:
 // they are the end-to-end smoke test that the Rust core is actually linked in. A
-// C++-side literal would still return "0.1.0" from a build where the static archive
+// C++-side literal would still return a plausible version from a build where the archive
 // was silently dropped -- which is exactly the WASM failure mode documented in
 // extension_config.cmake.
 

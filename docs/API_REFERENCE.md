@@ -1089,11 +1089,14 @@ with `IS NULL`.
 ## 4. Scalar functions
 
 ```sql
-anofox_bayes_version()               -> VARCHAR   -- e.g. '0.1.0'
+anofox_bayes_version()               -> VARCHAR   -- e.g. '2026.08.10'
 anofox_bayes_draws_schema_version()  -> INTEGER   -- e.g. 1
 ```
 
-`anofox_bayes_version` is the extension/crate version. `anofox_bayes_draws_schema_version`
+`anofox_bayes_version` is the release version: **CalVer**, `YYYY.MM.DD`, matching the
+git tag. It is deliberately not the `Cargo.toml` number, which cargo requires to be
+semver (see [RELEASING.md](RELEASING.md)). A dated version makes no compatibility
+claim. `anofox_bayes_draws_schema_version`
 is the version of the [draws contract](DRAWS_CONTRACT.md), and matches the
 `__schema_version__` row written into every fit. It moves only for a breaking
 change to column meaning or reserved-name semantics.
@@ -1101,7 +1104,7 @@ change to column meaning or reserved-name semantics.
 ```sql
 SELECT anofox_bayes_version() AS version,
        anofox_bayes_draws_schema_version() AS draws_schema;
---  0.1.0 | 1
+--  2026.08.10 | 1
 ```
 
 ### 4.1 Keyed randomness

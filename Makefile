@@ -8,7 +8,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Rust targets (for local development)
-.PHONY: rust_release rust_debug test_rust test_sbc test_scenario lint format_rust format_rust_fix clean_all
+.PHONY: rust_release rust_debug test_rust test_sbc test_scenario lint check_version format_rust format_rust_fix clean_all
 
 rust_release:
 	cargo build --release
@@ -59,6 +59,13 @@ test_scenario:
 # setting; running anything laxer locally just moves the failure to the pipeline.
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# The release version is written in three places (Rust macro, C++ fallback, banner)
+# and cannot live in Cargo.toml -- cargo rejects a zero-padded CalVer date as semver.
+# A stale copy is invisible without this: the extension builds, loads, and reports the
+# previous release. On a tag build it checks the tag too. See docs/RELEASING.md.
+check_version:
+	@./scripts/check_version.sh
 
 # Named `format_rust` rather than `format`: extension-ci-tools already defines
 # `format`/`format-fix` for the C++ side, and overriding them silently drops the

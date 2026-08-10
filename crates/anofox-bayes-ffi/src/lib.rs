@@ -56,7 +56,12 @@ use std::os::raw::c_char;
 pub extern "C" fn anofox_bayes_ffi_version() -> *const c_char {
     // Built from a compile-time constant, so the NUL byte is guaranteed present and
     // the pointer outlives every caller.
-    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+    //
+    // Reads the core crate's release constant, not CARGO_PKG_VERSION: the release
+    // scheme is CalVer and cargo rejects `2026.08.10` as a manifest version
+    // (invalid leading zero in the minor number), so the manifest keeps a semver
+    // number that is deliberately NOT the release identity.
+    anofox_bayes_core::VERSION_C.as_ptr() as *const c_char
 }
 
 /// Version of the long-format draws schema (`docs/DRAWS_CONTRACT.md`).

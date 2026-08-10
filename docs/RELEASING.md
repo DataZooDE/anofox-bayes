@@ -101,13 +101,53 @@ cargo test --workspace --release -- --ignored          # calibration suites
 (cd validation && uv run pytest -q)                    # PyMC parity
 
 # 2. Version and changelog.
-#    Bump `version` in Cargo.toml [workspace.package]; move the CHANGELOG
-#    Unreleased section under the new number.
+#    Set release_version!() in crates/anofox-bayes-core/src/lib.rs and the
+#    ExtensionVersion()/banner literals in src/anofox_bayes_extension.cpp to
+#    today's date, then move the CHANGELOG Unreleased section under it.
+./scripts/check_version.sh                             # all three agree
 
-# 3. Tag and push.
-git tag -a v0.1.0 -m "anofox-bayes v0.1.0"
+# 3. Tag and push. CalVer: v$(date +%Y.%m.%d).
+git tag -a v2026.08.10 -m "anofox-bayes v2026.08.10"
 git push origin main --follow-tags
 ```
+
+## Versioning: CalVer, and why not Cargo.toml
+
+Releases are dated — `vYYYY.MM.DD` — matching `erpl`, `erpl-idoc`, `erpl-tunnel`,
+`gdrive` and the rest of the fleet. A dated version makes no compatibility claim, so
+anything that would have been a breaking change under semver has to be spelled out in
+the CHANGELOG. The **draws schema** is where compatibility is actually promised, and it
+stays a separate integer (`docs/DRAWS_CONTRACT.md`).
+
+**The number cannot live in `Cargo.toml`.** Cargo parses the manifest version as semver
+and rejects a zero-padded date:
+
+```console
+$ cargo metadata          # with version = "2026.08.10"
+error: invalid leading zero in minor version number
+```
+
+Only `2026.8.10` parses, and that is a different string from the tag — so the manifest
+keeps a semver number that is crate metadata and **deliberately not** the release
+identity. The release version is a macro in `crates/anofox-bayes-core/src/lib.rs`:
+
+```rust
+macro_rules! release_version { () => { "2026.08.10" }; }
+pub const VERSION: &str   = release_version!();
+pub const VERSION_C: &str = concat!(release_version!(), "\0");   // for the FFI
+```
+
+A macro rather than a `const` because the FFI needs a *literal* to build the
+NUL-terminated string at compile time — `concat!` takes literals, not constants — and
+one source of truth beats two that can drift.
+
+`anofox_bayes_version()` still reads through the FFI, so it remains the end-to-end
+proof that the Rust core is linked in; it now answers with the release date.
+
+**Three copies must agree** — the Rust macro, the C++ `ExtensionVersion()` fallback and
+the banner literal — plus the tag on a tag build. `scripts/check_version.sh` checks all
+of them and runs in CI. Without it a stale constant is invisible: the extension builds,
+loads, and reports the *previous* release while the S3 path carries the new tag.
 
 **Use annotated tags** (`-a`). Lightweight ones work too, but the deploy job's
 `git fetch --tags --force` exists precisely because an annotated tag once failed the
@@ -125,7 +165,7 @@ for both DuckDB versions on linux/macOS/Windows (amd64 + arm64) and WASM.
 
 ```bash
 # Binaries landed for the architectures you expect:
-aws s3 ls s3://get.erpl.io/anofox_bayes/v0.1.0/ --recursive | head
+aws s3 ls s3://get.erpl.io/anofox_bayes/v2026.08.10/ --recursive | head
 
 # And it installs from a clean DuckDB:
 duckdb -c "INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';
