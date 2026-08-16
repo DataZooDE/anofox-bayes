@@ -335,6 +335,24 @@ impl CompiledModel for CompiledCensoredAft {
         &self.params
     }
 
+    /// `sigma` under `dist: 'exponential'`, and nothing else.
+    ///
+    /// The exponential AFT holds its scale at 1 by the definition of the
+    /// distribution, so `sigma` is reported — every `dist` publishes the same
+    /// parameter set — but never sampled. Its `ess` is therefore 0 and its `rhat`
+    /// undefined, and without this declaration the gate condemned an otherwise
+    /// converged fit on a parameter the model was never estimating.
+    ///
+    /// The other three distributions estimate the scale and appear here not at all,
+    /// so a scale that fails to mix still condemns the fit it belongs to.
+    fn fixed_params(&self) -> &[&'static str] {
+        if self.metas.iter().any(|m| m.fit_scale) {
+            &[]
+        } else {
+            &["sigma"]
+        }
+    }
+
     fn n_obs(&self) -> usize {
         self.n_obs
     }
@@ -419,6 +437,74 @@ mod tests {
     }
 
     const CFG: &str = r#"{"time": "days", "event": "delivered", "x": "distance"}"#;
+
+    /// **An exponential fit is `converged`, not `degenerate`.**
+    ///
+    /// Under `dist: 'exponential'` the AFT scale is held at 1 *by the definition of
+    /// the distribution*. It is still reported, so every distribution produces the
+    /// same parameter set and a downstream query need not branch on `dist` -- but it
+    /// is a constant, so its posterior has a standard deviation of exactly zero and
+    /// `ess` returns 0.0 for it.
+    ///
+    /// That zero is deliberate and must stay: it is what stops a genuinely stuck
+    /// sampler sailing through an `ess >= 400` gate. So the fix cannot be to infer
+    /// "constant" from the draws -- a stuck chain looks identical. The family has to
+    /// *declare* which parameters it does not estimate, and the gate has to skip
+    /// those and only those.
+    ///
+    /// Before this, the gate saw `ess 0` on `sigma` and graded the whole fit
+    /// `degenerate` while every coefficient was estimated correctly and the other
+    /// three distributions converged on the same data. An agent reading
+    /// `is_actionable` was told to ignore a fit that was fine.
+    #[test]
+    fn an_exponential_fit_is_not_condemned_by_the_scale_it_does_not_estimate() {
+        let f = frame(300, 10.0, Some(40.0));
+        let refs = f.key_refs();
+        let view = f.view(&refs);
+        let fit = crate::fit::fit(
+            "censored_aft",
+            &Config::parse(
+                r#"{"time": "days", "event": "delivered", "x": "distance",
+                     "dist": "exponential", "draws": 2000, "seed": 7}"#,
+            )
+            .unwrap(),
+            &view,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fit.posterior.meta.status,
+            FitStatus::Converged,
+            "an exponential fit whose coefficients are estimated must not be graded on \
+             a scale it never estimates; reasons: {:?}",
+            fit.reasons
+        );
+
+        // Still published, and still exactly 1: a consumer joining on `param =
+        // 'sigma'` must not have to branch on `dist`.
+        let idx = fit
+            .posterior
+            .params
+            .iter()
+            .position(|p| p.name == "sigma")
+            .expect("sigma is reported for every distribution");
+        let values: Vec<f64> = fit.posterior.chain_values(0, idx).collect();
+        assert!(!values.is_empty());
+        assert!(
+            values.iter().all(|v| (*v - 1.0).abs() < 1e-12),
+            "the exponential scale is fixed at 1 by definition, got {:?}",
+            &values[..values.len().min(4)]
+        );
+
+        // And the exemption is narrow: a coefficient that genuinely failed to mix
+        // must still condemn the fit, or the gate has been disabled rather than
+        // scoped.
+        assert!(
+            fit.reasons.iter().all(|r| !r.contains("'sigma'")),
+            "sigma must not appear as a diagnostic failure: {:?}",
+            fit.reasons
+        );
+    }
 
     #[test]
     fn the_family_reports_one_parameter_per_coefficient_plus_the_scale() {
