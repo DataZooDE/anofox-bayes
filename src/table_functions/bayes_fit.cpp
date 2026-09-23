@@ -2,6 +2,7 @@
 #include <vector>
 
 #include "duckdb.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -495,7 +496,22 @@ void RegisterBayesFitFunction(ExtensionLoader &loader) {
 	// so a convenience two-argument form is not available. It would not be much of a
 	// convenience anyway: every family requires at least a value column, so a fit
 	// with no config is never a valid request.
-	loader.RegisterFunction(std::move(fit));
+	CreateTableFunctionInfo info(std::move(fit));
+	FunctionDescription d;
+	d.description =
+	    "Fits a Bayesian model over an input relation and returns its posterior draws as a table of "
+	    "(param, draw, chain, value), plus reserved __status__ and __family__ rows describing the fit "
+	    "itself. 'family' names the model and 'config' is a struct mapping its roles onto columns of the "
+	    "input. A fit that cannot answer says so on the __status__ row rather than failing -- see "
+	    "anofox_bayes_status_text and anofox_bayes_is_actionable.";
+	// The first argument is a TABLE parameter, so an example must pass a SUBQUERY --
+	// `TABLE my_table` is a binder error in this position. Taken from README.md.
+	d.examples = {"SELECT * FROM anofox_bayes_fit((SELECT region, units FROM sales), "
+	              "'conjugate_anomaly', {'value': 'units', 'group': 'region'})"};
+	d.parameter_names = {"input", "family", "config"};
+	d.categories = {"bayes"};
+	info.descriptions.push_back(std::move(d));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace duckdb

@@ -171,12 +171,61 @@ const DefaultMacro ANOFOX_BAYES_MACROS[] = {
 
     {nullptr, nullptr, {nullptr}, {{nullptr, nullptr}}, nullptr}};
 
+
+// Descriptions for the table above, in the same order. Kept parallel rather than
+// folded into DefaultMacro because that struct is DuckDB's and has no room for them;
+// the static_assert below is what keeps the two from drifting apart.
+struct BayesMacroDoc {
+	const char *description;
+	const char *example;
+};
+
+const BayesMacroDoc ANOFOX_BAYES_MACRO_DOCS[] = {
+    {"Lower bound of an equal-tailed credible interval at the given level, over a column of posterior draws.",
+     "SELECT anofox_bayes_credible_lower(value, 0.95) FROM (VALUES (1.0),(2.0),(3.0)) t(value)"},
+    {"Upper bound of an equal-tailed credible interval at the given level, over a column of posterior draws.",
+     "SELECT anofox_bayes_credible_upper(value, 0.95) FROM (VALUES (1.0),(2.0),(3.0)) t(value)"},
+    {"The equal-tailed credible interval as one struct of (lower, median, upper), for callers who want a single column instead of three.",
+     "SELECT anofox_bayes_credible_interval(value, 0.95) FROM (VALUES (1.0),(2.0),(3.0)) t(value)"},
+    {"Posterior probability that the quantity exceeds a threshold: the share of draws above it, propagating NULL draws rather than counting them as misses.",
+     "SELECT anofox_bayes_prob_greater(value, 2.0) FROM (VALUES (1.0),(2.0),(3.0)) t(value)"},
+    {"Posterior probability that the quantity falls below a threshold: the share of draws under it, propagating NULL draws rather than counting them as misses.",
+     "SELECT anofox_bayes_prob_less(value, 2.0) FROM (VALUES (1.0),(2.0),(3.0)) t(value)"},
+    {"The quantity a service-level target implies -- the posterior quantile at that level. A 95% service level is the 95th percentile, NOT the mean plus some multiple of a standard deviation, which is only equivalent when the posterior happens to be symmetric.",
+     "SELECT anofox_bayes_service_level_quantile(value, 0.95) FROM (VALUES (1.0),(2.0),(3.0)) t(value)"},
+    {"Whether a parameter clears its effective-sample-size gate, NULL-safe by construction. An absent diagnostic counts as a FAILURE: ESS is NULL where it is undefined (a parameter that never moved, or too few draws), and the hand-written 'ess_bulk < 400' form silently lets exactly those through, because NULL < 400 is NULL rather than true.",
+     "SELECT anofox_bayes_ess_gate(value, chain, draw, 400) FROM (VALUES (1.0,0,0),(2.0,0,1)) t(value, chain, draw)"},
+    {"Whether a parameter clears its R-hat gate. Unlike the ESS gate an absent R-hat counts as a PASS: both 0.1 engines draw independently, so the statistic is legitimately undefined -- which is why this is a separate macro rather than folded into the ESS gate.",
+     "SELECT anofox_bayes_rhat_gate(value, chain, draw, 1.01) FROM (VALUES (1.0,0,0),(2.0,0,1)) t(value, chain, draw)"},
+    {"Decodes the reserved __status__ row of a draws table to 'converged', 'degenerate', 'insufficient_data', 'failed' or 'unknown'. An aggregate rather than a scalar so it applies straight to a draws table with no WHERE clause.",
+     "SELECT anofox_bayes_status_text(param, value) FROM (VALUES ('__status__', 0.0)) t(param, value)"},
+    {"Decodes a single status code to its name -- the scalar counterpart of anofox_bayes_status_text, for a code already in hand.",
+     "SELECT anofox_bayes_status_name(0)"},
+    {"True only for a fit an agent may act on without further qualification: status converged, and never NULL.",
+     "SELECT anofox_bayes_is_actionable(param, value) FROM (VALUES ('__status__', 0.0)) t(param, value)"},
+    {"Decodes the reserved __family__ row: which model produced this draws table. The family travels as its catalog F-number because the value column is DOUBLE; an unknown code reads as 'unknown' rather than NULL, since a table written by a newer extension is a fact worth seeing.",
+     "SELECT anofox_bayes_family_text(param, value) FROM (VALUES ('__family__', 1.0)) t(param, value)"},
+};
+
+static_assert(sizeof(ANOFOX_BAYES_MACRO_DOCS) / sizeof(ANOFOX_BAYES_MACRO_DOCS[0]) ==
+                  sizeof(ANOFOX_BAYES_MACROS) / sizeof(ANOFOX_BAYES_MACROS[0]) - 1,
+              "every macro needs a description; the -1 is the table's null terminator");
+
 } // anonymous namespace
 
 void RegisterBayesMacros(ExtensionLoader &loader) {
 	for (idx_t i = 0; ANOFOX_BAYES_MACROS[i].name != nullptr; i++) {
 		auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(ANOFOX_BAYES_MACROS[i]);
 		info->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		// CreateInternalMacroInfo leaves descriptions empty, which is why macros
+		// normally arrive undocumented. parameter_names is deliberately NOT set: a
+		// macro already reports its own, and a non-empty parameter_names replaces the
+		// whole rendered list.
+		FunctionDescription d;
+		d.description = ANOFOX_BAYES_MACRO_DOCS[i].description;
+		d.examples = {ANOFOX_BAYES_MACRO_DOCS[i].example};
+		d.categories = {"bayes"};
+		info->descriptions.push_back(std::move(d));
 		loader.RegisterFunction(*info);
 	}
 }
