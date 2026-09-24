@@ -66,6 +66,12 @@ jobs:
         run: cargo test --workspace
 
   duckdb-lts-build:
+    # windows_amd64 is excluded on the LTS line ONLY. MSYS2 removed
+    # msys2-runtime-3.5.4-2 from every mirror, which breaks the v1.4.5 toolchain's
+    # bootstrap. The same commit builds Windows fine on v1.5.5, so this is the LTS
+    # dependency chain, not our code. No LTS Windows artifact ships until it is
+    # unpinned -- tracked in #22. All three of build/smoke/deploy carry the same
+    # list on purpose: the smoke test downloads what the build produced.
     name: Build extension binaries (DuckDB LTS v1.4.5)
     needs: rust-tests
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4-andium
@@ -85,7 +91,7 @@ jobs:
       #   left failing, for the reason `deploy-configured` below gives: a pipeline
       #   that is permanently red for a known reason trains everyone to ignore it.
       #   Delete this line the day upstream bumps the pin.
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      exclude_archs: 'windows_amd64;windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   # Whether the distribution channel is configured at all.
   #
@@ -118,7 +124,7 @@ jobs:
     with:
       duckdb_version: v1.4.5
       extension_name: anofox_bayes
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      exclude_archs: 'windows_amd64;windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   duckdb-lts-deploy:
     name: Deploy extension binaries (v1.4.5 LTS)
@@ -134,7 +140,7 @@ jobs:
       duckdb_version: v1.4.5
       ci_tools_version: v1.4-andium
       extension_name: anofox_bayes
-      exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      exclude_archs: 'windows_amd64;windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
 
