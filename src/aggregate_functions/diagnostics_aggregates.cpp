@@ -166,7 +166,14 @@ void RegisterOne(ExtensionLoader &loader, const AggregateFunction &func, const c
 
 	FunctionDescription d;
 	d.description = description;
-	d.examples = {StringUtil::Format("SELECT param, %s(value, chain, draw) FROM draws GROUP BY param", func.name)};
+	// Self-contained: an example that reads FROM draws cannot run anywhere the caller
+	// has not already produced that table, and an example that does not run is the
+	// usual shape of one that is wrong. The inline relation mirrors the draws-table
+	// contract (param, value, chain, draw).
+	d.examples = {StringUtil::Format("SELECT param, %s(value, chain, draw) FROM (VALUES "
+	                                 "('mu',1.0,0,0),('mu',2.0,0,1)) t(param,value,chain,draw) "
+	                                 "GROUP BY param",
+	                                 func.name)};
 	d.categories = {"bayes", "diagnostics"};
 	d.parameter_names = {"value", "chain", "draw"};
 	d.parameter_types = {LogicalType::DOUBLE, LogicalType::BIGINT, LogicalType::BIGINT};

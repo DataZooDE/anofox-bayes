@@ -1,4 +1,5 @@
 #include "duckdb.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "../include/anofox_bayes_extension.hpp"
@@ -37,15 +38,39 @@ void RegisterKeyedRandomFunctions(ExtensionLoader &loader) {
 	// (seed, key, draw). The key is arbitrary text identifying the thing being
 	// simulated -- a SKU, a lane, a row id -- and the draw index selects the sample.
 	// Together they are the coordinates of a value in a fixed random stream.
-	ScalarFunctionSet uniform("anofox_bayes_uniform");
-	uniform.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT},
-	                                   LogicalType::DOUBLE, KeyedRandomFunction<anofox_bayes_ffi_uniform>));
-	loader.RegisterFunction(uniform);
-
-	ScalarFunctionSet std_normal("anofox_bayes_std_normal");
-	std_normal.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT},
-	                                      LogicalType::DOUBLE, KeyedRandomFunction<anofox_bayes_ffi_std_normal>));
-	loader.RegisterFunction(std_normal);
+	// Both take the same (seed, key, draw) coordinates, so the names are attached once
+	// per function rather than per overload.
+	auto keyed_doc = [](string description, string example) {
+		FunctionDescription d;
+		d.description = std::move(description);
+		d.examples = {std::move(example)};
+		d.parameter_names = {"seed", "key", "draw"};
+		d.categories = {"bayes", "random"};
+		return d;
+	};
+	{
+		ScalarFunctionSet uniform("anofox_bayes_uniform");
+		uniform.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT},
+		                                   LogicalType::DOUBLE, KeyedRandomFunction<anofox_bayes_ffi_uniform>));
+		CreateScalarFunctionInfo info(std::move(uniform));
+		info.descriptions.push_back(keyed_doc(
+		    "A uniform(0,1) draw at fixed coordinates in a reproducible random stream. 'key' names the "
+		    "thing being simulated -- a SKU, a lane, a row id -- and 'draw' selects the sample, so the "
+		    "same three arguments always return the same number.",
+		    "SELECT anofox_bayes_uniform(42, 'SKU-1', 0)"));
+		loader.RegisterFunction(std::move(info));
+	}
+	{
+		ScalarFunctionSet std_normal("anofox_bayes_std_normal");
+		std_normal.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT},
+		                                      LogicalType::DOUBLE, KeyedRandomFunction<anofox_bayes_ffi_std_normal>));
+		CreateScalarFunctionInfo info(std::move(std_normal));
+		info.descriptions.push_back(keyed_doc(
+		    "A standard-normal draw at fixed coordinates in a reproducible random stream, with the same "
+		    "(seed, key, draw) addressing as anofox_bayes_uniform.",
+		    "SELECT anofox_bayes_std_normal(42, 'SKU-1', 0)"));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb
