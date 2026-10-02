@@ -158,7 +158,7 @@ refuses as "would clobber existing tag".
 ## Status
 
 First publication: **2026-08-01**, from commit `9a91d22` on `main`. Verified by
-installing on a stock DuckDB v1.5.5 CLI with a clean home directory. Artifacts exist
+installing on a stock DuckDB v1.5.6 CLI with a clean home directory. Artifacts exist
 for both DuckDB versions on linux/macOS/Windows (amd64 + arm64) and WASM.
 
 ## Verifying a release

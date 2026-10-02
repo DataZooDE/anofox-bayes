@@ -68,7 +68,7 @@ jobs:
   duckdb-lts-build:
     # windows_amd64 is excluded on the LTS line ONLY. MSYS2 removed
     # msys2-runtime-3.5.4-2 from every mirror, which breaks the v1.4.5 toolchain's
-    # bootstrap. The same commit builds Windows fine on v1.5.5, so this is the LTS
+    # bootstrap. The same commit builds Windows fine on v1.5.6, so this is the LTS
     # dependency chain, not our code. No LTS Windows artifact ships until it is
     # unpinned -- tracked in #22. All three of build/smoke/deploy carry the same
     # list on purpose: the smoke test downloads what the build produced.
@@ -145,11 +145,11 @@ jobs:
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
 
   duckdb-latest-build:
-    name: Build extension binaries (DuckDB latest v1.5.5)
+    name: Build extension binaries (DuckDB latest v1.5.6)
     needs: rust-tests
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.5
+      duckdb_version: v1.5.6
       ci_tools_version: v1.5-variegata
       extension_name: anofox_bayes
       enable_rust: true
@@ -167,23 +167,23 @@ jobs:
       exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   duckdb-latest-smoke-test:
-    name: Smoke test (v1.5.5)
+    name: Smoke test (v1.5.6)
     needs: duckdb-latest-build
     uses: ./.github/workflows/_extension_smoke_test.yml
     with:
-      duckdb_version: v1.5.5
+      duckdb_version: v1.5.6
       extension_name: anofox_bayes
       exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   duckdb-latest-deploy:
-    name: Deploy extension binaries (v1.5.5)
+    name: Deploy extension binaries (v1.5.6)
     needs: [duckdb-latest-build, deploy-configured, duckdb-latest-smoke-test]
     if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped'
             && needs.deploy-configured.outputs.ready == 'true' }}
     uses: ./.github/workflows/_extension_deploy.yml
     secrets: inherit
     with:
-      duckdb_version: v1.5.5
+      duckdb_version: v1.5.6
       ci_tools_version: v1.5-variegata
       extension_name: anofox_bayes
       exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
