@@ -16,8 +16,8 @@ dependencies = [
     "pymc==6.2.0",
     "arviz==1.2.0",
     # Must match the DuckDB the extension is built against (the duckdb/ submodule
-    # is at v1.5.5); a mismatch is refused at LOAD time, so this is a hard pin.
-    "duckdb==1.5.5",
+    # is at v1.5.6); a mismatch is refused at LOAD time, so this is a hard pin.
+    "duckdb==1.5.6",
     "numpy==2.2.6",
     "pandas==3.0.5",
     "pytest==9.1.1",

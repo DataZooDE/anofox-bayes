@@ -23,7 +23,7 @@ cargo fmt --all && clang-format -i src/*.cpp src/*/*.cpp src/include/*.hpp
 the clang-format pass.
 
 **Verify the duckdb submodule pin before and after every build.**
-`git -C duckdb describe --tags` must read `v1.5.5`. An `M duckdb` in `git status`
+`git -C duckdb describe --tags` must read `v1.5.6`. An `M duckdb` in `git status`
 means stop and re-pin; a silent downgrade costs two full rebuilds.
 
 ## Where things live

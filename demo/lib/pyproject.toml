@@ -11,11 +11,11 @@ dependencies = [
     # front of it would hide the thing being demonstrated.
     # Pinned exactly, not `>=`. The extension is built against a specific DuckDB
     # and refuses at LOAD time on any other -- "built specifically for DuckDB
-    # version v1.5.5 and can only be loaded with that version". A floating lower
+    # version v1.5.6 and can only be loaded with that version". A floating lower
     # bound means the demos break the day duckdb ships 1.6, with an error about
     # versions rather than about anything the reader did. `validation/` pins for
     # the same reason and says so.
-    "duckdb==1.5.5",
+    "duckdb==1.5.6",
     "rich>=13.0",
 ]
 
