@@ -4,6 +4,8 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    branches: [main]
+    tags: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -23,6 +25,7 @@ jobs:
   # broken family or an unformatted file fails fast and cheap.
   rust-tests:
     name: Rust tests and formatting
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -102,6 +105,7 @@ jobs:
   # unknown one. Skip instead, and say so.
   deploy-configured:
     name: Distribution channel configured?
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     outputs:
       ready: ${{ steps.check.outputs.ready }}
