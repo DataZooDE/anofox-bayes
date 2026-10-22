@@ -12,6 +12,11 @@ where compatibility is actually promised.
 
 ## [Unreleased]
 
+### Removed
+
+- Dropped DuckDB 1.4.x LTS support; the v1.4.5 build, smoke-test and deploy jobs are
+  gone from CI. Supported: DuckDB 1.5.6.
+
 ## [2026.08.10]
 
 ### Changed — releases are dated (CalVer), not semantic

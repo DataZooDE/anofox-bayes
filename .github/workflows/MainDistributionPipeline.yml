@@ -68,34 +68,6 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace
 
-  duckdb-lts-build:
-    # windows_amd64 is excluded on the LTS line ONLY. MSYS2 removed
-    # msys2-runtime-3.5.4-2 from every mirror, which breaks the v1.4.5 toolchain's
-    # bootstrap. The same commit builds Windows fine on v1.5.6, so this is the LTS
-    # dependency chain, not our code. No LTS Windows artifact ships until it is
-    # unpinned -- tracked in #22. All three of build/smoke/deploy carry the same
-    # list on purpose: the smoke test downloads what the build produced.
-    name: Build extension binaries (DuckDB LTS v1.4.5)
-    needs: rust-tests
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4-andium
-    with:
-      duckdb_version: v1.4.5
-      ci_tools_version: v1.4-andium
-      extension_name: anofox_bayes
-      enable_rust: true
-      # windows_amd64_rtools: only needed for R package builds
-      # windows_amd64_mingw: rtools42 MinGW lacks libbcrypt.a needed by Rust getrandom 0.3+
-      # wasm_*: blocked upstream, not here. extension-ci-tools pins the WASM job to
-      #   dtolnay/rust-toolchain@1.86.0 (_extension_distribution.yml:1128), and argmin
-      #   0.11 -- a transitive dependency through anofox-regression -- calls
-      #   `is_multiple_of`, stable only from 1.87. Four E0658s, none of them our code:
-      #   `cargo check --target wasm32-unknown-emscripten` on 1.97.1 builds
-      #   anofox-bayes-core clean, sequential chain loop and all. Excluded rather than
-      #   left failing, for the reason `deploy-configured` below gives: a pipeline
-      #   that is permanently red for a known reason trains everyone to ignore it.
-      #   Delete this line the day upstream bumps the pin.
-      exclude_archs: 'windows_amd64;windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-
   # Whether the distribution channel is configured at all.
   #
   # DEPLOY_S3_BUCKET is a repository *variable*, so this is readable without exposing
@@ -121,33 +93,6 @@ jobs:
             attached as artifacts; publishing is skipped rather than failed."
           fi
 
-  duckdb-lts-smoke-test:
-    name: Smoke test (v1.4.5)
-    needs: duckdb-lts-build
-    uses: ./.github/workflows/_extension_smoke_test.yml
-    with:
-      duckdb_version: v1.4.5
-      extension_name: anofox_bayes
-      exclude_archs: 'windows_amd64;windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-
-  duckdb-lts-deploy:
-    name: Deploy extension binaries (v1.4.5 LTS)
-    needs: [duckdb-lts-build, deploy-configured, duckdb-lts-smoke-test]
-    # Run the deploy step even when a non-essential build matrix entry fails -- it
-    # fans out per arch and only pushes the artifacts that actually exist -- but not
-    # at all until the channel is configured.
-    if: ${{ !cancelled() && needs.duckdb-lts-build.result != 'skipped'
-            && needs.deploy-configured.outputs.ready == 'true' }}
-    uses: ./.github/workflows/_extension_deploy.yml
-    secrets: inherit
-    with:
-      duckdb_version: v1.4.5
-      ci_tools_version: v1.4-andium
-      extension_name: anofox_bayes
-      exclude_archs: 'windows_amd64;windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
-
   duckdb-latest-build:
     name: Build extension binaries (DuckDB latest v1.5.6)
     needs: rust-tests
@@ -165,7 +110,7 @@ jobs:
       #   `is_multiple_of`, stable only from 1.87. Four E0658s, none of them our code:
       #   `cargo check --target wasm32-unknown-emscripten` on 1.97.1 builds
       #   anofox-bayes-core clean, sequential chain loop and all. Excluded rather than
-      #   left failing, for the reason `deploy-configured` below gives: a pipeline
+      #   left failing, for the reason `deploy-configured` above gives: a pipeline
       #   that is permanently red for a known reason trains everyone to ignore it.
       #   Delete this line the day upstream bumps the pin.
       exclude_archs: 'windows_amd64_rtools;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
@@ -182,6 +127,9 @@ jobs:
   duckdb-latest-deploy:
     name: Deploy extension binaries (v1.5.6)
     needs: [duckdb-latest-build, deploy-configured, duckdb-latest-smoke-test]
+    # Run the deploy step even when a non-essential build matrix entry fails -- it
+    # fans out per arch and only pushes the artifacts that actually exist -- but not
+    # at all until the channel is configured.
     if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped'
             && needs.deploy-configured.outputs.ready == 'true' }}
     uses: ./.github/workflows/_extension_deploy.yml
