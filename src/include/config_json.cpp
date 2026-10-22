@@ -1,6 +1,7 @@
 #include "config_json.hpp"
 
 #include "duckdb/common/types/value.hpp"
+#include "duckdb_compat.hpp"
 
 namespace duckdb {
 
@@ -76,7 +77,7 @@ void RenderInto(const Value &value, string &out) {
 			if (i > 0) {
 				out += ',';
 			}
-			EscapeInto(names[i].first, out);
+			EscapeInto(duckdb_compat::Str(names[i].first), out);
 			out += ':';
 			RenderInto(children[i], out);
 		}

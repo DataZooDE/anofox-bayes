@@ -6,6 +6,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "duckdb_compat/aggregate.hpp"
 
 #include "../include/anofox_bayes_extension.hpp"
 #include "../include/anofox_bayes_ffi.h"
@@ -41,30 +42,30 @@ struct DiagnosticState {
 	}
 };
 
-void DiagnosticInitialize(const AggregateFunction &, data_ptr_t state_p) {
+void DiagnosticInitialize(data_ptr_t state_p) {
 	new (state_p) DiagnosticState();
 }
 
 void DiagnosticDestroy(Vector &state_vector, AggregateInputData &, idx_t count) {
 	UnifiedVectorFormat sdata;
-	state_vector.ToUnifiedFormat(count, sdata);
-	auto states = reinterpret_cast<DiagnosticState **>(sdata.data);
+	duckdb_compat::ToUnifiedFormat(state_vector, count, sdata);
+	auto states = UnifiedVectorFormat::GetData<data_ptr_t>(sdata);
 	for (idx_t i = 0; i < count; i++) {
-		states[sdata.sel->get_index(i)]->~DiagnosticState();
+		reinterpret_cast<DiagnosticState *>(states[sdata.sel->get_index(i)])->~DiagnosticState();
 	}
 }
 
 void DiagnosticUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, Vector &state_vector, idx_t count) {
 	UnifiedVectorFormat value_data, chain_data, draw_data, sdata;
-	inputs[0].ToUnifiedFormat(count, value_data);
-	inputs[1].ToUnifiedFormat(count, chain_data);
-	inputs[2].ToUnifiedFormat(count, draw_data);
-	state_vector.ToUnifiedFormat(count, sdata);
+	duckdb_compat::ToUnifiedFormat(inputs[0], count, value_data);
+	duckdb_compat::ToUnifiedFormat(inputs[1], count, chain_data);
+	duckdb_compat::ToUnifiedFormat(inputs[2], count, draw_data);
+	duckdb_compat::ToUnifiedFormat(state_vector, count, sdata);
 
 	auto values = UnifiedVectorFormat::GetData<double>(value_data);
 	auto chains = UnifiedVectorFormat::GetData<int64_t>(chain_data);
 	auto draws = UnifiedVectorFormat::GetData<int64_t>(draw_data);
-	auto states = reinterpret_cast<DiagnosticState **>(sdata.data);
+	auto states = UnifiedVectorFormat::GetData<data_ptr_t>(sdata);
 
 	for (idx_t i = 0; i < count; i++) {
 		auto value_idx = value_data.sel->get_index(i);
@@ -78,7 +79,7 @@ void DiagnosticUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, 
 			continue;
 		}
 
-		auto &state = *states[sdata.sel->get_index(i)];
+		auto &state = *reinterpret_cast<DiagnosticState *>(states[sdata.sel->get_index(i)]);
 		state.values.push_back(values[value_idx]);
 		// Narrowed deliberately. The signature takes BIGINT so that INTEGER upcasts
 		// implicitly and the indices produced by row_number() and generate_series()
@@ -99,14 +100,14 @@ void DiagnosticUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, 
 
 void DiagnosticCombine(Vector &source_vector, Vector &target_vector, AggregateInputData &, idx_t count) {
 	UnifiedVectorFormat source_data, target_data;
-	source_vector.ToUnifiedFormat(count, source_data);
-	target_vector.ToUnifiedFormat(count, target_data);
-	auto sources = reinterpret_cast<DiagnosticState **>(source_data.data);
-	auto targets = reinterpret_cast<DiagnosticState **>(target_data.data);
+	duckdb_compat::ToUnifiedFormat(source_vector, count, source_data);
+	duckdb_compat::ToUnifiedFormat(target_vector, count, target_data);
+	auto sources = UnifiedVectorFormat::GetData<data_ptr_t>(source_data);
+	auto targets = UnifiedVectorFormat::GetData<data_ptr_t>(target_data);
 
 	for (idx_t i = 0; i < count; i++) {
-		auto &source = *sources[source_data.sel->get_index(i)];
-		auto &target = *targets[target_data.sel->get_index(i)];
+		auto &source = *reinterpret_cast<DiagnosticState *>(sources[source_data.sel->get_index(i)]);
+		auto &target = *reinterpret_cast<DiagnosticState *>(targets[target_data.sel->get_index(i)]);
 		if (source.values.empty()) {
 			continue;
 		}
@@ -121,12 +122,12 @@ void DiagnosticCombine(Vector &source_vector, Vector &target_vector, AggregateIn
 template <int32_t KIND>
 void DiagnosticFinalize(Vector &state_vector, AggregateInputData &, Vector &result, idx_t count, idx_t offset) {
 	UnifiedVectorFormat sdata;
-	state_vector.ToUnifiedFormat(count, sdata);
-	auto states = reinterpret_cast<DiagnosticState **>(sdata.data);
-	auto out = FlatVector::GetData<double>(result);
+	duckdb_compat::ToUnifiedFormat(state_vector, count, sdata);
+	auto states = UnifiedVectorFormat::GetData<data_ptr_t>(sdata);
+	auto out = duckdb_compat::FlatData<double>(result);
 
 	for (idx_t i = 0; i < count; i++) {
-		auto &state = *states[sdata.sel->get_index(i)];
+		auto &state = *reinterpret_cast<DiagnosticState *>(states[sdata.sel->get_index(i)]);
 		idx_t result_idx = i + offset;
 
 		double value = 0;
@@ -153,8 +154,10 @@ AggregateFunction MakeDiagnostic(const char *name) {
 	// output, which are BIGINT and would otherwise need an explicit cast at every
 	// call site.
 	return AggregateFunction(name, {LogicalType::DOUBLE, LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::DOUBLE,
-	                         AggregateFunction::StateSize<DiagnosticState>, DiagnosticInitialize, DiagnosticUpdate,
-	                         DiagnosticCombine, DiagnosticFinalize<KIND>, nullptr, nullptr, DiagnosticDestroy);
+	                         duckdb_compat::AggregateStateSize<sizeof(DiagnosticState)>(),
+	                         duckdb_compat::AggregateInit<DiagnosticInitialize>(), DiagnosticUpdate, DiagnosticCombine,
+	                         duckdb_compat::AggregateFinalize<DiagnosticFinalize<KIND>>(), nullptr, nullptr,
+	                         DiagnosticDestroy);
 }
 
 void RegisterOne(ExtensionLoader &loader, const AggregateFunction &func, const char *description) {
@@ -178,6 +181,7 @@ void RegisterOne(ExtensionLoader &loader, const AggregateFunction &func, const c
 	d.parameter_names = {"value", "chain", "draw"};
 	d.parameter_types = {LogicalType::DOUBLE, LogicalType::BIGINT, LogicalType::BIGINT};
 	info.descriptions.push_back(std::move(d));
+	duckdb_compat::NameFunctionsFromDescriptions(info);
 
 	loader.RegisterFunction(std::move(info));
 }
