@@ -12,10 +12,23 @@ where compatibility is actually promised.
 
 ## [Unreleased]
 
+### Added — DuckDB 2.0
+
+- Builds and tests on **DuckDB 2.0.0** and **v1.5.6** from one source tree, through the
+  `duckdb-compat` header library (no version checks at call sites). macOS links the
+  `Security` framework that DuckDB 2.0's HTTP client needs. CI builds the 2.0 line on
+  every platform and smoke-loads the artifact. The draws schema is unchanged.
+
 ### Removed
 
 - Dropped DuckDB 1.4.x LTS support; the v1.4.5 build, smoke-test and deploy jobs are
-  gone from CI. Supported: DuckDB 1.5.6.
+  gone from CI. Supported: DuckDB 1.5.6 and 2.0.
+
+### Fixed
+
+- On DuckDB 2.0 the group and parameter name vectors behind `anofox_bayes_fit`'s
+  dictionary output are now sized, so DuckDB knows the dictionary size instead of
+  treating it as unknown.
 
 ## [2026.08.10]
 
