@@ -66,6 +66,18 @@ SELECT count(DISTINCT model_id) FROM draws;
 ----
 1
 
+# The struct macro must agree with its component quantiles on the same posterior.
+query I
+SELECT bool_and(ok) FROM (
+SELECT anofox_bayes_credible_interval(value, 0.9) =
+    {'lower': anofox_bayes_credible_lower(value, 0.9),
+     'median': quantile_cont(value, 0.5),
+     'upper': anofox_bayes_credible_upper(value, 0.9)} AS ok
+FROM draws WHERE draw >= 0 GROUP BY group_id, param
+);
+----
+true
+
 #######################################
 # The gate: is this fit safe to act on?
 #######################################

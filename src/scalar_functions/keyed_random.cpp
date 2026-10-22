@@ -1,6 +1,7 @@
 #include "duckdb.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb_compat.hpp"
 
 #include "../include/anofox_bayes_extension.hpp"
 #include "../include/anofox_bayes_ffi.h"
@@ -24,8 +25,7 @@ namespace {
 template <double (*Fn)(int64_t, const uint8_t *, size_t, int64_t)>
 void KeyedRandomFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	TernaryExecutor::Execute<int64_t, string_t, int64_t, double>(
-	    args.data[0], args.data[1], args.data[2], result, args.size(),
-	    [&](int64_t seed, string_t key, int64_t draw) {
+	    args.data[0], args.data[1], args.data[2], result, args.size(), [&](int64_t seed, string_t key, int64_t draw) {
 		    // GetDataUnsafe may be null for an empty string; the Rust side treats a
 		    // null pointer with a zero length as an empty key rather than as UB.
 		    return Fn(seed, reinterpret_cast<const uint8_t *>(key.GetData()), key.GetSize(), draw);
@@ -53,11 +53,12 @@ void RegisterKeyedRandomFunctions(ExtensionLoader &loader) {
 		uniform.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT},
 		                                   LogicalType::DOUBLE, KeyedRandomFunction<anofox_bayes_ffi_uniform>));
 		CreateScalarFunctionInfo info(std::move(uniform));
-		info.descriptions.push_back(keyed_doc(
-		    "A uniform(0,1) draw at fixed coordinates in a reproducible random stream. 'key' names the "
-		    "thing being simulated -- a SKU, a lane, a row id -- and 'draw' selects the sample, so the "
-		    "same three arguments always return the same number.",
-		    "SELECT anofox_bayes_uniform(42, 'SKU-1', 0)"));
+		info.descriptions.push_back(
+		    keyed_doc("A uniform(0,1) draw at fixed coordinates in a reproducible random stream. 'key' names the "
+			          "thing being simulated -- a SKU, a lane, a row id -- and 'draw' selects the sample, so the "
+			          "same three arguments always return the same number.",
+			          "SELECT anofox_bayes_uniform(42, 'SKU-1', 0)"));
+		duckdb_compat::NameFunctionsFromDescriptions(info);
 		loader.RegisterFunction(std::move(info));
 	}
 	{
@@ -65,10 +66,11 @@ void RegisterKeyedRandomFunctions(ExtensionLoader &loader) {
 		std_normal.AddFunction(ScalarFunction({LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT},
 		                                      LogicalType::DOUBLE, KeyedRandomFunction<anofox_bayes_ffi_std_normal>));
 		CreateScalarFunctionInfo info(std::move(std_normal));
-		info.descriptions.push_back(keyed_doc(
-		    "A standard-normal draw at fixed coordinates in a reproducible random stream, with the same "
-		    "(seed, key, draw) addressing as anofox_bayes_uniform.",
-		    "SELECT anofox_bayes_std_normal(42, 'SKU-1', 0)"));
+		info.descriptions.push_back(
+		    keyed_doc("A standard-normal draw at fixed coordinates in a reproducible random stream, with the same "
+			          "(seed, key, draw) addressing as anofox_bayes_uniform.",
+			          "SELECT anofox_bayes_std_normal(42, 'SKU-1', 0)"));
+		duckdb_compat::NameFunctionsFromDescriptions(info);
 		loader.RegisterFunction(std::move(info));
 	}
 }

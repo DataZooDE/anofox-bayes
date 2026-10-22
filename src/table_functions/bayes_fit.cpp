@@ -8,6 +8,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb_compat.hpp"
 
 #include "../include/anofox_bayes_extension.hpp"
 #include "../include/anofox_bayes_ffi.h"
@@ -129,7 +130,7 @@ AnofoxBayesStr Borrow(const string &s) {
 }
 
 unique_ptr<FunctionData> BayesFitBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
 	auto result = make_uniq<BayesFitBindData>();
 
 	if (input.inputs.size() < 2 || input.inputs[1].IsNull()) {
@@ -144,10 +145,10 @@ unique_ptr<FunctionData> BayesFitBind(ClientContext &context, TableFunctionBindI
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
 		auto &type = input.input_table_types[i];
 		if (type.IsNumeric()) {
-			result->numeric_names.push_back(input.input_table_names[i]);
+			result->numeric_names.push_back(duckdb_compat::Str(input.input_table_names[i]));
 			result->numeric_cols.push_back(i);
 		} else {
-			result->key_names.push_back(input.input_table_names[i]);
+			result->key_names.push_back(duckdb_compat::Str(input.input_table_names[i]));
 			result->key_cols.push_back(i);
 		}
 	}
@@ -180,11 +181,11 @@ OperatorResultType BayesFitInOut(ExecutionContext &context, TableFunctionInput &
 	// costs more than the copy does.
 	vector<UnifiedVectorFormat> numeric(bind_data.numeric_cols.size());
 	for (idx_t c = 0; c < bind_data.numeric_cols.size(); c++) {
-		input.data[bind_data.numeric_cols[c]].ToUnifiedFormat(input.size(), numeric[c]);
+		duckdb_compat::ToUnifiedFormat(input.data[bind_data.numeric_cols[c]], input.size(), numeric[c]);
 	}
 	vector<UnifiedVectorFormat> keys(bind_data.key_cols.size());
 	for (idx_t c = 0; c < bind_data.key_cols.size(); c++) {
-		input.data[bind_data.key_cols[c]].ToUnifiedFormat(input.size(), keys[c]);
+		duckdb_compat::ToUnifiedFormat(input.data[bind_data.key_cols[c]], input.size(), keys[c]);
 	}
 
 	lock_guard<mutex> guard(gstate.lock);
@@ -219,7 +220,7 @@ OperatorResultType BayesFitInOut(ExecutionContext &context, TableFunctionInput &
 	}
 	gstate.n_rows += input.size();
 
-	output.SetCardinality(0);
+	duckdb_compat::SetChildCardinality(output, 0);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -284,7 +285,7 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 	// from each and abort the CREATE TABLE AS.
 	bool expected = false;
 	if (!gstate.claimed.compare_exchange_strong(expected, true)) {
-		output.SetCardinality(0);
+		duckdb_compat::SetChildCardinality(output, 0);
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
@@ -305,19 +306,20 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 		AnofoxBayesStr r_group, r_param;
 		int32_t r_chain, r_draw;
 		double r_value;
-		anofox_bayes_ffi_fit_rows(gstate.fit, 0, 1, &gstate.model_id, &r_group, &r_chain, &r_draw, &r_param,
-		                          &r_value);
+		anofox_bayes_ffi_fit_rows(gstate.fit, 0, 1, &gstate.model_id, &r_group, &r_chain, &r_draw, &r_param, &r_value);
 		if (n_params > 0) {
 			gstate.dict_group_vec = make_uniq<Vector>(LogicalType::VARCHAR, n_params);
 			gstate.dict_param_vec = make_uniq<Vector>(LogicalType::VARCHAR, n_params);
-			auto g = FlatVector::GetData<string_t>(*gstate.dict_group_vec);
-			auto p = FlatVector::GetData<string_t>(*gstate.dict_param_vec);
+			auto g = duckdb_compat::FlatData<string_t>(*gstate.dict_group_vec);
+			auto p = duckdb_compat::FlatData<string_t>(*gstate.dict_param_vec);
 			for (idx_t i = 0; i < n_params; i++) {
-				g[i] = StringVector::AddString(*gstate.dict_group_vec, gstate.dict_group[i].ptr,
-				                               gstate.dict_group[i].len);
-				p[i] = StringVector::AddString(*gstate.dict_param_vec, gstate.dict_param[i].ptr,
-				                               gstate.dict_param[i].len);
+				g[i] =
+				    StringVector::AddString(*gstate.dict_group_vec, gstate.dict_group[i].ptr, gstate.dict_group[i].len);
+				p[i] =
+				    StringVector::AddString(*gstate.dict_param_vec, gstate.dict_param[i].ptr, gstate.dict_param[i].len);
 			}
+			duckdb_compat::SetVectorSize(*gstate.dict_group_vec, n_params);
+			duckdb_compat::SetVectorSize(*gstate.dict_param_vec, n_params);
 		}
 	}
 
@@ -344,9 +346,9 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 			ConstantVector::GetData<string_t>(output.data[0])[0] =
 			    StringVector::AddString(output.data[0], gstate.model_id.ptr, gstate.model_id.len);
 
-			auto chain_fast = FlatVector::GetData<int32_t>(output.data[2]);
-			auto draw_fast = FlatVector::GetData<int32_t>(output.data[3]);
-			auto value_fast = FlatVector::GetData<double>(output.data[5]);
+			auto chain_fast = duckdb_compat::FlatData<int32_t>(output.data[2]);
+			auto draw_fast = duckdb_compat::FlatData<int32_t>(output.data[3]);
+			auto value_fast = duckdb_compat::FlatData<double>(output.data[5]);
 			memcpy(value_fast, peek.values, capacity * sizeof(double));
 			for (idx_t i = 0; i < capacity; i++) {
 				chain_fast[i] = peek.chain;
@@ -359,7 +361,7 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 					}
 				}
 			}
-			output.SetCardinality(capacity);
+			duckdb_compat::SetChildCardinality(output, capacity);
 			gstate.emitted += capacity;
 			if (gstate.emitted >= gstate.total) {
 				return OperatorFinalizeResultType::FINISHED;
@@ -379,12 +381,12 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 	// through.
 
 	const idx_t capacity = STANDARD_VECTOR_SIZE;
-	auto model_out = FlatVector::GetData<string_t>(output.data[0]);
-	auto group_out = FlatVector::GetData<string_t>(output.data[1]);
-	auto chain_out = FlatVector::GetData<int32_t>(output.data[2]);
-	auto draw_out = FlatVector::GetData<int32_t>(output.data[3]);
-	auto param_out = FlatVector::GetData<string_t>(output.data[4]);
-	auto value_out = FlatVector::GetData<double>(output.data[5]);
+	auto model_out = duckdb_compat::FlatData<string_t>(output.data[0]);
+	auto group_out = duckdb_compat::FlatData<string_t>(output.data[1]);
+	auto chain_out = duckdb_compat::FlatData<int32_t>(output.data[2]);
+	auto draw_out = duckdb_compat::FlatData<int32_t>(output.data[3]);
+	auto param_out = duckdb_compat::FlatData<string_t>(output.data[4]);
+	auto value_out = duckdb_compat::FlatData<double>(output.data[5]);
 
 	// Emit by *runs* rather than by rows.
 	//
@@ -404,10 +406,9 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 	// `model_id` is added to the chunk once and reused: it is one value for the whole
 	// fit and, at 16 hex characters, past the 12 bytes `string_t` inlines, so calling
 	// `AddString` per row is one heap copy per row of the same string.
-	const string_t model_str =
-	    gstate.model_id.ptr != nullptr
-	        ? StringVector::AddString(output.data[0], gstate.model_id.ptr, gstate.model_id.len)
-	        : string_t();
+	const string_t model_str = gstate.model_id.ptr != nullptr
+	                               ? StringVector::AddString(output.data[0], gstate.model_id.ptr, gstate.model_id.len)
+	                               : string_t();
 
 	idx_t written = 0;
 	while (written < capacity && gstate.emitted < gstate.total) {
@@ -469,7 +470,7 @@ OperatorFinalizeResultType BayesFitFinalize(ExecutionContext &context, TableFunc
 		written += run.len;
 		gstate.emitted += run.len;
 	}
-	output.SetCardinality(written);
+	duckdb_compat::SetChildCardinality(output, written);
 
 	if (gstate.emitted >= gstate.total) {
 		return OperatorFinalizeResultType::FINISHED;
@@ -498,12 +499,11 @@ void RegisterBayesFitFunction(ExtensionLoader &loader) {
 	// with no config is never a valid request.
 	CreateTableFunctionInfo info(std::move(fit));
 	FunctionDescription d;
-	d.description =
-	    "Fits a Bayesian model over an input relation and returns its posterior draws as a table of "
-	    "(param, draw, chain, value), plus reserved __status__ and __family__ rows describing the fit "
-	    "itself. 'family' names the model and 'config' is a struct mapping its roles onto columns of the "
-	    "input. A fit that cannot answer says so on the __status__ row rather than failing -- see "
-	    "anofox_bayes_status_text and anofox_bayes_is_actionable.";
+	d.description = "Fits a Bayesian model over an input relation and returns its posterior draws as a table of "
+	                "(param, draw, chain, value), plus reserved __status__ and __family__ rows describing the fit "
+	                "itself. 'family' names the model and 'config' is a struct mapping its roles onto columns of the "
+	                "input. A fit that cannot answer says so on the __status__ row rather than failing -- see "
+	                "anofox_bayes_status_text and anofox_bayes_is_actionable.";
 	// The first argument is a TABLE parameter, so an example must pass a SUBQUERY --
 	// `TABLE my_table` is a binder error in this position. Taken from README.md.
 	d.examples = {"SELECT * FROM anofox_bayes_fit((SELECT region, units FROM sales), "
