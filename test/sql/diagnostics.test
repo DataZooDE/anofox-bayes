@@ -237,3 +237,81 @@ query I
 SELECT anofox_bayes_rhat_gate(value, chain, draw, 1.01) FROM mixed;
 ----
 true
+
+#######################################
+# Vector boundaries, window results, NULLs and parallel combine
+#######################################
+
+# More than one vector of groups exercises finalize offsets. Every group has the
+# same sequence, so each result must equal the one-group reference.
+statement ok
+CREATE TABLE many_groups AS
+SELECT g::INTEGER AS grp, 0::BIGINT AS chain, d::BIGINT AS draw,
+       ((d * 17) % 31)::DOUBLE AS value
+FROM range(2051) g(g), range(32) d(d);
+
+query II
+WITH grouped AS (
+    SELECT grp, anofox_bayes_ess_bulk(value, chain, draw) AS ess FROM many_groups GROUP BY grp
+), reference AS (
+    SELECT anofox_bayes_ess_bulk(value, chain, draw) AS ess FROM many_groups WHERE grp = 0
+)
+SELECT count(*) = 2051, bool_and(reference.ess IS NOT NULL AND grouped.ess = reference.ess)
+FROM grouped, reference;
+----
+true	true
+
+# Window aggregate output must match GROUP BY for every source row.
+query I
+WITH grouped AS (
+    SELECT grp, anofox_bayes_ess_bulk(value, chain, draw) AS ess FROM many_groups GROUP BY grp
+), windowed AS (
+    SELECT grp, anofox_bayes_ess_bulk(value, chain, draw) OVER (PARTITION BY grp) AS ess
+    FROM many_groups
+)
+SELECT bool_and(windowed.ess IS NOT DISTINCT FROM grouped.ess)
+FROM windowed JOIN grouped USING (grp);
+----
+true
+
+# A NULL in any input drops that whole triple.
+query I
+WITH nullable AS (
+    SELECT value, chain, draw FROM mixed
+    UNION ALL SELECT NULL::DOUBLE, 0, 4000
+    UNION ALL SELECT 0.0, NULL::BIGINT, 4001
+    UNION ALL SELECT 0.0, 0, NULL::BIGINT
+)
+SELECT (SELECT anofox_bayes_ess_bulk(value, chain, draw) FROM nullable)
+       = (SELECT anofox_bayes_ess_bulk(value, chain, draw) FROM mixed);
+----
+true
+
+# Literal chain arrives as a constant vector.
+query I
+SELECT anofox_bayes_ess_bulk(value, 0, draw)
+       = (SELECT anofox_bayes_ess_bulk(value, chain, draw) FROM sticky)
+FROM sticky;
+----
+true
+
+# Large enough to trigger parallel aggregate combine, with deterministic inputs.
+statement ok
+CREATE TABLE parallel_diagnostic AS
+SELECT i::BIGINT AS draw, (i % 97)::DOUBLE AS value FROM range(131072) t(i);
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE serial_result AS
+SELECT anofox_bayes_ess_bulk(value, 0, draw) AS ess FROM parallel_diagnostic;
+
+statement ok
+SET threads=8;
+
+query I
+SELECT s.ess IS NOT DISTINCT FROM anofox_bayes_ess_bulk(p.value, 0, p.draw)
+FROM parallel_diagnostic p CROSS JOIN serial_result s GROUP BY s.ess;
+----
+true

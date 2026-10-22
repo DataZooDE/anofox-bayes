@@ -1,0 +1,39 @@
+# name: test/sql/function_metadata.test
+# description: Public argument names stay discoverable across DuckDB lines
+# group: [sql]
+
+require anofox_bayes
+
+query II
+SELECT count(*) = 2, bool_and(parameters = ['seed', 'key', 'draw'])
+FROM duckdb_functions()
+WHERE function_name IN ('anofox_bayes_uniform', 'anofox_bayes_std_normal');
+----
+true	true
+
+query II
+SELECT count(*) = 12, bool_and(parameters = expected)
+FROM duckdb_functions() f
+JOIN (VALUES
+    ('anofox_bayes_credible_lower', ['value', 'level']),
+    ('anofox_bayes_credible_upper', ['value', 'level']),
+    ('anofox_bayes_credible_interval', ['value', 'level']),
+    ('anofox_bayes_prob_greater', ['value', 'threshold']),
+    ('anofox_bayes_prob_less', ['value', 'threshold']),
+    ('anofox_bayes_service_level_quantile', ['value', 'service_level']),
+    ('anofox_bayes_ess_gate', ['value', 'chain', 'draw', 'min_ess']),
+    ('anofox_bayes_rhat_gate', ['value', 'chain', 'draw', 'max_rhat']),
+    ('anofox_bayes_status_text', ['param', 'value']),
+    ('anofox_bayes_status_name', ['value']),
+    ('anofox_bayes_is_actionable', ['param', 'value']),
+    ('anofox_bayes_family_text', ['param', 'value'])
+) t(name, expected) ON f.function_name = t.name;
+----
+true	true
+
+query II
+SELECT count(*) = 3, bool_and(parameters = ['value', 'chain', 'draw'])
+FROM duckdb_functions()
+WHERE function_name IN ('anofox_bayes_rhat', 'anofox_bayes_ess_bulk', 'anofox_bayes_ess_tail');
+----
+true	true

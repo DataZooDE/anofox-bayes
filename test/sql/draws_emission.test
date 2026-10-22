@@ -5,7 +5,7 @@
 # `anofox_bayes_fit` does not hand DuckDB one row at a time. It asks the core for a
 # *run* -- a maximal block of structurally identical rows -- and, when a run fills a
 # whole 2048-row vector, copies the block's values in one move, fills `chain` and
-# `draw` as constants, and points the two name columns at a per-fit dictionary instead
+# `draw` for that run, and points the two name columns at a per-fit dictionary instead
 # of copying a string per row.
 #
 # That is a large amount of machinery standing between the posterior and the table a
@@ -17,15 +17,31 @@
 
 require anofox_bayes
 
+# 4096 parameters leave a full 2048-row run after the first metadata chunk.
+# This forces the dictionary Slice path that the 2048-parameter fixture cannot reach.
+statement ok
+CREATE TABLE wide_obs AS
+SELECT 'W' || (i % 2048)::VARCHAR AS grp, (i % 29)::DOUBLE + 5.0 AS y
+FROM range(0, 81920) t(i);
+
+statement ok
+CREATE TABLE wide AS
+SELECT * FROM anofox_bayes_fit(
+    (SELECT grp, y FROM wide_obs), 'conjugate_anomaly',
+    {'value': 'y', 'group': 'grp', 'draws': 4, 'seed': 3});
+
+query I
+SELECT count(*) FILTER (WHERE draw >= 0) FROM wide;
+----
+16384
+
 #######################################
 # A fit whose parameter count lands exactly on the vector boundary
 #######################################
 
 # 1024 groups x 2 parameters = **exactly** 2048 parameters, which is DuckDB's vector
-# size. So every draw is one full run, every chunk is one full run, and the fast path
-# runs back to back for the whole table with no partial block to fall out on. If the
-# fast path could fail to advance -- re-serving the same 2048 rows forever -- this is
-# the shape that would hang rather than the shape that would be caught by a value.
+# size. The 11 metadata rows offset the output chunks, so this exercises mixed-run
+# chunks rather than the dictionary Slice. The wide fixture above reaches that Slice.
 statement ok
 CREATE TABLE aligned_obs AS
 SELECT 'G' || (i % 1024)::VARCHAR AS grp, (i % 29)::DOUBLE + 5.0 AS y
@@ -45,9 +61,7 @@ FROM aligned;
 ----
 131083	11	1025
 
-# Every group must appear with both of its parameters in every draw. A dictionary
-# indexed one slot off would still produce 2048 names per draw -- just the wrong ones,
-# and shifted consistently, so no count would move. This counts the pairing instead.
+# Check that each group retains both parameter names after mixed-run emission.
 query I
 SELECT count(*) FROM (
     SELECT group_id FROM aligned WHERE draw >= 0 AND group_id <> '__global__'
@@ -57,7 +71,7 @@ SELECT count(*) FROM (
 0
 
 # The names that belong to `__global__` must not leak onto a group, which is what a
-# dictionary shifted across the group boundary would do.
+# name lookup shifted across the group boundary would do.
 query I
 SELECT count(*) FROM aligned
 WHERE draw >= 0 AND group_id <> '__global__' AND param NOT IN ('mu', 'sigma');
@@ -71,6 +85,19 @@ WHERE draw >= 0 AND group_id <> '__global__' AND param NOT IN ('mu', 'sigma');
 query I
 SELECT count(*) FROM aligned
 WHERE draw >= 0 AND param = 'mu' AND (value < 0.0 OR value > 40.0);
+----
+0
+
+query I
+SELECT count(DISTINCT draw) FROM aligned WHERE draw >= 0;
+----
+64
+
+query I
+SELECT count(*) FROM (
+    SELECT group_id, param, draw FROM aligned WHERE draw >= 0
+    GROUP BY ALL HAVING count(*) <> 1
+);
 ----
 0
 
