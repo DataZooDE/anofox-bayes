@@ -68,6 +68,18 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace
 
+  # The smoke test is the only job that loads the shipped .duckdb_extension in an
+  # official DuckDB CLI. Every deploy must require it to have passed; a bare
+  # `!cancelled()` would publish a binary that failed it. This checks that gate, so
+  # a later edit cannot quietly drop it.
+  deploy-gates:
+    name: Deploys gated on smoke tests?
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --quiet pyyaml && python3 scripts/check_deploy_gates.py
+
   # Whether the distribution channel is configured at all.
   #
   # DEPLOY_S3_BUCKET is a repository *variable*, so this is readable without exposing
@@ -130,6 +142,9 @@ jobs:
   duckdb-next-smoke-test:
     name: Smoke test (v2.0.0)
     needs: duckdb-next-build
+    # Run even when a non-essential build arch failed: the deploy requires this job
+    # to succeed, so skipping it would block publishing the archs that did build.
+    if: ${{ !cancelled() && needs.duckdb-next-build.result != 'skipped' }}
     uses: ./.github/workflows/_extension_smoke_test.yml
     with:
       duckdb_version: v2.0.0
@@ -139,6 +154,9 @@ jobs:
   duckdb-latest-smoke-test:
     name: Smoke test (v1.5.6)
     needs: duckdb-latest-build
+    # Run even when a non-essential build arch failed: the deploy requires this job
+    # to succeed, so skipping it would block publishing the archs that did build.
+    if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped' }}
     uses: ./.github/workflows/_extension_smoke_test.yml
     with:
       duckdb_version: v1.5.6
@@ -147,12 +165,14 @@ jobs:
 
   duckdb-latest-deploy:
     name: Deploy extension binaries (v1.5.6)
-    needs: [duckdb-latest-build, deploy-configured, duckdb-latest-smoke-test]
+    needs: [duckdb-latest-build, deploy-configured, deploy-gates, duckdb-latest-smoke-test]
     # Run the deploy step even when a non-essential build matrix entry fails -- it
     # fans out per arch and only pushes the artifacts that actually exist -- but not
-    # at all until the channel is configured.
+    # at all until the channel is configured, and never after a failed smoke test.
     if: ${{ !cancelled() && needs.duckdb-latest-build.result != 'skipped'
-            && needs.deploy-configured.outputs.ready == 'true' }}
+            && needs.deploy-configured.outputs.ready == 'true'
+            && needs.deploy-gates.result == 'success'
+            && needs.duckdb-latest-smoke-test.result == 'success' }}
     uses: ./.github/workflows/_extension_deploy.yml
     secrets: inherit
     with:
@@ -165,14 +185,16 @@ jobs:
 
   duckdb-next-deploy:
     name: Deploy extension binaries (v2.0.0)
-    needs: [duckdb-next-build, deploy-configured, duckdb-next-smoke-test]
+    needs: [duckdb-next-build, deploy-configured, deploy-gates, duckdb-next-smoke-test]
     # Same gate as the v1.5.6 deploy above. The 2.0 artifacts are named
     # <ext>-v2.0.0-extension-<arch> by v2.0-cyanoptera's ci_phase.py upload, which
     # is the name _extension_deploy.yml downloads, and DuckDB v2.0.0 keeps the
     # 256-byte signature footer extension-upload.sh strips and re-appends -- so
     # the shared deploy workflow needs no 2.0-specific change.
     if: ${{ !cancelled() && needs.duckdb-next-build.result != 'skipped'
-            && needs.deploy-configured.outputs.ready == 'true' }}
+            && needs.deploy-configured.outputs.ready == 'true'
+            && needs.deploy-gates.result == 'success'
+            && needs.duckdb-next-smoke-test.result == 'success' }}
     uses: ./.github/workflows/_extension_deploy.yml
     secrets: inherit
     with:
