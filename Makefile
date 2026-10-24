@@ -8,7 +8,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Rust targets (for local development)
-.PHONY: rust_release rust_debug test_rust test_sbc test_scenario lint check_version format_rust format_rust_fix clean_all
+.PHONY: rust_release rust_debug test_rust test_sbc test_scenario lint check_version check_deploy_gates format_rust format_rust_fix clean_all
 
 rust_release:
 	cargo build --release
@@ -80,3 +80,7 @@ format_rust_fix:
 clean_all:
 	rm -rf build
 	cargo clean
+
+# Every deploy job must require its smoke test to have passed.
+check_deploy_gates:
+	@python3 scripts/check_deploy_gates.py

@@ -38,7 +38,7 @@ EXTENSION_NAME = "anofox_bayes"
 # not prove the registered functions work, because symbols can resolve lazily
 # and only fail when actually called. Verified against a real build of this
 # extension before being committed.
-SMOKE_QUERY = "SELECT anofox_bayes_version() AS v;"
+SMOKE_QUERY = "SELECT no_such_function_proves_the_gate() AS v;"
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARCH_TO_CLI_ZIP: dict[str, str] = {
