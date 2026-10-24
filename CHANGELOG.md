@@ -12,12 +12,18 @@ where compatibility is actually promised.
 
 ## [Unreleased]
 
+## [2026.10.24]
+
 ### Added — DuckDB 2.0
 
+- **Supports DuckDB 2.0.0.** Binaries for DuckDB v2.0.0 are published to
+  `get.erpl.io` next to the v1.5.6 ones, so `INSTALL 'anofox_bayes' FROM
+  'http://get.erpl.io'` works from either DuckDB version.
 - Builds and tests on **DuckDB 2.0.0** and **v1.5.6** from one source tree, through the
   `duckdb-compat` header library (no version checks at call sites). macOS links the
   `Security` framework that DuckDB 2.0's HTTP client needs. CI builds the 2.0 line on
   every platform and smoke-loads the artifact. The draws schema is unchanged.
+- On DuckDB 1.5.6, give named arguments in the documented order.
 
 ### Removed
 

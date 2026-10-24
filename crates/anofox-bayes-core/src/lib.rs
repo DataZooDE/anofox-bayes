@@ -32,7 +32,7 @@
 /// truth beats two literals that can drift.
 macro_rules! release_version {
     () => {
-        "2026.08.10"
+        "2026.10.24"
     };
 }
 

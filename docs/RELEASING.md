@@ -158,8 +158,14 @@ refuses as "would clobber existing tag".
 ## Status
 
 First publication: **2026-08-01**, from commit `9a91d22` on `main`. Verified by
-installing on a stock DuckDB v1.5.6 CLI with a clean home directory. Artifacts exist
-for both DuckDB versions on linux/macOS/Windows (amd64 + arm64) and WASM.
+installing on a stock DuckDB v1.5.6 CLI with a clean home directory.
+
+From **2026.10.24** each release publishes binaries for DuckDB **v1.5.6** and
+**v2.0.0**, both built from one source tree (`duckdb-compat`). v1.5.6 covers
+linux_amd64, linux_arm64, osx_amd64, osx_arm64 and windows_amd64. v2.0.0 covers
+linux_amd64, linux_arm64, osx_arm64 and windows_amd64, because osx_amd64 is opt-in in
+extension-ci-tools v2.0-cyanoptera. WASM is excluded on both lines (see
+`MainDistributionPipeline.yml`).
 
 ## Verifying a release
 

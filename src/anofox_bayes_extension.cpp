@@ -10,7 +10,7 @@
 // Deliberately outside namespace duckdb: the banner library is DuckDB-agnostic
 // and the guard macro refers to this object from every guarded source file.
 const datazoo::BannerInfo ANOFOX_BAYES_BANNER {
-    "anofox_bayes", "2026.08.10", "https://github.com/DataZooDE/anofox-bayes"};
+    "anofox_bayes", "2026.10.24", "https://github.com/DataZooDE/anofox-bayes"};
 
 namespace duckdb {
 
@@ -25,7 +25,7 @@ const char *ExtensionVersion() {
 #ifdef EXT_VERSION_ANOFOX_BAYES
 	return EXT_VERSION_ANOFOX_BAYES;
 #else
-	return "2026.08.10";
+	return "2026.10.24";
 #endif
 }
 
