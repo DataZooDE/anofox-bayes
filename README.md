@@ -3,7 +3,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSL%201.1-blue.svg" alt="License: BSL 1.1"></a>
-  <a href="https://duckdb.org"><img src="https://img.shields.io/badge/DuckDB-1.5.6-green.svg" alt="DuckDB"></a>
+  <a href="https://duckdb.org"><img src="https://img.shields.io/badge/DuckDB-1.5.6%20%7C%202.0-green.svg" alt="DuckDB"></a>
   <img src="https://img.shields.io/badge/draws%20schema-v1-informational.svg" alt="Draws schema v1">
   <img src="https://img.shields.io/badge/status-v0.1%20early-orange.svg" alt="Status">
 </p>
@@ -80,8 +80,8 @@ See [the roadmap](#roadmap).
 ## Install
 
 `anofox-bayes` is BSL-licensed, so it is served from the DataZoo channel rather than
-the DuckDB community repository. Binaries are published for DuckDB **v1.5.6**,
-on linux/macOS/Windows (amd64 + arm64) and WASM.
+the DuckDB community repository. Binaries are published for DuckDB **v1.5.6** and **v2.0.0**,
+on linux/macOS/Windows (amd64 + arm64).
 
 ```sql
 INSTALL 'anofox_bayes' FROM 'http://get.erpl.io';
