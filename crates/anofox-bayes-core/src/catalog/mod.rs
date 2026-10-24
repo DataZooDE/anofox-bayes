@@ -156,6 +156,28 @@ pub trait CompiledModel: std::fmt::Debug {
     /// The structural verdict described on [`Readiness`].
     fn readiness(&self) -> Readiness;
 
+    /// Parameters this model *reports* but does not *estimate*.
+    ///
+    /// A structurally-fixed parameter is one whose value the model holds constant by
+    /// construction — `censored_aft`'s scale under `dist: 'exponential'`, which the
+    /// distribution defines as 1. It is still published, so every variant of a family
+    /// produces the same parameter set and a downstream query need not branch, but its
+    /// posterior is a point and its diagnostics are meaningless: `rhat` is undefined
+    /// and `ess` is zero.
+    ///
+    /// The gate in [`crate::fit::grade`] skips these and only these. It cannot instead
+    /// notice that the draws never move, and the distinction is the whole point: a
+    /// genuinely stuck sampler produces identical draws too, and `ess` returning zero
+    /// for it is deliberate — it is what stops a stuck chain sailing through an
+    /// `ess >= 400` gate. Inferring "fixed" from the values would hand that stuck chain
+    /// the same exemption. So the family declares it, and a family that declares
+    /// nothing gets no exemption.
+    ///
+    /// Names are matched against [`crate::draws::ParamName::name`], across every group.
+    fn fixed_params(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// How many of [`CompiledModel::n_groups`] groups did **not** reach
     /// `FitStatus::Converged` on their own.
     ///
